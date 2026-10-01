@@ -622,14 +622,17 @@ def _t_nonttext_pickup():
     cursors = {"__time__": _IMG_TS - 100}
 
     out1 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
-    ok &= check("第一次见到某会话：只记水位线，不把历史图片翻出来报",
-                out1 == [] and (cursors.get("__nonttext__") or {}).get("filehelper") == _IMG_TS,
-                (out1, cursors.get("__nonttext__")))
-    ok &= check("第一次也不去查消息表（省掉无谓查询）", c.msg_queries() == [], c.msg_queries())
+    ok &= check("第一次见到某会话**也要报**（不然「你在某会话发的第一张图」永远报不上来）",
+                len(out1) == 1 and out1[0].get("local_type") == 3
+                and "[图片]" in str(out1[0].get("content")),
+                out1)
+    ok &= check("报到之后水位线记下这个会话",
+                (cursors.get("__nonttext__") or {}).get("filehelper") == _IMG_TS,
+                cursors.get("__nonttext__"))
 
     c.last_ts = _IMG_TS + 5
     out2 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
-    ok &= check("水位线前进之后，把那张图片消息报上来",
+    ok &= check("水位线前进之后，把新的那张图片消息报上来",
                 len(out2) == 1 and out2[0].get("local_type") == 3
                 and "[图片]" in str(out2[0].get("content")),
                 out2)

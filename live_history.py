@@ -1453,8 +1453,12 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
     稳态下这个查询返回 0 行 → **不增加任何额外查库**；真收到图才多 1~2 次查询。
 
     每个会话一个水位线 `cursors["__nonttext__"][talker]`，避免同一张图每轮重复报。
-    **第一次见到某会话时只记水位线、不报**——和 `prime()` 的语义一致
-    （只管「启动之后」的新消息，不把历史图片翻出来刷一遍）。
+    **不做「第一次见到就只记水位线不报」那种 seed**——那会让「你在某个会话里发的
+    第一张图」永远报不上来（那个会话还没进水位线，就被当成历史 seed 掉了）。
+    启动边界的历史回放由两道现成机制挡着，不需要在这里再挡一次：
+      * `last_timestamp >= since`（since 是 fts 游标 `__time__`，启动时就是最新）= 老会话根本进不来；
+      * `prime()` 会把边界那批消息塞进 `seen`，第一轮再查到的会被去重掉；
+      * 真有「停机期间的旧消息」漏进来，bot 主循环的 catchup 判定也只通知、不自动回复。
     """
     since = _as_int((cursors or {}).get("__time__", 0))
     sql = ("SELECT username, last_timestamp FROM SessionTable "
@@ -1476,9 +1480,6 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
         talker = str(_pick(r, "username", 0) or "")
         last_ts = _as_int(_pick(r, "last_timestamp", 1))
         if not talker or last_ts <= 0:
-            continue
-        if talker not in wm:
-            wm[talker] = last_ts          # 第一次见：只记水位线（不报历史图片）
             continue
         prev = _as_int(wm.get(talker, 0))
         if last_ts <= prev:
