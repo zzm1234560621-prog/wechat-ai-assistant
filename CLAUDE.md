@@ -24,6 +24,7 @@ tail -f bot.log
                                       │ query_sql(db, sql)
                                       ▼
 bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
+   │                    ↑ 每轮轮询的空档还跑一次 scheduler.run_due()（发定时消息）
    │
    ├─ / 开头        -> handle_command()        （改配置）
    ├─ 「确认」/「不发」-> agent_tools.pop_pending() （执行待确认发送）
@@ -31,8 +32,9 @@ bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
 ```
 
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
-- `agent_tools.py` — 给大模型的工具层（7 个工具）+ 待确认机制 + 查询预算。
+- `agent_tools.py` — 给大模型的工具层（8 个工具）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
 - `auto_reply.py` — 代用户本人回指定会话。
+- `scheduler.py` — 定时任务（到点自动给对方发文本或打电话）。任务存在 `settings.json` 的 `schedule` 段，命令 `/定时` 维护；**必须跑在收消息那条线程上**，见下面「改代码时的约定」。
 - `llm.py` — anthropic / openai 两种协议，工具调用格式互转。
 - 入口有三条，都会起 `bot.py`：`助手.bat` 菜单、`启动助手.bat`、开机自启注册表。
 
@@ -100,6 +102,8 @@ bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
 - **重名不许静默取第一个。** 解析联系人统一走 `ToolBox._one()`，重名时回一句让模型去问用户——静默取第一个会读错人、发错人。
 - **渲染「谁说的」一律用显示名。** 预取路径用 `bot._msg_speaker()`，工具路径用 `agent_tools.speaker_of()` / `format_history_lines()`。**绝不要把 talker（wxid / roomid）原样塞进给模型的文本**——模型会照抄一串 id 给你。这是 2026-10-01「看不到真正的名字」的根因。
 - **hook 不支持并发**。工具串行执行，查询有预算（`agent.max_queries`）；连发消息是同步的、故意不开线程。任何"并发加速"的想法都会让微信崩。
+- **定时任务同样不许开后台线程。** `scheduler.py` 靠 `bot._Ticker` 挂在**收消息那条线程**的轮询空档里跑（`iter_aixed_messages` / `iter_wcferry_messages` 各调一次）。代价是精度只有 `poll_interval`（默认 5 秒），换来「定时发消息」和「轮询」永不并发。往 `run_due` 里加新动作时别起线程。
+- **不支持的功能要如实报错，不许静默降级。** 典型：定时任务里 `action: call`（语音通话）现在打不出去，`run_due` 就明确报错并通知用户，**绝不偷偷改成发文本**——那是在骗用户。加新功能时保持这条。
 - **不要随手重启微信**：每次重启都会掉登录态，要重新扫码。
 - **摘除 hook**：把微信目录的 `version.dll` 改名 `version.dll.disabled` 重启微信即可（脚本 `installers/wechat-4.1.10.27/do_remove_hook.ps1`，装回 `do_restore_hook.ps1`）。
 - **改 hook 源码**（`installers/wechat-4.1.10.27/src-4.1.10.27/WeChat-Hook-4.1.10.27`）后重编译：

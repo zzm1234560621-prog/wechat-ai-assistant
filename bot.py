@@ -15,6 +15,7 @@ import socket
 import sys
 import time
 import traceback
+from datetime import datetime
 
 import yaml
 
@@ -23,6 +24,7 @@ import auto_reply
 import live_history
 import settings
 import providers
+import scheduler
 from llm import ChatLLM
 from history import HistoryStore
 from live_history import (
@@ -129,11 +131,19 @@ HELP_TEXT = (
     "/auto del <昵称|wxid>    移出名单\n"
     "/auto mode <谁> self|assistant   改人设\n"
     "/auto review on|off [谁] 开审核（草稿先发你，回「确认」才发）\n"
-    "/auto ctx <1~30>         上下文条数"
+    "/auto ctx <1~30>         上下文条数\n"
+    "\n"
+    "—— 定时任务（到点自动给对方发消息）——\n"
+    "也可以直接说「明天9点提醒我给张三发…」。\n"
+    "/定时 —— 看列表\n"
+    "/定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
+    "/定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
+    "/定时 删|开|关 <编号|all> —— 删 / 恢复 / 暂停\n"
+    "时间写法：9:00=每天，明天9:00=只一次，每周一 9:00=每周，每30分钟=每隔一段"
 )
 
 
-def handle_command(text, wcf, cfg, live_ok):
+def handle_command(text, wcf, cfg, live_ok, contacts=None):
     """识别 / 开头的命令。返回 (回复文本, 是否改了配置)；非命令返回 (None, False)。"""
     t = text.strip()
     if not t.startswith("/"):
@@ -274,6 +284,17 @@ def handle_command(text, wcf, cfg, live_ok):
         # 命令之前的快照，直接用它会在「读-改-写」里丢掉上一次的改动。
         return auto_reply.handle_command(arg, settings.effective(load_config()), wcf,
                                          can_lookup=live_ok)
+
+    if cmd in ("/定时", "/schedule", "/提醒"):
+        # 同 /auto：重新读一次，避免连着发命令时丢掉上一条的改动。
+        fresh = settings.effective(load_config())
+
+        def resolve(who):
+            # 走和 agent 工具**同一套**解析：重名不静默取第一个
+            return agent_tools.resolve_one(contacts, who,
+                                           fresh.get("self_wxid", ""), wcf)
+
+        return scheduler.handle_command(arg, fresh, resolve, can_lookup=live_ok)
 
     return f"未知命令 {cmd}。发 /help 查看帮助。", False
 
@@ -488,7 +509,7 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
         result = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
         last_text = result.text or last_text
         if not result.tool_calls:
-            return result.text or "（模型没有返回内容）", box.auto_changed
+            return result.text or "（模型没有返回内容）", box.cfg_changed
 
         messages.append({
             "role": "assistant",
@@ -508,9 +529,9 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
     try:
         final = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
         return (final.text or last_text or "（工具调用次数用完了，没能给出答复）",
-                box.auto_changed)
+                box.cfg_changed)
     except Exception:
-        return last_text or "（工具调用次数用完了，没能给出答复）", box.auto_changed
+        return last_text or "（工具调用次数用完了，没能给出答复）", box.cfg_changed
 
 
 # 自己刚发出去的回复，用来防止「自聊模式下回复又被当成新消息」造成死循环
@@ -619,9 +640,37 @@ def connect_aixed(base_url):
     return None
 
 
-def iter_wcferry_messages(wcf):
+class _Ticker:
+    """把定时任务的 tick 节流到最多 min_gap 秒一次。
+
+    两条收消息通路（轮询 / wcferry 阻塞读）都在里面调 tick：这样定时任务
+    永远跑在**同一条线程**上，绝不会和收消息并发碰 hook。
+    """
+
+    def __init__(self, fn, min_gap=1.0):
+        self.fn = fn
+        self.min_gap = min_gap
+        self.last = 0.0
+
+    def __call__(self):
+        if self.fn is None:
+            return
+        now = time.monotonic()
+        if now - self.last < self.min_gap:
+            return
+        self.last = now
+        try:
+            self.fn()
+        except Exception:
+            # 定时任务炸了绝不能把收消息的主循环带下去
+            traceback.print_exc()
+
+
+def iter_wcferry_messages(wcf, tick=None):
     """wcferry 的 get_msg 是阻塞的，直接 yield。"""
+    tick = tick or (lambda: None)
     while True:
+        tick()
         try:
             msg = wcf.get_msg()
         except Exception:
@@ -632,12 +681,16 @@ def iter_wcferry_messages(wcf):
         yield msg
 
 
-def iter_aixed_messages(client, interval):
+def iter_aixed_messages(client, interval, tick=None):
     """aixed 没有收消息接口，只能轮询数据库拿新消息。"""
+    tick = tick or (lambda: None)
     cursor, seen = client.prime()
     print(f"[bot] 轮询模式：游标 = {cursor}，间隔 {interval}s")
     polls = 0
     while True:
+        # 每一轮轮询之前先跑一次定时任务：空闲时这个循环每 interval 秒转一圈，
+        # 所以定时精度就是 poll_interval（默认 5 秒）。
+        tick()
         msgs = []
         try:
             msgs, cursor, seen = client.poll_messages(since=cursor, seen=seen)
@@ -773,6 +826,7 @@ def main():
     else:
         print("[bot] 自动回复：未配置（在微信里发 /auto add <昵称> 添加）")
     print("[bot] 在微信里发 /help 查看可用的配置命令。Ctrl+C 退出。")
+    print(f"[bot] {scheduler.summary_line(cfg)}")
 
     def reload_cfg():
         """配置被改后重建主循环的状态。
@@ -789,8 +843,26 @@ def main():
         auto_recs = auto_reply.chats(cfg)
         control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
 
-    source = (iter_aixed_messages(wcf, poll_interval)
-              if backend == "aixed" else iter_wcferry_messages(wcf))
+    def run_scheduled():
+        """跑一遍到点的定时任务。
+
+        **只在收消息那条线程上调用**（见 _Ticker）：定时任务里要发消息，
+        而 hook 不支持并发——另起线程会直接把微信搞崩。
+        传入的是内存里的 cfg（不是重新读盘）：scheduler 会就地更新任务的
+        next_ts，这样同一个任务不会在下一 tick 又触发一遍。命令改过配置后
+        主循环会 reload_cfg()，新任务自然生效。
+        """
+        fired = scheduler.run_due(
+            cfg, datetime.now(),
+            send_text=lambda to, text: send(text, to),
+            notify=lambda text: send(text, control_chat),
+        )
+        if fired:
+            print(f"[bot] 定时任务已触发：{'、'.join(fired)}")
+
+    source = (iter_aixed_messages(wcf, poll_interval, tick=_Ticker(run_scheduled))
+              if backend == "aixed"
+              else iter_wcferry_messages(wcf, tick=_Ticker(run_scheduled)))
 
     try:
         while True:
@@ -842,7 +914,7 @@ def main():
                 continue
 
             # 1) 命令优先
-            reply, changed = handle_command(query, wcf, cfg, live_ok)
+            reply, changed = handle_command(query, wcf, cfg, live_ok, contacts)
             if reply is not None:
                 send(reply, sender)
                 if changed:

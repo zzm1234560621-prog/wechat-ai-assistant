@@ -22,6 +22,7 @@ import time
 import auto_reply
 import image_cache
 import live_history
+import scheduler
 
 # 允许发送的图片后缀
 _IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -167,6 +168,43 @@ TOOLS = [
         },
     },
     {
+        "name": "schedule",
+        "description": (
+            "管理「定时任务」——到点自动给某人发消息（打电话还没做出来）。"
+            "用户提这类要求时**必须调用本工具**，不要只口头答应：\n"
+            "  「明天9点提醒我给张三发个消息说带伞」→ action=add, when=明天9:00,"
+            " who=张三, text=记得带伞\n"
+            "  「每天早上8点给李四发个早安」→ action=add, when=8:00, who=李四, text=早安\n"
+            "  「每周一9点给王五发周报提醒」→ action=add, when=每周一 9:00, ...\n"
+            "  「每隔半小时给他发一次」→ action=add, when=每30分钟, ...\n"
+            "  「把第2个定时删了」→ action=del, target=t2\n"
+            "  「定时都先停掉」→ action=off, target=all\n"
+            "  「我有哪些定时」→ action=status\n"
+            "when 是**时间写法**，照用户原话写：9:00=每天、明天9:00=只一次、"
+            "每周一 9:00、每30分钟。别把它换算成别的时间。"
+            "打电话（mode=call）目前发不出去，用户要这个时也要照实建、"
+            "并告诉他到点只会报错。"
+            "调用后把工具返回的内容**如实复述**给用户，别自己另编一套说法。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": ["add", "del", "on", "off", "status"]},
+                "when": {"type": "string",
+                         "description": "时间写法：9:00 / 明天9:00 / 每周一 9:00 / 每30分钟"},
+                "who": {"type": "string",
+                        "description": "昵称/备注/微信号/wxid"},
+                "text": {"type": "string", "description": "要发的内容（action=add 且不是通话时必填）"},
+                "mode": {"type": "string", "enum": ["text", "call"],
+                         "description": "默认 text；call=打电话（还没打通）"},
+                "target": {"type": "string",
+                           "description": "del/on/off 时的任务编号，如 t2；on/off 可用 all"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "find_images",
         "description": (
             "列出某个聊天里最近的**图片**消息，并标明哪几张能真正看到。"
@@ -303,6 +341,7 @@ TOOLS = [
 ]
 
 _AUTO_ACTIONS = ("on", "off", "add", "del", "mode", "review", "ctx", "status")
+_SCHED_ACTIONS = ("add", "del", "on", "off", "status")
 
 
 class _Budget:
@@ -423,6 +462,68 @@ def send_pending(client, item, interval=0.0):
                          item.get("count") or 1, interval)
 
 
+def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None):
+    """昵称/备注/微信号 -> 候选列表。先精确匹配，没有再退到包含匹配。
+
+    抽成模块级是为了让 bot 的 /定时 命令也能用**同一套**解析：重名处理必须一致，
+    不能一边要求用户说清楚、另一边静默取第一个（那会发错人）。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return []
+
+    # 原始 id 直接透传：群没法用昵称定位（只能给 roomid），而且这样不查库。
+    if looks_like_id(name):
+        for c in contacts or []:
+            if str(c.get("wxid") or "") == name:
+                return [c]
+        return [{"wxid": name, "name": name}]
+
+    # 精确相等必须单独一遍——否则「李同学」会把「李同学2」也带出来。
+    exact = []
+    for c in contacts or []:
+        for key in (c.get("remark"), c.get("name"), c.get("alias"), c.get("wxid")):
+            if key and str(key) == name:
+                exact.append(c)
+                break
+    if exact:
+        return exact
+
+    loose = []
+    for c in contacts or []:
+        for key in (c.get("remark"), c.get("name"), c.get("alias")):
+            if key and name in str(key):
+                loose.append(c)
+                break
+    if loose:
+        return loose
+
+    if self_wxid and name == self_wxid:
+        return [{"wxid": self_wxid, "name": "我自己"}]
+    # 退路：交给 live_history 去库里模糊找（会花一次查询预算）
+    if client is not None and (budget is None or budget.take()):
+        try:
+            return live_history.resolve_contact(client, name, limit=5)
+        except Exception:
+            return []
+    return []
+
+
+def resolve_one(contacts, name, self_wxid="", client=None, budget=None):
+    """把「昵称/备注/wxid」解析成唯一候选人。返回 (候选人, 错误文本)。
+
+    重名时**不静默取第一个**——那会读错人、甚至发错人。
+    """
+    cands = resolve_contacts(contacts, name, self_wxid, client, budget)
+    if not cands:
+        return None, f"没找到「{name}」。"
+    if len(cands) > 1:
+        names = "；".join(
+            f"{c.get('remark') or c.get('name')}({c.get('wxid')})" for c in cands[:5])
+        return None, f"「{name}」匹配到多个人：{names}。请用全名或直接给 wxid。"
+    return cands[0], None
+
+
 class ToolBox:
     """一次对话里执行工具调用的上下文。"""
 
@@ -435,8 +536,8 @@ class ToolBox:
         # 取「当前最新配置」的方式。cfg 是构造时的快照，一轮里连着改两次
         # 第二次就会基于旧快照读-改-写，把第一次的改动丢掉。
         self.cfg_provider = cfg_provider or (lambda: self.cfg)
-        # 有工具改动了配置（目前只有 auto_reply），主循环要据此重建自己的状态
-        self.auto_changed = False
+        # 有工具改动了配置（auto_reply / 定时任务），主循环要据此重建自己的状态
+        self.cfg_changed = False
         agent_cfg = self.cfg.get("agent") or {}
         self.whitelist = [str(x).strip() for x in (agent_cfg.get("auto_send_whitelist") or []) if str(x).strip()]
         self.confirm_ttl = int(agent_cfg.get("confirm_ttl", 300))
@@ -512,48 +613,9 @@ class ToolBox:
     # ---------- 工具实现 ----------
 
     def _resolve(self, name):
-        """昵称/备注/微信号 -> 候选列表。先精确匹配，没有再退到包含匹配。"""
-        name = str(name or "").strip()
-        if not name:
-            return []
-
-        # 原始 id 直接透传：群没法用昵称定位（只能给 roomid），而且这样不查库。
-        # 已知联系人仍用列表里的显示名，别退化成一串 wxid。
-        if looks_like_id(name):
-            for c in self.contacts:
-                if str(c.get("wxid") or "") == name:
-                    return [c]
-            return [{"wxid": name, "name": name}]
-
-        # 第一遍：精确相等。必须单独一遍——否则「李同学」会把「李同学2」也带出来。
-        exact = []
-        for c in self.contacts:
-            for key in (c.get("remark"), c.get("name"), c.get("alias"), c.get("wxid")):
-                if key and str(key) == name:
-                    exact.append(c)
-                    break
-        if exact:
-            return exact
-
-        # 第二遍：包含
-        loose = []
-        for c in self.contacts:
-            for key in (c.get("remark"), c.get("name"), c.get("alias")):
-                if key and name in str(key):
-                    loose.append(c)
-                    break
-        if loose:
-            return loose
-
-        if self.self_wxid and name == self.self_wxid:
-            return [{"wxid": self.self_wxid, "name": "我自己"}]
-        # 退路：交给 live_history 去库里模糊找
-        if self.budget.take():
-            try:
-                return live_history.resolve_contact(self.client, name, limit=5)
-            except Exception:
-                return []
-        return []
+        """昵称/备注/微信号 -> 候选列表。实现见模块级 resolve_contacts。"""
+        return resolve_contacts(self.contacts, name, self.self_wxid,
+                                self.client, self.budget)
 
     def _in_whitelist(self, wxid, name):
         for w in self.whitelist:
@@ -964,10 +1026,28 @@ class ToolBox:
                                                   self.client, can_lookup=True,
                                                   name_hint=hint)
         if changed:
-            self.auto_changed = True
+            self.cfg_changed = True
         if action == "status":
             return text          # 状态本身就把名单列全了，不用再补一行摘要
         return f"{text}\n（当前自动回复：{auto_reply.summary_line(self.cfg_provider())}）"
+
+    def t_schedule(self, args):
+        args = args or {}
+        action = str(args.get("action") or "").strip().lower()
+        if action not in _SCHED_ACTIONS:
+            return f"action 只能是 {' / '.join(_SCHED_ACTIONS)} 之一。"
+        who = str(args.get("who") or "").strip()
+        # 和 /定时 走**同一条**实现（scheduler.handle_command），
+        # 包括重名不静默取第一个这条规矩。
+        arg = scheduler.build_arg(
+            action, when=args.get("when"), who=who, text=args.get("text"),
+            target=args.get("target") or who, mode=args.get("mode"))
+        text, changed = scheduler.handle_command(arg, self.cfg_provider(), self._one)
+        if changed:
+            self.cfg_changed = True
+        if action == "status":
+            return text
+        return f"{text}\n（当前{scheduler.summary_line(self.cfg_provider())}）"
 
     # ---------- 分发 ----------
 
