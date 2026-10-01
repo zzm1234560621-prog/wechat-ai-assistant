@@ -13,6 +13,9 @@ settings.json
 data/
 *.log
 
+# ---- 自测用的图片（从微信缓存里拷的，是私人内容，别提交）----
+test_images/
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
