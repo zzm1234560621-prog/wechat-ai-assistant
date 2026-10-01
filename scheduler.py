@@ -40,12 +40,14 @@ _USAGE = (
     "用法（也可以直接跟助手说「明天9点提醒我给张三发…」）：\n"
     "  /定时 —— 看列表\n"
     "  /定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
+    "  /定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
     "  /定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
     "  /定时 删 <编号> —— 删掉\n"
     "  /定时 开|关 <编号|all> —— 恢复 / 暂停\n"
     "时间写法：9:00 是每天，明天9:00 是只一次，"
     "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段。\n"
-    "例：/定时 加 明天9:00 张三 记得带伞"
+    "例：/定时 加 明天9:00 张三 记得带伞\n"
+    "    /定时 加提问 每天8:00 整理一下谁还没回我、昨天有什么漏的"
 )
 
 
@@ -239,15 +241,22 @@ def describe(t):
     else:
         when = f"每天 {t.get('at', '')}"
 
-    what = "打电话" if t.get("action") == "call" else "发消息"
-    body = f"「{t.get('text', '')[:20]}」" if t.get("action") != "call" else ""
+    act = t.get("action")
+    body = f"「{(t.get('text') or '')[:24]}」"
+    if act == "call":
+        what = f"打电话给 {t.get('to_name') or t.get('to')}"
+    elif act == "ask":
+        # 提问式的答案是回控制会话的，没有「发给谁」这回事
+        what = f"问你：{body}"
+    else:
+        what = f"发消息给 {t.get('to_name') or t.get('to')} {body}"
+
     nx = t.get("next_ts")
     nxt = ""
     if nx and t.get("enabled", True):
         nxt = "，下次 " + datetime.fromtimestamp(float(nx)).strftime("%m-%d %H:%M")
     flag = "" if t.get("enabled", True) else "（已暂停）"
-    return (f"[{t.get('id')}] {when} {what}给 {t.get('to_name') or t.get('to')}"
-            f"{body}{nxt}{flag}")
+    return f"[{t.get('id')}] {when} {what}{nxt}{flag}"
 
 
 def status_text(cfg):
@@ -271,13 +280,15 @@ def summary_line(cfg):
 
 # ---------------- 执行 ----------------
 
-def run_due(cfg, now, send_text, notify=None, call=None):
+def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
     """跑一遍到点的任务。**在主循环那次 tick 里调用**（单线程）。
 
     send_text(wxid, text)  发文本
     notify(text)           把结果发到控制会话（可选）
     call(wxid, name)       发起语音通话；返回 None 表示成功，返回字符串表示失败原因。
                            没给 call 就说明还没打通，如实报错、**不降级成发文本**。
+    ask(prompt)            把这句话当提问跑一次助手，返回答复（失败就抛异常）。
+                           答案回控制会话——「定时给我一份整理」用的就是这条。
     返回本次触发的任务 id 列表。
     """
     if not enabled(cfg):
@@ -285,20 +296,47 @@ def run_due(cfg, now, send_text, notify=None, call=None):
     now = now or datetime.now()
     now_ts = now.timestamp()
     recs = tasks(cfg)
-    fired = []
-    dirty = False
 
+    # 先排好「谁该触发、下次什么时候」，落盘，**再**执行动作。
+    # 顺序很要紧：动作里可能会跑一次 agent，而 agent 可能改配置（加/删定时任务），
+    # 那时候才写盘就会把我们手里这份旧列表盖回去。先写盘就没这问题。
+    fire = []
+    dirty = False
     for t in recs:
         if not t.get("enabled", True):
             continue
         nx = t.get("next_ts")
         if nx is None or float(nx) > now_ts:
             continue
+        t["last_ts"] = now_ts
+        nxt = _next_after(t, now)
+        if nxt is None:
+            # 一次性任务：跑完就停，但**不删**——留着让用户看得到
+            t["next_ts"] = None
+            t["enabled"] = False
+        else:
+            t["next_ts"] = nxt
+        fire.append(t)
+        dirty = True
+    if dirty:
+        _save(tasks=recs)
 
+    fired = []
+    for t in fire:
         tid = str(t.get("id"))
         name = t.get("to_name") or t.get("to")
         try:
-            if t.get("action") == "call":
+            act = t.get("action")
+            if act == "ask":
+                if ask is None:
+                    if notify:
+                        notify(f"⏰ 定时任务 [{tid}] 到点了，但没法执行——"
+                               f"主循环没提供 ask 回调。")
+                else:
+                    answer = ask(t.get("text") or "")
+                    if notify:
+                        notify(answer)
+            elif act == "call":
                 # 语音通话的发送路径还没打通（见记忆里的逆向记录）。
                 # 这里**必须报错**，不能悄悄改成发文本——那会骗用户。
                 if call is None:
@@ -315,21 +353,7 @@ def run_due(cfg, now, send_text, notify=None, call=None):
         except Exception as e:  # 一条任务炸了不能拖垮主循环
             if notify:
                 notify(f"⏰ 定时任务 [{tid}] 执行失败：{e}")
-
-        # 记一次触发时间，再算下次
-        t["last_ts"] = now_ts
-        nxt = _next_after(t, now)
-        if nxt is None:
-            # 一次性任务：跑完就停，但**不删**——留着让用户看得到
-            t["next_ts"] = None
-            t["enabled"] = False
-        else:
-            t["next_ts"] = nxt
         fired.append(tid)
-        dirty = True
-
-    if dirty:
-        _save(tasks=recs)
     return fired
 
 
@@ -344,7 +368,12 @@ def build_arg(action, when="", who="", text="", target="", mode="call"):
     if a in ("list", "status", "列表", ""):
         return ""
     if a in ("add", "加", "添加"):
-        head = "addcall" if str(mode or "").lower() in ("call", "通话", "电话") else "add"
+        if str(mode or "").lower() in ("call", "通话", "电话"):
+            head = "addcall"
+        elif str(mode or "").lower() in ("ask", "提问"):
+            head = "ask"
+        else:
+            head = "add"
         return " ".join(x for x in (head, when, who, text) if str(x).strip())
     if a in ("del", "delete", "删", "删除"):
         return f"del {target or who}".strip()
@@ -389,8 +418,9 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         _save(tasks=keep)
         return f"已删除任务 {rest}。", True
 
-    if sub in ("add", "加", "添加", "addcall", "加通话", "加电话"):
+    if sub in ("add", "加", "添加", "addcall", "加通话", "加电话", "加提问", "ask"):
         want_call = sub in ("addcall", "加通话", "加电话")
+        want_ask = sub in ("加提问", "ask")
         # 时间可能是两个词（「明天 9:00」「2026-10-02 9:00」），先按前缀吃掉
         bits = rest.split()
         if not bits:
@@ -408,6 +438,12 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         if want_call:
             who = " ".join(tail).strip()
             text = ""
+        elif want_ask:
+            # 提问式：整段剩下的话就是问题，不用解析对象（答案回控制会话）
+            text = " ".join(tail).strip()
+            who = ""
+            if not text:
+                return "要说清楚问什么。例：/定时 加提问 每天8:00 整理谁还没回我", False
         else:
             if not tail:
                 return _USAGE, False
@@ -416,16 +452,19 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
             if not text:
                 return "要发的内容不能空。用法：/定时 加 <时间> <对象> <内容>", False
 
-        cand, err = resolve(who)
-        if err:
-            return err, False
-        wxid = str(cand.get("wxid"))
-        disp = str(name_hint or "").strip() or (cand.get("remark") or cand.get("name")
-                                               or wxid)
-        if not can_lookup and not wxid:
-            return "当前查不到联系人，请直接填 wxid。", False
+        wxid = disp = ""
+        if not want_ask:
+            cand, err = resolve(who)
+            if err:
+                return err, False
+            wxid = str(cand.get("wxid"))
+            disp = str(name_hint or "").strip() or (cand.get("remark") or cand.get("name")
+                                                   or wxid)
+            if not can_lookup and not wxid:
+                return "当前查不到联系人，请直接填 wxid。", False
 
-        task = {"id": _next_id(recs), "action": "call" if want_call else "text",
+        action = "call" if want_call else ("ask" if want_ask else "text")
+        task = {"id": _next_id(recs), "action": action,
                 "to": wxid, "to_name": disp, "text": text, "enabled": True,
                 "last_ts": None}
         task.update(spec)
@@ -518,16 +557,27 @@ if __name__ == "__main__":
         {"id": "t3", "action": "text", "to": "wxid_c", "to_name": "王五",
          "text": "还没到", "repeat": "daily", "at": "23:00", "enabled": True,
          "next_ts": base.timestamp() + 9999, "last_ts": None},
+        {"id": "t4", "action": "ask", "to": "", "to_name": "", "text": "整理谁还没回我",
+         "repeat": "daily", "at": "08:00", "enabled": True,
+         "next_ts": base.timestamp() - 1, "last_ts": None},
     ]}}
     # 把 _save 挡掉，自测不写 settings.json
     _real_save = _save
     globals()["_save"] = lambda **kw: None
+    asked = []
+
+    def _ask(q):
+        asked.append(q)
+        return f"（整理结果：{q} → 3 人没回）"
+
     try:
         fired = run_due(cfg, base, lambda to, tx: sent.append((to, tx)),
-                        notify=notes.append)
+                        notify=notes.append, ask=_ask)
     finally:
         globals()["_save"] = _real_save
-    chk(fired == ["t1", "t2"], f"触发 t1/t2，没触发 t3（实际 {fired}）")
+    chk(fired == ["t1", "t2", "t4"], f"触发 t1/t2/t4，没触发 t3（实际 {fired}）")
+    chk(asked == ["整理谁还没回我"], "提问式任务把 text 当问题传下去了")
+    chk(any("整理结果" in n for n in notes), "提问的答案回控制会话了")
     chk(sent == [("wxid_a", "记得带伞")], "文本任务真发了")
     chk(all("李四" in n and "没有执行" in n for n in notes if "李四" in n),
         "通话任务**如实报错**，没有偷偷改成发文本")
@@ -587,6 +637,12 @@ if __name__ == "__main__":
         out, ch = handle_command("加 每30分钟 李四 打卡", c2, resolve)
         chk(ch and saved.get("tasks", [{}])[-1].get("every_minutes") == 30,
             "间隔式任务")
+
+        out, ch = handle_command("加提问 每天8:00 整理谁还没回我", c2, resolve)
+        tk = saved.get("tasks", [{}])[-1]
+        chk(ch and tk.get("action") == "ask" and tk.get("text") == "整理谁还没回我"
+            and not tk.get("to"), "提问式任务：不用填对象，问题原样存下")
+        chk("问你" in out, "列表里把提问式任务显示成「问你…」")
 
         out, ch = handle_command("删 t1", c2, resolve)
         chk(ch and "已删除" in out, "按编号删")
