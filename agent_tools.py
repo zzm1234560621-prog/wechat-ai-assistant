@@ -831,6 +831,43 @@ def send_repeated(client, wxid, text, count=1, interval=0.0):
     return sent, None
 
 
+# 自己刚发出去的**图片**：图片没有文本可比，只能用「会话 + 时间窗」认。
+# 为什么必须有：`live_history` 补了「非文本补漏」之后（图片不在 fts 里，见那边的
+# docstring），**我们自己发出去的图也会被回显成一条新消息**——文本有
+# `bot._SENT_RECENT` / `remember_sent` 兜着，图片没有，于是自聊场景下 bot 会
+# 对着自己刚发的图再答一轮。这组簿记就是给图片用的同一件事。
+_SENT_IMAGE = {}
+# 窗口给短：只要盖住「发出去 → 下一轮轮询看见」这段（poll_interval 默认 5 秒）。
+# 窗口越大，越可能把**对方真发来的图**误当成自己的回显丢掉 —— 宁可漏判不误判。
+_SENT_IMAGE_TTL = 30.0
+
+
+def remember_sent_image(talker):
+    """记下「我刚给这个会话发过图」。所有发图路径都要调（见三处调用点）。"""
+    _SENT_IMAGE[str(talker)] = time.time()
+
+
+def is_own_image(talker, ts):
+    """这条图片消息是不是我自己刚发出去的那张（而不是对方发的）。
+
+    判据：会话对得上 + 消息时间落在发图那一刻的窗口内。取不到时间就**不当成自己的**
+    （漏判的代价是「自聊时多答一句」，误判的代价是「把对方发来的图静默丢掉」，
+    后者严重得多）。
+    """
+    t = _SENT_IMAGE.get(str(talker))
+    if t is None:
+        return False
+    if time.time() - t > _SENT_IMAGE_TTL:
+        return False
+    try:
+        ts = float(ts or 0)
+    except (TypeError, ValueError):
+        return False
+    if ts <= 0:
+        return False
+    return abs(ts - t) <= _SENT_IMAGE_TTL
+
+
 def send_pending(client, item, interval=0.0, allowed_dirs=None):
     """执行一条待确认动作，返回 (真正发出的条数, 错误)。**同步、串行。**
 
@@ -872,6 +909,8 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None):
             except Exception as e:
                 return sent, e
             sent += 1
+        if sent:
+            remember_sent_image(wxid)     # 免得这张图回显时又被当成新消息
         return sent, None
     if item.get("xml"):
         try:
@@ -1488,6 +1527,7 @@ class ToolBox:
                 self.client.send_image(path, wxid)
             except Exception as e:
                 self._send_fail(f"给 {nm} 发图片失败：{e}")
+            remember_sent_image(wxid)     # 免得这张图回显时又被当成新消息
             self._sent_count += 1
             self.sent.append((nm, desc))
             return f"已把 {base} 发给 {nm}。"
@@ -1564,6 +1604,7 @@ class ToolBox:
                     self._sent_count += i
                     self._send_fail(f"发到第 {i + 1} 张失败（前面 {i} 张已发出）：{e}")
             self._sent_count += len(picked)
+            remember_sent_image(wxid)     # 免得这些图回显时又被当成新消息
             self.sent.append((nm, desc))
             return f"已把 {len(picked)} 张图片发给 {nm}。{trunc}"
 

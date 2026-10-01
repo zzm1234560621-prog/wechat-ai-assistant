@@ -1587,6 +1587,15 @@ def main():
                            and _msg_ts < _START_TS
                            and (_now - _msg_ts) > catchup_after)
 
+                # 图片消息：**自己刚发出去的那张会作为「我发的新消息」回显回来**
+                # （图片不在 fts 里，是靠 live_history 的非文本补漏捞回来的，见那边
+                # 的 docstring），不能当成新消息再答一遍。文本有 is_own_reply 兜着，
+                # 图片没有，所以这里用「会话 + 时间窗」认（agent_tools 那组簿记）。
+                if getattr(msg, "local_type", 1) != 1 \
+                        and agent_tools.is_own_image(sender, _msg_ts):
+                    print(f"[bot] 跳过（这是自己刚发出的图片）: {sender}")
+                    continue
+
                 if msg.from_self():
                     # 自己发的消息默认忽略（否则会回复自己）。
                     # 但「文件传输助手」这类自聊场景需要响应自己——

@@ -1437,6 +1437,65 @@ def _v4_active_talkers(client, since):
     return [str(_pick(r, "username", 0)) for r in rows if _pick(r, "username", 0)]
 
 
+def _v4_pickup_nontext(client, cursors, already, limit=10):
+    """把 **fts 装不下的非文本（主要是图片）**从消息表里捞出来。
+
+    为什么非有这一条不可（2026-10-01 实测）：
+      * **fts 里根本不存在 `local_type = 3` 的行** —— 四个分片
+        `SELECT COUNT(*) WHERE local_type = 3` 全是 **0**。所以轮询游标走 fts
+        时，**任何会话里别人发来的图片它永远看不见**；
+      * 另一条路 `_v4_new_messages_session` 靠 SessionTable.summary，
+        而图片的 summary 是**空串** → 被 `if not content: continue` 跳过。
+      两条路都瞎，用户看到的就是「我把图发过去了，它一点反应没有」。
+
+    做法：只用 SessionTable 当「有新动静」的信号（几百行的小表、一次查询），
+    条件收紧到 **最后一条不是文本**（summary 为空）才回查那个会话的消息表。
+    稳态下这个查询返回 0 行 → **不增加任何额外查库**；真收到图才多 1~2 次查询。
+
+    每个会话一个水位线 `cursors["__nonttext__"][talker]`，避免同一张图每轮重复报。
+    **第一次见到某会话时只记水位线、不报**——和 `prime()` 的语义一致
+    （只管「启动之后」的新消息，不把历史图片翻出来刷一遍）。
+    """
+    since = _as_int((cursors or {}).get("__time__", 0))
+    sql = ("SELECT username, last_timestamp FROM SessionTable "
+           f"WHERE last_timestamp >= {since} "
+           "AND (summary IS NULL OR summary = '')")
+    try:
+        rows = _query(client, "session.db", sql)
+    except Exception as e:
+        _note_poll_error("session.db", e)
+        return []
+
+    wm = cursors.setdefault("__nonttext__", {})
+    if not isinstance(wm, dict):          # 旧 state.json 里形状不对就重置，别让它挡住轮询
+        wm = cursors["__nonttext__"] = {}
+
+    seen = {(m.get("talker"), m.get("content"), m.get("_ts")) for m in (already or [])}
+    out = []
+    for r in rows:
+        talker = str(_pick(r, "username", 0) or "")
+        last_ts = _as_int(_pick(r, "last_timestamp", 1))
+        if not talker or last_ts <= 0:
+            continue
+        if talker not in wm:
+            wm[talker] = last_ts          # 第一次见：只记水位线（不报历史图片）
+            continue
+        prev = _as_int(wm.get(talker, 0))
+        if last_ts <= prev:
+            continue
+        wm[talker] = last_ts
+        # 这条会话最后一条是非文本 → 回查它的消息表，把新增的那几条渲染出来
+        for m in _v4_history_from_tables(client, talker, limit=limit):
+            if _as_int(m.get("_ts", 0)) <= prev:
+                continue
+            key = (m.get("talker"), m.get("content"), m.get("_ts"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+    return out
+
+
 def _v4_new_messages(client, cursors, limit=200):
     """按 **rowid 游标**取新消息——纯索引范围扫描，最便宜的一条路。
 
@@ -1508,7 +1567,18 @@ def _v4_new_messages(client, cursors, limit=200):
                 "is_self": 1 if (self_id is not None and sender == self_id) else 0,
                 "time": _fmt_time(_pick(r, "create_time", 4)),
                 "_ts": ts,
+                # local_type 带下去：上层要区分「文本 vs 图片」才能决定该不该
+                # 响应（例如自己刚发出去的图不该再被当成新消息）。
+                "local_type": lt,
             })
+
+    # 补漏：图片之类**不在 fts 里**的消息，靠 SessionTable 的信号捞回来。
+    # 详见 _v4_pickup_nontext 的 docstring（这是「对方发图、bot 没反应」的根治处）。
+    try:
+        out.extend(_v4_pickup_nontext(client, cursors, out, limit=10))
+    except Exception as e:
+        _note_poll_error("session.db", e)
+
     out.sort(key=lambda m: m["_ts"])
     return out, cursors
 

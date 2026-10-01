@@ -51,15 +51,19 @@ class Msg:
     """冒充 wcferry 的 Message，让 bot.py 的消息处理逻辑可以原样复用。
 
     只保留 bot.py 用到的：type / sender / roomid / content / from_self()。
+    `local_type` 是 4.x 的消息类型（1=文本 3=图片 49=appmsg…）：**图片不在 fts 里**，
+    是靠 `live_history` 的非文本补漏捞回来的，上层要区分它才能决定该不该响应
+    （例如自己刚发出去的图不该再当成新消息答一遍）。默认 1 = 文本，老调用不受影响。
     """
 
-    __slots__ = ("talker", "content", "is_self", "create_time")
+    __slots__ = ("talker", "content", "is_self", "create_time", "local_type")
 
-    def __init__(self, talker="", content="", is_self=0, create_time=0):
+    def __init__(self, talker="", content="", is_self=0, create_time=0, local_type=1):
         self.talker = str(talker or "")
         self.content = str(content or "")
         self.is_self = _as_int(is_self)
         self.create_time = _as_int(create_time)
+        self.local_type = _as_int(local_type) or 1
 
     @property
     def type(self):
@@ -130,16 +134,39 @@ class AixedClient:
         return []
 
     @staticmethod
-    def _check(resp, what=""):
-        """这套接口用 {"status": <负数>, "desc": "..."} 表示失败。
+    def _neg(v):
+        """值是「负数」就返回它，否则 None（兼容 `-1` 和 `"-1"` 两种写法）。"""
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v if v < 0 else None
+        if isinstance(v, str):
+            try:
+                n = int(v.strip())
+            except (TypeError, ValueError):
+                return None
+            return n if n < 0 else None
+        return None
 
-        必须显式检查：否则查库失败会被 _rows 当成「空结果」，
-        表现成「没有新消息」，把错误静默吞掉。
+    @classmethod
+    def _check(cls, resp, what=""):
+        """失败必须显式抛错——否则会被 `_rows` 当成「空结果」静默吞掉。
+
+        这套 hook 的失败标记**有两种**：
+          * `{"status": <负数>, "desc": ...}`（查库那些接口）
+          * `{"ret": <负数>, "msg"/"retmsg": ...}`（发送那些接口；成功是
+            `{"ret":0,"retmsg":"success"}`，JSON 坏掉是 `{"ret":-1,...}`）
+        以前这里**只认 `status`**，于是发送类接口的 `ret:-1` 被当成功放过去。
+        ⚠️ 但要知道限度：`/SendImgMsg` **成功也是无条件 `ret:0`**（hook 侧
+        `WeixinSend::SendImage` 是 void、连 HeapAlloc 失败都只是 return），
+        所以「没报错」**不等于真发出去了**——发图之后要不要读回校验，
+        由上层按代价决定（见 `live_history` 的图片补漏与 `bot.py` 的发送分支）。
         """
         if isinstance(resp, dict):
-            st = resp.get("status")
-            if isinstance(st, int) and st < 0:
-                raise AixedError(f"{what}失败：{resp.get('desc') or resp}")
+            for key, desc in (("status", "desc"), ("ret", "retmsg")):
+                if cls._neg(resp.get(key)) is not None:
+                    detail = resp.get(desc) or resp.get("msg") or resp
+                    raise AixedError(f"{what}失败：{detail}")
         return resp
 
     # ---------- 与 wcferry 对齐的接口 ----------
@@ -281,7 +308,8 @@ class AixedClient:
             if key in seen:
                 continue
             seen[key] = None
-            out.append(Msg(m["talker"], m["content"], m["is_self"], m["_ts"]))
+            out.append(Msg(m["talker"], m["content"], m["is_self"], m["_ts"],
+                           m.get("local_type", 1)))
         while len(seen) > seen_max:
             seen.pop(next(iter(seen)))
         return out, new_cursor, seen

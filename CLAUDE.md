@@ -175,6 +175,22 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - 查某会话历史：`WHERE session_id = N ORDER BY create_time DESC LIMIT k` —— 过滤先缩小行集，所以快（0.41 秒）。
 - 关键词检索走 `acontent MATCH '...'`（唯一有索引的路径；`message_fts.db` 带 fts5 + 微信自研中文分词器）。
 - **fts 库的 `Name2Id` 和 `message_N.db` 的不是同一套 id**，`session_id` / `sender_id` 必须用 fts 库自己的解。
+- **⚠️ 图片消息不在 fts 里（2026-10-01 实测）。** 四个分片的
+  `SELECT COUNT(*) FROM <分片> WHERE local_type = 3` **全是 0** —— 微信的 fts 只索引
+  有文本内容的行。后果：**只靠 fts 游标轮询，永远看不见别人发来的图片**
+  （表现就是「我把图发过去了，它一点反应没有」）。而另一条路
+  `_v4_new_messages_session` 靠 `SessionTable.summary`，图片的 summary 是**空串**，
+  被 `if not content: continue` 跳过 —— **两条通路都瞎**。
+  这就是 `live_history._v4_pickup_nontext` 存在的原因：拿 `SessionTable` 的
+  `last_timestamp` + `summary = ''` 当「最后一条不是文本」的信号，只对这类会话
+  回查一次消息表（水位线 `cursors["__nonttext__"]` 防重复；**稳态下 0 行 → 零额外查询**）。
+  **改收消息通路时，必须同时想「fts 装不下的类型怎么办」。**
+- **自己发出去的图也会回显成一条新消息**（因为上面那条补捞）。文本有
+  `bot.remember_sent` / `is_own_reply` 兜着，**图片没有** —— 所以每条发图路径都要调
+  `agent_tools.remember_sent_image()`，主循环用 `is_own_image()` 把回显认掉。
+  时间窗只有 30 秒，取不到消息时间就**不当成自己的**：宁可漏判（自聊时多答一句），
+  也绝不误判（那会把**对方真发来的图静默丢掉**）。回归用例在 `selftest_live_history.py`
+  与 `selftest_bot_loop.py`。
 - 最近消息直接读 `session.db` 的 `SessionTable.summary`（一次查询 0.012 秒）；逐个会话去 FTS 捞要 4.4 秒。
 - `all_contacts` 的 limit 别设小（用户有 10875 个联系人，曾写死 5000 导致按人名查历史时灵时不灵）。
 - **`contact.db` 的表**（2026-10-01 实探）：`contact`、`chatroom_member`、`chat_room`、`chat_room_info_detail`、`stranger`、`biz_info`、`contact_label`、`name2id`、`encrypt_name2id` 等。

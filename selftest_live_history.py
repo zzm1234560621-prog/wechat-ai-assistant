@@ -566,10 +566,104 @@ def main():
     ok &= check("带选择性过滤（rowid IN）、不做排序",
                 all("rowid IN" in s and "ORDER BY" not in s for _, s in mapped), mapped)
 
+    # ---------------------------------------------------------------
+    print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
+    ok &= _t_nonttext_pickup()
+
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")
     print("=" * 50)
     return 0 if ok else 1
+
+
+_IMG_TS = 1790000100
+
+
+class _PickupStub:
+    """只回答 _v4_pickup_nontext 需要的那几个查询。
+
+    真实故障的形状（2026-10-01 实测）：**图片不在 fts 里**（四个分片
+    `local_type=3` 全是 0 条），而 SessionTable 里那个会话 `summary` 是空串。
+    """
+
+    def __init__(self, last_ts=_IMG_TS, has_image=True):
+        self.last_ts = last_ts
+        self.has_image = has_image
+        self.sql_log = []
+
+    def query_sql(self, db, sql):
+        self.sql_log.append((db, sql))
+        if db == "session.db":
+            return [{"username": "filehelper", "last_timestamp": str(self.last_ts)}]
+        if db.startswith("message_"):
+            if "sqlite_master" in sql:
+                return [{"x": 1}]
+            if "FROM Msg_" in sql:
+                if self.has_image:
+                    return [{"local_id": "7", "local_type": "3",
+                             "create_time": str(self.last_ts),
+                             "real_sender_id": "0", "message_content": ""}]
+                return []
+            return []
+        raise aixed_api.AixedError(db)
+
+    def get_dbs(self):
+        return []
+
+    def msg_queries(self):
+        return [s for db, s in self.sql_log if "FROM Msg_" in s]
+
+
+def _t_nonttext_pickup():
+    """非文本补漏的三条硬要求：不报历史、不重复报、稳态零开销。"""
+    ok = True
+    _clear_poll_errors()
+    c = _PickupStub()
+    cursors = {"__time__": _IMG_TS - 100}
+
+    out1 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
+    ok &= check("第一次见到某会话：只记水位线，不把历史图片翻出来报",
+                out1 == [] and (cursors.get("__nonttext__") or {}).get("filehelper") == _IMG_TS,
+                (out1, cursors.get("__nonttext__")))
+    ok &= check("第一次也不去查消息表（省掉无谓查询）", c.msg_queries() == [], c.msg_queries())
+
+    c.last_ts = _IMG_TS + 5
+    out2 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
+    ok &= check("水位线前进之后，把那张图片消息报上来",
+                len(out2) == 1 and out2[0].get("local_type") == 3
+                and "[图片]" in str(out2[0].get("content")),
+                out2)
+
+    out3 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
+    ok &= check("同一张图不会每轮重复报（水位线生效）", out3 == [], out3)
+
+    # 已经在 fts 结果里的那条不许重复报（去重）
+    c.last_ts = _IMG_TS + 9
+    dup = [{"talker": "filehelper", "content": out2[0]["content"], "_ts": _IMG_TS + 9}]
+    out4 = live_history._v4_pickup_nontext(c, cursors, dup, limit=5)
+    ok &= check("已经在 fts 结果里的那条不重复报", out4 == [], out4)
+
+    # 稳态：summary 非空（最后一条是文本）→ 假 client 返回空 → 一次消息表都不查
+    class _NoNontext(_PickupStub):
+        def query_sql(self, db, sql):
+            self.sql_log.append((db, sql))
+            if db == "session.db":
+                return []            # 真实 SQL 已经用 summary='' 过滤掉了
+            return []
+
+    c2 = _NoNontext()
+    cur2 = {"__time__": _IMG_TS}
+    out5 = live_history._v4_pickup_nontext(c2, cur2, [], limit=5)
+    ok &= check("最后一条是文本时：零额外查询、零输出（稳态不加负担）",
+                out5 == [] and c2.msg_queries() == [], (out5, c2.msg_queries()))
+
+    # 坏掉的游标形状不许把轮询挡住
+    cur3 = {"__time__": _IMG_TS, "__nonttext__": "垃圾"}
+    c3 = _PickupStub(last_ts=_IMG_TS + 1)
+    live_history._v4_pickup_nontext(c3, cur3, [], limit=5)
+    ok &= check("__nonttext__ 形状不对时自动重置，不抛异常",
+                isinstance(cur3.get("__nonttext__"), dict), cur3.get("__nonttext__"))
+    return ok
 
 
 if __name__ == "__main__":

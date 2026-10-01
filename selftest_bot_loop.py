@@ -24,6 +24,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import agent_tools                      # noqa: E402
+import aixed_api                        # noqa: E402
 import auto_reply                       # noqa: E402
 import bot                              # noqa: E402
 import image_cache                      # noqa: E402
@@ -436,6 +437,48 @@ def t_image_dirs_union(tmp):
         agent_tools._WARNED_IMAGE_DIRS[0] = orig_w
 
 
+def t_check_ret():
+    """失败标记两种都要认：`status`（查库）和 `ret`（发送类）。
+
+    hook 的发送接口成功时回 `{"ret":0,"retmsg":"success"}`、JSON 坏掉回 `{"ret":-1}`，
+    而旧 `_check` **只认 status** → `ret:-1` 被当成功放过去（静默）。
+    """
+    sec("失败标记：status 与 ret 都要认")
+    ck = aixed_api.AixedClient._check
+    chk(ck({"ret": 0, "retmsg": "success"}) is not None, "ret:0 当成功放行")
+    for bad in ({"ret": -1, "msg": "invalid json"}, {"status": -1, "desc": "x"},
+                {"ret": "-1"}, {"status": "-1"}):
+        try:
+            ck(bad, "发送 ")
+            chk(False, f"{bad} 应当被认成失败")
+        except aixed_api.AixedError:
+            chk(True, f"{bad} 被认成失败（旧代码对 ret 是静默的）")
+    chk(ck(None) is None, "非 dict 原样返回（不误伤）")
+    chk(ck({}) is not None, "空 dict 当成功（没有失败标记）")
+    chk(ck({"ret": True}) is not None, "ret 是布尔 True 不算负数（别把 bool 当 int）")
+
+
+def t_own_image():
+    """自己刚发出去的图片：不能被下一轮轮询当成新消息再答一遍。
+
+    图片补上「非文本补漏」之后（图片不在 fts 里），**我们自己发的图也会回显**。
+    文本有 is_own_reply 兜着，图片没有，所以用「会话 + 时间窗」认。
+    """
+    sec("自己刚发出的图片：不误当成新消息，也不误伤对方发来的图")
+    agent_tools._SENT_IMAGE.clear()
+    now = time.time()
+    chk(not agent_tools.is_own_image("filehelper", now),
+        "没记过 → 不是自己的（**对方发来的图绝不能被误判丢掉**）")
+    agent_tools.remember_sent_image("filehelper")
+    chk(agent_tools.is_own_image("filehelper", now), "刚记过 + 时间吻合 → 认成自己的回显")
+    chk(not agent_tools.is_own_image("wxid_other", now), "别的会话不算")
+    chk(not agent_tools.is_own_image("filehelper", 0),
+        "取不到消息时间 → 不当成自己的（宁可漏判多答一句，也不误判丢图）")
+    agent_tools._SENT_IMAGE["filehelper"] = now - agent_tools._SENT_IMAGE_TTL - 5
+    chk(not agent_tools.is_own_image("filehelper", now), "超过时间窗 → 不再当成自己的")
+    agent_tools._SENT_IMAGE.clear()
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -455,6 +498,8 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     t_redact_wiring()
     t_usage_cmd()
+    t_check_ret()
+    t_own_image()
 
     print("\n" + "=" * 60)
     if _FAIL:
