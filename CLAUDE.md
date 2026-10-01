@@ -65,7 +65,8 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 ```
 
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
-- `agent_tools.py` — 给大模型的工具层（**19 个工具**：find_contact / send_text / read_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / run_command）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
+- `agent_tools.py` — 给大模型的工具层（**20 个工具**：find_contact / send_text / read_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / send_asset / run_command）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
+- `assets.py` — **素材暂存区**：用户在控制会话里发一次图/表情，之后说「发给谁」就能再发。见下面「素材暂存」。
 - `auto_reply.py` — 代用户本人回指定会话。
   - **审核是「每个会话一份」，全局那份只是默认值**（`review_on(rec, cfg)`：`rec["review"]` 优先，`None` 才继承全局）。
     所以「只让某个人免确认」是 `/auto review off 张三`，不该动全局。
@@ -113,7 +114,15 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
     没装的人「装完还是起不来」死循环（H1 那类），installer 还会去装这个重包。
     **可选依赖一律写成注释**（pywxdump 一直是这么写的）。回归：`selftest_audio.py`。
 - `image_cache.py` — 找微信 4.x 的**明文缩略图缓存**（`<账号>/cache/<月>/Message/<md5>/Thumb/`）。`send_image` 的默认白名单就是这里的 `image_cache_dirs()`（即 `<账号>/cache`），**不再是整个 `xwechat_files`**。
-  - **只有「别人发来的图」才有 `Thumb/<local_id>_<create_time>_thumb.jpg`。自己发出去的图，微信只留加密原图（`Bubble/<md5>_b.dat`，实测 filehelper 那条会话连 `Thumb/` 目录都没有）** → `read_image` 对这类图**读不了内容**，只能在消息里如实说「看不了」。这是微信的存储事实，不是本项目的 bug；**别顺手去解密 `.dat`**（那是另一件事，见 `docs/wechat4-dat-image-notes.md`）。
+  - **「自己发出去的图没有明文缩略图」这条只对了一部分**（2026-10-01 的观察，
+    现在实测已经反例）：`cache\<月>\Message\<md5(会话)>\Thumb\<local_id>_<create_time>_thumb.jpg`
+    里确实有**自己发出去**的图——`md5("filehelper")` 那个目录下就有
+    `265_1789304494_thumb.jpg`（同目录 `Bubble\` 里还有配对的加密 `_b.dat`）。
+    所以**别拿「自己发的图一定没缩略图」当判据**：有就发/能读，没有才如实说看不了。
+    覆盖到哪一步取决于微信渲染与缓存清理，**不是保证**；而且仍然是缩略图不是原图。
+    `read_image` 对没有缓存的图**读不了内容**，只能在消息里如实说「看不了」。
+    这是微信的存储事实，不是本项目的 bug；**别顺手去解密 `.dat`**（那是另一件事，
+    见 `docs/wechat4-dat-image-notes.md`）。
   - 渲染图片消息时**带上 `local_id`**（`live_history` 里做），模型据此能直接 `read_image(contact, local_id)`；不带的话它得先 `find_images` 再 `read_image`，白多一次查库。
 - `llm.py` — anthropic / openai 两种协议，工具调用格式互转。
 - `providers.py` — 服务商预设表（`/provider` 与 `setup_llm.py` 共用同一份，别各写一份）。
@@ -258,6 +267,55 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   2. 才手工 `force_rescan`。
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。
 - 回归用例：`selftest_aixed.py` 的 `_V4StaleFtsStub`。
+
+## 素材暂存（assets.py）——发一次图/表情，之后说「发给谁」就能再发
+
+用户要的能力：在控制会话（文件传输助手）里发一张图或一个表情，之后只说「发给张三」
+就发出去，想发几次发几次。
+
+```
+控制会话来了图片/表情/视频
+  → bot.py `stash_control_media()`：`live_history.media_kind()` 认出是哪一类
+  → `live_history.latest_media()` 拿到那条的 local_id（一次 PK 索引查询）
+  → `live_history.message_xml()` 取**原始 XML** → `assets.stash()` 落盘 data/assets.json
+  → 回一句回执（「已暂存这张图。说『发给谁』我就发」）
+用户说「发给张三」
+  → 模型调 `send_asset`：名单内 `send_xml_repeated()` 直接转发 /
+    名单外 `set_pending(..., label=...)` 等用户回「确认」
+```
+
+- **存的是消息 XML，不是图片副本**（定下来的方案，别改回去）：用户**自己发出去**的图
+  在磁盘上只有 AES 加密的 `.dat`（密钥没拿到，见 `docs/wechat4-dat-image-notes.md`），
+  明文顶多是**缩略图**、表情包基本没有；转发原始 XML 不需要解密，原图/动图都保留。
+- **hook 成功也无条件回 `ret:0`**（`aixed_api` 的说明），所以「转发其实没成」本地
+  发现不了。回给用户的只能是「已发出」，**不许**说成「对方收到了」——`assets.py` 顶部、
+  `send_asset` 的注释和 config 的 `assets` 段都写了这一条。**真机验收要肉眼确认一次。**
+- 只收**用户自己发出去的**（`msg.from_self()`）：控制会话是"和自己说话"，别人发进来的图
+  不该被悄悄收进暂存区——那会让「发给谁」把对方刚发来的东西又发出去。
+- 只收**能转发的三类**（`live_history.media_kind()`：图片/视频/表情，含 appmsg 编码）。
+  语音/文件/位置/名片/链接**一律不收**：转发不了，收进来就是骗用户（工具回一句「已发」
+  而对方什么都收不到）。**想往 `media_kind` 里加类型，先确认 hook 真能转发那一类。**
+- **补存（`ToolBox._sync_latest_asset`）不能删。** 图和「发给谁」这句话可能落在
+  **同一个轮询间隔**（`poll_interval` 默认 5 秒）里，那时 `SessionTable.summary` 已经是
+  文字、非空，`_v4_pickup_nontext` 会**整条会话都不回查** —— 那张图永远不会被暂存。
+  所以 `send_asset` 在真的要发素材时回查一次「控制会话里最新的媒体」并补存
+  （普通消息上**一次都不查**）。**取不到那张更新图的原文时必须一张都不发**，
+  绝不退回发暂存区里旧的那张——发错东西不可逆。回归：`selftest_assets.test_sync_latest`。
+- **重复暂存不叠两条**（同会话同 local_id 挪到最新）；满了顶掉最老的，并且**要把
+  「顶掉了几条」说出来**——静默丢弃不允许。
+- 容量 `assets.max_items`（默认 5）在 **`assets.cap_of(cfg)` 里夹在 1~20 并告警**（唯一一处
+  钳制逻辑，bot 和工具都走它），别让它变成「配置写 9999 就真存 9999 条」。
+- `assets.load()` 遇到坏文件/形状不对**只告警、当空**（和 `data/state.json` 同一姿势）；
+  没有 xml 的条目读出来就丢——那种条目存下去也转发不了。`assets.stash()` 缺 xml/local_id
+  **直接拒绝存**（抛 ValueError），别让它进暂存区。
+- 暂存区**故意不并进 `data/state.json`**：那份是「轮询游标 + 待确认队列」的单一真源，
+  素材库是另一码事，混进去会让那条规矩变糊。
+- `send_pending()` 对 `xml` 认 `count`（素材那条路要连发）；`forward_message` **没有**
+  count 参数、仍然只发一次——别顺手给它加（转发别人的消息连发更容易发错对象）。
+- 3.9.x（wcferry）后端没有 `message_xml`，这条功能只有 4.x 有；媒体在 v3 那条路上
+  根本进不了主循环（`bot.py` 开头 `msg.type != 1` 就 continue）。
+- 回归：`selftest_assets.py`（媒体类型判定 / latest_media / 落盘与容量 / 按序号取 /
+  名单内直发与名单外待确认 / 连发钳制 / 中途失败的「已发出 N」）。
 
 ## 运行看护（health / status_page / usage / redact）
 

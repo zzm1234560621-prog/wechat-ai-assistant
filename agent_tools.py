@@ -20,6 +20,7 @@ import os
 import sys
 import time
 
+import assets
 import auto_reply
 import executor
 import file_read
@@ -54,7 +55,8 @@ _MAX_QUERIES_MAX = 20
 # 「发送类」工具：它们会**真的把东西发出去**，所以异常时不能只说一句
 # 「工具 X 执行出错」——那样模型会以为一条都没发，转头跟用户说「没发出去」，
 # 而实际上可能已经发出去好几条了。见 ToolBox.run() 的异常分支。
-_SEND_TOOLS = ("send_text", "send_image", "send_images", "forward_message")
+_SEND_TOOLS = ("send_text", "send_image", "send_images", "forward_message",
+               "send_asset")
 
 
 def looks_like_id(name):
@@ -505,6 +507,30 @@ TOOLS = [
         },
     },
     {
+        "name": "send_asset",
+        "description": (
+            "把**用户刚在控制会话里发过的那张图/表情**（素材暂存区里的东西）发给某人。\n"
+            "用户先发一张图或表情、再说「发给张三」「刚才那张发给他」「再发一次给李四」"
+            "时**必须用这个**——不要用 send_image（那要一个本地路径）、也不要让用户"
+            "去念 local_id。\n"
+            "which 默认 1 = 最近一张；用户说「第2张」就填 2。count 是连发几次"
+            "（只在用户明确说「发 N 次」时才填）。\n"
+            "暂存区是空的、或取不到那条素材时，工具会回一句人话——如实转述给用户"
+            "（让他先在文件传输助手里发一张图或表情），**绝不许改用别的图或编一张**。\n"
+            "和 send_text 一样受确认机制约束：名单外的收件人要先请用户回「确认」。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "收件人的昵称/备注/微信号/wxid"},
+                "which": {"type": "integer",
+                          "description": "第几张素材，默认 1 = 最近一张"},
+                "count": {"type": "integer", "description": "连发几次，默认 1"},
+            },
+            "required": ["to"],
+        },
+    },
+    {
         "name": "run_command",
         "description": (
             "在用户本机执行**一条命令行命令**（cmd / PowerShell 都能用）。"
@@ -656,7 +682,7 @@ def _alive(chat, ttl):
 
 
 def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
-                image=None, xml=None, cmd=None, timeout=None):
+                image=None, xml=None, cmd=None, timeout=None, label=None):
     """登记一条待确认发送。kind 区分来源：agent（用户让助手发的）/ auto（自动回复草稿）。
 
     bot 对两者要求不一样：自动回复草稿只认明确的中文确认词，避免用户在控制
@@ -666,8 +692,13 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
     agent.send_interval 兜着，别指望调用方自觉。
 
     image / xml 用来表示「这条待确认要发的不是文本」：image 是本地图片路径，
-    xml 是要转发的原始消息 XML。bot 的确认分支据此选发法（都只发一次，
-    count/连发只对文本有意义）。
+    xml 是要转发的原始消息 XML。`count` 对二者都认：image 是「这串路径按顺序发」
+    （路径重复几次就发几次），xml 是「同一条转发几次」。
+
+    `label` 是给用户看的**指代**（素材暂存区专用，例如「那张图」/「第 2 个表情」）：
+    有它就用它，没有才回退到「转发一条消息」这种描述（见 describe_pending）。
+    为什么不复用 text：xml 那条待确认项没有正文可比，用户回「确认」时看到的
+    必须是「要发哪一条」，含糊过去等于让他闭着眼睛确认。
 
     kind="shell" 表示「待确认执行的一条本地命令」：cmd 是**模型给的命令原文**，
     text 也存同一份原文（bot 复述给用户用）。它没有收件人，to_wxid / to_name
@@ -676,7 +707,7 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
     _PENDING.setdefault(str(chat), []).append(
         {"to_wxid": to_wxid, "to_name": to_name, "text": text,
          "image": image, "xml": xml,
-         "cmd": cmd, "timeout": timeout,
+         "cmd": cmd, "timeout": timeout, "label": label,
          "kind": kind, "count": int(count or 1), "ts": time.time()})
 
 
@@ -790,7 +821,12 @@ def describe_pending(item):
         cmd, note = _clip(str(raw or ""), 200)
         return f"本机命令「{cmd}」{(' ' + note) if note else ''}"
 
-    # 2) 待确认发送的图片（单张或一串路径）
+    # 2) 素材暂存区那条：用户给的是「那张图」这种指代，必须原样显示出来，
+    #    否则用户回「确认」时根本不知道要发的是哪一条（xml 本身没有正文可比）。
+    if item.get("label"):
+        return f"发给 {to_name} {item['label']}"
+
+    # 3) 待确认发送的图片（单张或一串路径）
     img = item.get("image")
     if img:
         paths = [img] if isinstance(img, str) else list(img)
@@ -800,18 +836,18 @@ def describe_pending(item):
         head = "、".join(names[:3]) + ("…" if len(names) > 3 else "")
         return f"发给 {to_name} {len(names)} 张图片（{head}）"
 
-    # 3) 待确认转发的一条消息
+    # 4) 待确认转发的一条消息
     if item.get("xml"):
         return f"转发一条消息给 {to_name}"
 
     text, note = _clip(item.get("text"), 120)
     tail = f" {note}" if note else ""
 
-    # 4) 自动回复草稿：正文已经原样发给用户看过了，这里不重复（省 token）
+    # 5) 自动回复草稿：正文已经原样发给用户看过了，这里不重复（省 token）
     if kind == "auto":
         return f"自动回复草稿 → 发给 {to_name}：{text}{tail}"
 
-    # 5) 普通的待确认发送
+    # 6) 普通的待确认发送
     try:
         count = int(item.get("count") or 1)
     except (TypeError, ValueError):
@@ -842,6 +878,30 @@ def send_repeated(client, wxid, text, count=1, interval=0.0):
             time.sleep(interval)
         try:
             client.send_text(text, wxid)
+        except Exception as e:
+            return sent, e
+        sent += 1
+    return sent, None
+
+
+def send_xml_repeated(client, xml, wxid, count=1, interval=0.0):
+    """把同一条消息 XML **转发** count 次，每次之间等 interval 秒。
+    返回 (真正发出的条数, 错误)。同步、顺序，故意不开线程——理由同 send_repeated。
+
+    为什么转发也要支持连发：素材暂存区那条路（用户发一次图、之后说「发给谁」）
+    里，「再发 3 次」是用户会说的话。现有的 `forward_message` 工具**没有** count
+    参数，所以那条路仍然只发一次（不要顺手给它加上，转发别人的消息连发更容易
+    发错对象，那是另一件事）。
+
+    中途失败立刻停手，已发出几条如实返回，不假装全成功。
+    """
+    count = max(1, int(count or 1))
+    sent = 0
+    for i in range(count):
+        if i and interval > 0:
+            time.sleep(interval)
+        try:
+            client.send_xml(xml, wxid)
         except Exception as e:
             return sent, e
         sent += 1
@@ -888,8 +948,9 @@ def is_own_image(talker, ts):
 def send_pending(client, item, interval=0.0, allowed_dirs=None):
     """执行一条待确认动作，返回 (真正发出的条数, 错误)。**同步、串行。**
 
-    文本可以连发；转发只发一次。图片可以是一个路径或**一串路径**（群发照片），
-    多个之间按 interval 停顿——连发期间轮询会暂停，这是有意为之（hook 不支持并发）。
+    文本和转发可以连发（转发连发的唯一来源是素材暂存区，见 send_xml_repeated）；
+    图片可以是一个路径或**一串路径**（群发照片），多个之间按 interval 停顿——
+    连发期间轮询会暂停，这是有意为之（hook 不支持并发）。
 
     `allowed_dirs`：**发送时的二次校验**。登记（工具）时校验过一次，但从登记到
     用户回「确认」之间隔着时间，配置可能变了、文件可能被换成链接指到别处——
@@ -930,11 +991,14 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None):
             remember_sent_image(wxid)     # 免得这张图回显时又被当成新消息
         return sent, None
     if item.get("xml"):
-        try:
-            client.send_xml(item["xml"], wxid)
-        except Exception as e:
-            return 0, e
-        return 1, None
+        n, err = send_xml_repeated(client, item["xml"], wxid,
+                                   item.get("count") or 1, interval)
+        if n:
+            # 转发出去的东西**也会回显成一条新消息**（转发给自己时就是控制会话）。
+            # 图片那条路一直记这一笔，转发这条路以前没记——转发给自己就会被当成
+            # 新消息再答一轮（现在还会被再暂存一遍）。所以这里一样记上。
+            remember_sent_image(wxid)
+        return n, err
     return send_repeated(client, wxid, item.get("text") or "",
                          item.get("count") or 1, interval)
 
@@ -1668,6 +1732,131 @@ class ToolBox:
         set_pending(self.chat, wxid, nm, desc, xml=xml)
         return (f"「{nm}」不在自动发送名单里，转发**尚未发出**。"
                 f"请告诉用户：准备把「{snm}」里那条消息转给 {nm}，"
+                f"让他回复「确认」后再发。")
+
+    def _sync_latest_asset(self, items):
+        """把控制会话里**比暂存区更新的**那条「自己发的媒体」补存进来。
+
+        为什么需要它（这是真机一定会撞上的窗口）：图 + 文字可能落在**同一个轮询
+        间隔**里（`poll_interval` 默认 5 秒）。那时 `SessionTable.summary` 已经是那句
+        文字、非空，`live_history._v4_pickup_nontext` 就**整条会话都不回查**——那张图
+        永远不会被暂存，用户说「发给谁」时暂存区里要么是空的、要么还是上一张。
+        这里在**用户真的要发素材**时补一次，代价是这一轮多一两次查库；普通
+        消息上**一次都不查**（不想为这个窗口给每条消息加查询）。
+
+        返回 (items, 错误文本)。没有更新的就把原样返回（绝大多数情况）。
+        """
+        newest = items[-1] if items else None
+        if not self.budget.take():
+            return items, ("本轮查库次数已用完，我没法核对「最新的那张」是哪一张，"
+                           "所以**没有发**（怕发成旧的那张）。请让用户再说一次"
+                           "「发给谁」。")
+        try:
+            rows = live_history.latest_media(self.client, self.chat, limit=1)
+        except Exception as e:
+            # 查不动 = 无从判断有没有更新的图。**宁可让用户再说一次，也不发旧的。**
+            return items, _db_fail("核对控制会话里最新的那张图", e)
+        if not rows:
+            return items, ""
+        top = rows[0] or {}
+        if top.get("is_self") != 1:
+            return items, ""
+        if newest is not None and str(newest.get("local_id")) == str(top.get("local_id")):
+            return items, ""        # 最新的这张已经在暂存区里了
+        if is_own_image(self.chat, top.get("_ts")):
+            # 这条是**我自己刚发出去的**回显（发图/转发都会记这笔）：不是用户新发的，
+            # 别把它当成「最新的素材」——否则会把机器人自己发的图再发一遍。
+            return items, ""
+        try:
+            xml = live_history.message_xml(self.client, self.chat, top.get("local_id"))
+        except Exception as e:
+            return items, _db_fail("取那张图的原始内容", e)
+        if not xml:
+            # **已经确认**有一张更新的图，但取不到它的原文：这时绝不许退回去发旧的
+            # 那张（那是发错东西，且不可逆）。如实说清楚，让用户重发一次。
+            return items, ("控制会话里有一张更新的图，但我取不到它的原始内容，"
+                           "所以这次**一张都没发**。请让用户重新发一次那张图，"
+                           "或者用 /素材 看看暂存区里现在有什么。")
+        try:
+            items, _added, _dropped = assets.stash(
+                assets.entry_from_media(top, xml), assets.cap_of(self.cfg))
+        except Exception as e:
+            return items, f"补存最新的那张图失败：{e}"
+        return items, ""
+
+    def t_send_asset(self, args):
+        """把素材暂存区里的那张图/表情发给某人（用户先说「发给谁」的场景）。
+
+        链路：`assets.pick()` 取素材（默认最近一条）→ 名单内直接
+        `send_xml_repeated()` 转发、名单外登记待确认（带 label，用户才看得出
+        要发的是哪一条）。
+
+        **为什么这里不校验 `allowed_image_dirs`**：发出去的是那条消息的原始 XML，
+        不是本地路径——「模型从你硬盘上挑文件发出去」这个攻击面在这里不存在
+        （那套白名单管的是 send_image / send_images）。素材来源也只有一条：
+        **用户自己**在控制会话里发过的那条消息（`assets` 只由 bot 主循环写入）。
+
+        取不到素材时如实回一句人话，**绝不退回「随便发一张」**：发消息不可逆，
+        发错东西收不回来。
+        """
+        to = str(args.get("to") or "").strip()
+        if not to:
+            return "参数不全：需要 to（收件人）。"
+
+        items = assets.load()
+        items, sync_err = self._sync_latest_asset(items)
+        if sync_err:
+            return sync_err
+        which = args.get("which")
+        a, err = assets.pick(items, which)
+        if err:
+            return (err + "（这不是发送失败，是**没有可发的素材**——"
+                    "请如实告诉用户，不要改用别的图或编一张。）")
+
+        rank = 1
+        if which not in (None, ""):
+            try:
+                rank = int(which)
+            except (TypeError, ValueError):
+                rank = 1
+
+        try:
+            count = int(args.get("count") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        # 闸在工具里：模型填多少都不算数（和 t_send_text 一致）
+        count = max(1, min(count, self.max_send_count))
+
+        cand, err = self._one(to)
+        if err:
+            return err
+        wxid = str(cand.get("wxid"))
+        nm = cand.get("remark") or cand.get("name") or to
+        what = assets.label(a, rank)
+        xml = str(a.get("xml") or "")
+
+        if self._in_whitelist(wxid, nm) or self._in_whitelist(wxid, to):
+            n, serr = send_xml_repeated(self.client, xml, wxid, count,
+                                        self.send_interval)
+            self._sent_count += n
+            if n:
+                # 同 send_pending：转发出去的东西会回显，别让它又被当成新消息
+                # （「转发给自己」那条尤其明显：不记就会再暂存一遍 + 多回一句）。
+                remember_sent_image(wxid)
+            self.sent.append((nm, what if n <= 1 else f"{what} ×{n}"))
+            if serr is not None:
+                self._send_fail(f"把{what}发给 {nm} 时失败"
+                                f"（已发出 {n}/{count} 次）：{serr}")
+            if n <= 1:
+                # 「已发」而不是「对方收到了」：hook 成功也无条件回 ret:0，
+                # 无法确认对方真收到（见 assets.py 顶部说明）。
+                return f"已把{what}发给 {nm}。"
+            return f"已把{what}给 {nm} 连发 {n} 次。"
+
+        set_pending(self.chat, wxid, nm, what, xml=xml, count=count, label=what)
+        times = f"连发 {count} 次" if count > 1 else "发一次"
+        return (f"「{nm}」不在自动发送名单里，{what}**尚未发送**。"
+                f"请告诉用户：准备把{what}{times}发给 {nm}，"
                 f"让他回复「确认」后再发。")
 
     def t_run_command(self, args):

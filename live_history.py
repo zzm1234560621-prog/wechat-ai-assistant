@@ -284,6 +284,27 @@ def _render_nontext(local_type, summary=""):
     return f"[{label}] {s[:200]}" if s else f"[{label}]"
 
 
+# 「能再发一次的媒体」：素材暂存区（assets.py）只收这三类。
+# 依据是 hook 的能力边界——`ForwardXMLMsg` 只认图片/视频/动图（CLAUDE.md 记着）。
+# 其余非文本（语音/文件/位置/名片/链接）**转发不了**，收进暂存区就是骗用户：
+# 到时候工具只能回一句「已发」而对方什么都收不到。
+_MEDIA_KIND = {3: "图片", 43: "视频", 47: "表情"}
+_MEDIA_APPMSG = {5: "图片", 8: "表情", 44: "视频"}
+
+
+def media_kind(local_type):
+    """这条消息是不是「能再发出去的媒体」，是就返回类型名，否则返回 ""。
+
+    4.x 里图片/表情有两种存法：直接的 local_type，以及 appmsg
+    （`local_type = (子类型<<32)|49`，实测 5=图片、8=表情、44=视频）。判据和
+    `_type_label` 一致，**只多一个「能不能转发」的取舍**，不要在这里塞别的语义。
+    """
+    lt = _as_int(local_type)
+    if (lt & 0xFFFFFFFF) == 49:
+        return _MEDIA_APPMSG.get(lt >> 32, "")
+    return _MEDIA_KIND.get(lt, "")
+
+
 def _xml_field(xml, tag):
     """从 XML 里抠一个标签的文本。微信的消息 XML 结构简单，正则够用。"""
     m = re.search(rf"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>", xml or "", re.S)
@@ -719,9 +740,11 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
                         if p:
                             content += f"；本地已解码缩略图：{p}）"
                         else:
-                            # **自己发出去的图**微信只留加密原图（`Bubble/<md5>_b.dat`），
-                            # 没有可解码的 Thumb（实测 filehelper 会话连 Thumb 目录都没有）。
-                            # 如实说明，别让模型以为「有图但它不去看」。
+                            # **自己发出去的图常常没有明文缩略图**（微信多数只留加密原图
+                            # `Bubble/<md5>_b.dat`）。注意：**不是绝对没有**——实测
+                            # `md5("filehelper")` 那个缓存目录下就有一张自己发的图的
+                            # Thumb（见 CLAUDE.md 的 image_cache 段）。所以这里只是
+                            # 「这次没找到」，别写成「自己发的图一定没有」。
                             content += "；微信没留可解码缩略图，看不了内容）"
                     except Exception:
                         content += "）"
@@ -862,6 +885,70 @@ def v4_images(client, talker, limit=30):
         picked += rest[:limit - len(picked)]
     picked.sort(key=lambda m: m["_ts"])
     return picked
+
+
+def latest_media(client, talker, limit=3):
+    """某会话最近的**可转发媒体**（图片/表情/视频），最近的在最前。
+
+    给素材暂存区用：用户在控制会话里发了张图，bot 要立刻知道是哪条消息
+    （`local_id`）、是不是他自己发的，好把那条的原始 XML 取出来留着转发。
+
+    只查 `Msg_<hash>` 表、`ORDER BY local_id DESC LIMIT n`（主键索引，便宜），
+    **不碰 fts**：图片/表情本来就不在 fts 里（见 `_v4_pickup_nontext`），走那条路
+    永远查不到。取最近的一小批行再在 Python 里挑媒体，不写 `WHERE local_type IN (...)`
+    ——那个条件没索引，稀疏类型会一路扫到底（CLAUDE.md 的 hook 铁律第 2 条）。
+
+    `is_self`：和 `_v4_history_from_tables` 同源（比对本分片 Name2Id 的 rowid）。
+    拿不到自己的 rowid 时为 None，调用方**必须当成"不确定"**，别当 0 用。
+
+    取不到（3.9.x / 没有该会话的表 / 库句柄失效）返回 []，由调用方如实报错。
+    仅 v4。
+    """
+    if not is_wechat4(client):
+        return []
+    table = _v4_table_for(talker)
+    want = max(1, int(limit))
+    # 多取几行：最近几条可能全是文本，媒体在更下面一点点。
+    fetch = max(12, want * 4)
+    out = []
+    for db in _v4_msg_dbs(client):
+        self_id = _v4_self_rowid(client, db)
+        try:
+            found = _query(client, db,
+                           f"SELECT local_id, local_type, real_sender_id, create_time "
+                           f"FROM {table} ORDER BY local_id DESC LIMIT {int(fetch)}")
+        except Exception:
+            continue  # 这个分片里没有该会话的表
+        for r in found:
+            lid = _pick(r, "local_id", 0)
+            lt = _as_int(_pick(r, "local_type", 1))
+            kind = media_kind(lt)
+            if not kind or lid in (None, ""):
+                continue
+            ct = _pick(r, "create_time", 3)
+            sid_i = _as_int(_pick(r, "real_sender_id", 2))
+            path = None
+            try:
+                import image_cache
+                path = image_cache.find(table[4:], lid, ct)
+            except Exception:
+                path = None
+            out.append({
+                "talker": talker,
+                "local_id": str(lid),
+                "local_type": lt,
+                "kind": kind,
+                "is_self": (None if self_id is None
+                            else (1 if sid_i == self_id else 0)),
+                # 明文缩略图（有就给，给不了 None）——转发才是主路径，
+                # 这个只是「顺带拿到」的兜底信息，别让上层以为一定有图可发。
+                "image": path,
+                "time": _fmt_time(ct),
+                "_ts": _as_int(ct),
+            })
+        break
+    out.sort(key=lambda m: -_as_int(m.get("_ts")))     # 最近的在最前
+    return out[:want]
 
 
 # 文件消息：appmsg 子类型 6 → local_type = (6<<32)|49（实测值，和图片的 5 同理）

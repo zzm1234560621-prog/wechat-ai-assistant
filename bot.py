@@ -20,6 +20,7 @@ from datetime import datetime
 import yaml
 
 import agent_tools
+import assets
 import auto_reply
 import executor
 import live_history
@@ -189,7 +190,13 @@ HELP_TEXT = (
     "/盯着 加 <昵称|wxid|roomid> —— 加进来\n"
     "/盯着 删 <昵称|wxid> —— 移出去\n"
     "/盯着 开|关 —— 总开关\n"
-    "（和 /auto 互斥：那个是代你回对方，这个是只告诉你不回）"
+    "（和 /auto 互斥：那个是代你回对方，这个是只告诉你不回）\n"
+    "\n"
+    "—— 素材暂存（发一次图/表情，之后说「发给谁」就能再发）——\n"
+    "在这里发一张图或一个表情，我就记下来（默认最多 5 条，新的顶掉最老的）。\n"
+    "之后直接说「发给张三」「把刚才那张发给李四」「发 3 次」就行。\n"
+    "/素材 —— 看暂存了什么\n"
+    "/素材 清空 —— 清空暂存区"
 )
 
 
@@ -385,6 +392,14 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
                                            fresh.get("self_wxid", ""), wcf)
 
         return watch.handle_command(arg, fresh, resolve_watch)
+
+    if cmd in ("/素材", "/asset", "/assetbank"):
+        # 容量的钳制在 _assets_cap 里（配置写歪了也只告警钳制，不静默放大）。
+        if arg.strip().lower() in ("清空", "clear", "清除", "删", "全清"):
+            n = assets.clear()
+            return (f"素材暂存区已清空（{n} 条）。" if n
+                    else "素材暂存区本来就是空的。"), False
+        return "\n".join(assets.list_lines(assets.load())), False
 
     return f"未知命令 {cmd}。发 /help 查看帮助。", False
 
@@ -1136,6 +1151,97 @@ def _probe_login(client):
     return True, ""
 
 
+def _msg_ts(msg):
+    try:
+        return int(getattr(msg, "create_time", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def stash_control_media(wcf, cfg, talker, msg, send):
+    """控制会话来了图片/表情/视频 -> 暂存进素材区并回执。返回 True = 已处理。
+
+    **为什么不把这件事交给模型**：素材是「刚才那张」。模型看不到图片内容、也拿不到
+    local_id（图片/表情根本不在 fts 里，见 live_history 的非文本补漏），让它去认
+    只会来回问用户。收到就存 + 回一句回执，用户才知道「它记住了」——这是确定性
+    动作，不该看模型心情。
+
+    **只收用户自己发出去的**（`msg.from_self()`）：控制会话是「和自己说话」，别人
+    发进来的图不该被悄悄收进暂存区——那会让「发给谁」把对方刚发来的东西又发出去。
+    `is_self` 取不到时（None）**不当素材**：宁可漏判，也不误存。
+
+    取不到那条消息的原始 XML 时**如实回一句「暂存失败」**并返回 True（这轮到此为止），
+    绝不退化成「先存个空壳」——空壳存下去，「发给谁」时会变成一个发不出去的东西。
+    """
+    if not (cfg.get("assets") or {}).get("enabled", True):
+        return False
+    kind = live_history.media_kind(getattr(msg, "local_type", 1))
+    if not kind or not msg.from_self():
+        return False
+
+    ts = _msg_ts(msg)
+    try:
+        rows = live_history.latest_media(wcf, talker, limit=3)
+    except Exception:
+        traceback.print_exc()
+        rows = []
+    mine = [r for r in rows if r.get("is_self") == 1]
+    target = next((r for r in mine if _msg_ts_key(r) == ts), None)
+    if target is None and len(mine) == 1 and abs(_msg_ts_key(mine[0]) - ts) <= 120:
+        # 库里 create_time 与轮询拿到的时间戳可能有秒级差异：只有**唯一候选**
+        # 且差得很小时才认。认错一条就是把别的消息存进素材区，宁可让用户重发一次。
+        target = mine[0]
+    if target is None:
+        print(f"[bot] 素材暂存失败：找不到对应的消息"
+              f"（local_type={int(getattr(msg, 'local_type', 0))} ts={ts}）")
+        send(f"{assets.this_label(kind)}我取不到原始内容，暂存失败"
+             f"（转发它需要那条原始消息）。", talker)
+        return True
+
+    try:
+        xml = live_history.message_xml(wcf, talker, target["local_id"])
+    except Exception:
+        traceback.print_exc()
+        xml = ""
+    if not xml:
+        print(f"[bot] 素材暂存失败：local_id={target.get('local_id')} 取不到原始 XML")
+        send(f"{assets.this_label(kind)}我取不到原始内容（转发不了），暂存失败。", talker)
+        return True
+
+    cap = assets.cap_of(cfg)          # 唯一一处钳制逻辑（assets.cap_of）
+    try:
+        items, added, dropped = assets.stash(
+            assets.entry_from_media(target, xml), cap)
+    except Exception as e:
+        traceback.print_exc()
+        send(f"暂存{assets.this_label(kind)}时出错：{e}", talker)
+        return True
+
+    print(f"[bot] 素材暂存 -> {talker}: {kind} local_id={target.get('local_id')} "
+          f"共 {len(items)}/{cap} 条" + (f"，顶掉最老的 {dropped} 条" if dropped else ""))
+    # 刚收到的这条**永远是第 1 条**（stash 把它挪到末尾），也就是说「发给谁」
+    # 默认发的就是它——这正是用户要的「发一次，然后说发给谁」。
+    if added:
+        head = f"已暂存{assets.this_label(kind)}。"
+    else:
+        head = f"{assets.this_label(kind)}刚才已经存过了，还是用它。"
+    if dropped:
+        extra = f"（最多 {cap} 条，顶掉了最老的 {dropped} 条）"
+    elif len(items) > 1:
+        extra = f"（暂存区共 {len(items)} 条，第 1 条是最近那张）"
+    else:
+        extra = ""
+    send(head + "说「发给谁」我就发；想连发就说「发 3 次」。" + extra, talker)
+    return True
+
+
+def _msg_ts_key(row):
+    try:
+        return int((row or {}).get("_ts") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def iter_aixed_messages(client, interval, tick=None, cfg=None):
     """aixed 没有收消息接口，只能轮询数据库拿新消息。
 
@@ -1641,6 +1747,13 @@ def main():
                           f"{query[:30]}")
                     continue
 
+                # 1.1) 素材暂存：控制会话里发来的图片/表情/视频，收到就记下来
+                #      （之后说「发给谁」就能再发，见 assets.py）。
+                #      插在**补齐判定之后**：停机期间的旧图不补存——那个「刚才那张」
+                #      的语境早就过去了，存进来只会让「发给谁」发错东西。
+                if in_targets and stash_control_media(wcf, cfg, sender, msg, send):
+                    continue
+
                 # 自动回复：代我回对方。这条路**不解析命令**——
                 # 对方随口发个「/help」不该触发助手的命令表。
                 if rec is not None:
@@ -1756,7 +1869,8 @@ def main():
                         interval = max(0.0, float(agent_cfg.get("send_interval", 1.5)))
                         # 连发是同步做的：中途轮询会暂停几秒（消息在库里排着，回来照收）。
                         # 故意不开线程——并发碰 hook 会把微信搞崩。
-                        # 图片和转发只发一次，count/连发对它们没意义（见 send_pending）。
+                        # 图片按路径串发（一条路径一次）；转发认 count 的**只有素材
+                        # 暂存区那条路**（见 send_xml_repeated），forward_message 仍只发一次。
                         # 发送时**再校验一次**目录归属：登记时校验过，但登记之后
                         # 用户可能改了配置、路径本身也可能是个软链——发出去就收不回。
                         try:
@@ -1771,6 +1885,7 @@ def main():
                             # 记一下，免得发给自己时又被当成新消息回一遍
                             remember_sent(item["text"])
                         what = "转发" if item.get("xml") else "图片"
+                        label = item.get("label")
                         if err is not None:
                             print(f"[bot] 确认发送失败（已发 {n}/{count}）: {err}")
                             send(f"发给 {item['to_name']} 失败：{err}", sender)
@@ -1778,6 +1893,13 @@ def main():
                             print(f"[bot] 确认发送 -> {item['to_name']}: {item['text'][:40]} ×{n}")
                             send(f"已发送给 {item['to_name']}。" if n == 1
                                  else f"已给 {item['to_name']} 连发 {n} 条。", sender)
+                        elif label:
+                            # 素材暂存区那条路：说人话（「那张图」/「第 2 个表情」）。
+                            # 只说「已发出」不说「对方收到了」——hook 成功也回 ret:0，
+                            # 收没收到本地无法确认（见 assets.py 顶部）。
+                            print(f"[bot] 确认发送 -> {item['to_name']}: {label} ×{n}")
+                            send(f"已把{label}发给 {item['to_name']}"
+                                 + (f"（连发 {n} 次）。" if n > 1 else "。"), sender)
                         else:
                             print(f"[bot] 确认发送 -> {item['to_name']}: {what} ×{n}")
                             send(f"已把 {n} 张{what}发给 {item['to_name']}。" if n > 1

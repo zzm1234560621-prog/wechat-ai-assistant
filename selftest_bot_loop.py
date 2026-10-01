@@ -479,6 +479,95 @@ def t_own_image():
     agent_tools._SENT_IMAGE.clear()
 
 
+def t_stash_media(tmp):
+    """控制会话来了图片/表情 -> 自动暂存 + 回执（素材暂存区那条**确定性**链路）。
+
+    为什么不交给模型：素材是「刚才那张」，模型看不到图片内容、也拿不到 local_id。
+    这条链路的判据全在这里锁住：只收自己发的、只收能转发的类型、取不到原始 XML 就
+    如实说「暂存失败」（**绝不留一个发不出去的空壳**）、关掉开关就完全不动作。
+    """
+    sec("素材暂存：控制会话收到图片/表情就记下来，并回一句回执")
+    import assets
+    import live_history
+
+    old_path = assets.PATH
+    old_latest = live_history.latest_media
+    old_xml = live_history.message_xml
+    assets.PATH = os.path.join(tmp, "stash_assets.json")
+    sent = []
+
+    def _send(text, chat):
+        sent.append((text, chat))
+
+    def _msg(local_type=3, is_self=1, ts=1000):
+        return aixed_api.Msg("filehelper", "[图片]", is_self, ts, local_type)
+
+    def _row(kind="图片", local_type=3, is_self=1, ts=1000, lid="42"):
+        return {"talker": "filehelper", "local_id": lid, "local_type": local_type,
+                "kind": kind, "is_self": is_self, "image": None, "time": "", "_ts": ts}
+
+    try:
+        live_history.latest_media = lambda client, talker, limit=3: [_row()]
+        live_history.message_xml = lambda client, talker, lid: "<msg><img/></msg>"
+
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send) is True,
+            "图片：返回 True（这轮到此为止，不再当成提问丢给模型）")
+        chk(len(sent) == 1 and "已暂存" in sent[0][0] and "发给谁" in sent[0][0],
+            "回执说「已暂存」，并告诉用户接下来怎么说")
+        items = assets.load()
+        chk(len(items) == 1 and items[0]["xml"] == "<msg><img/></msg>",
+            "原始 XML 原样存进暂存区（转发要的就是它）")
+
+        bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send)
+        chk(len(assets.load()) == 1 and "已经存过了" in sent[-1][0],
+            "同一条重复报上来：不叠两条，回执改说「已经存过了」")
+
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper",
+                                    _msg(local_type=1), _send) is False,
+            "文本消息不拦（照旧走命令/问答）")
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper",
+                                    _msg(is_self=0), _send) is False,
+            "**别人发来的图不暂存**（否则「发给谁」会把对方刚发的又发出去）")
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper",
+                                    _msg(local_type=34), _send) is False,
+            "语音这类转发不了的类型不暂存")
+
+        live_history.latest_media = lambda client, talker, limit=3: [_row(is_self=None)]
+        n_before = len(assets.load())
+        sent.clear()
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send) is True
+            and "暂存失败" in sent[-1][0] and len(assets.load()) == n_before,
+            "认不出是不是自己发的 → 如实说暂存失败，不留空壳")
+
+        live_history.latest_media = lambda client, talker, limit=3: [_row()]
+        live_history.message_xml = lambda client, talker, lid: ""
+        sent.clear()
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send) is True
+            and "暂存失败" in sent[-1][0] and len(assets.load()) == n_before,
+            "取不到原始 XML → 如实说「转发不了」，不留空壳")
+
+        # 时间戳有秒级差异、只有一个候选：认下来（否则真机上会经常「暂存失败」）
+        live_history.message_xml = lambda client, talker, lid: "<msg><img/></msg>"
+        live_history.latest_media = lambda client, talker, limit=3: [_row(ts=1005, lid="43")]
+        sent.clear()
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(ts=1000), _send)
+            is True and len(assets.load()) == n_before + 1,
+            "时间戳差几秒且只有一个候选 → 认下来（别动不动就报暂存失败）")
+
+        # 关掉开关：什么都不做（连查库都不去）
+        def _boom(*a, **k):
+            raise AssertionError("开关关着就不该查库")
+        live_history.latest_media = _boom
+        sent.clear()
+        chk(bot.stash_control_media(None, {"assets": {"enabled": False}}, "filehelper",
+                                    _msg(), _send) is False and sent == [],
+            "assets.enabled=false：不暂存、不回执、不查库")
+    finally:
+        assets.PATH = old_path
+        live_history.latest_media = old_latest
+        live_history.message_xml = old_xml
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -494,6 +583,7 @@ def main():
         t_batch_survives_consumer_error(tmp)
         t_poll_failure_throttled(tmp)
         t_image_dirs_union(tmp)
+        t_stash_media(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     t_redact_wiring()
