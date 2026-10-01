@@ -44,6 +44,22 @@ def poll_errors():
     return dict(_POLL_ERRORS)
 
 
+def _note_poll_error(key, exc):
+    """记一次轮询失败（同一键累计连续次数），返回新的连续次数。
+
+    抽成函数是为了让**每一条**轮询路径都必须留痕：fts 分片和 session.db 兜底
+    都是「查不动了就永远收不到消息」的地方，静默只有一种后果——
+    日志看起来一切正常，实际一条消息都进不来。
+    只打第 1/10/50 次，避免每 5 秒刷一行。
+    """
+    n = _POLL_ERRORS.get(key, ("", 0))[1] + 1
+    _POLL_ERRORS[key] = (str(exc), n)
+    if n in (1, 10, 50):
+        print(f"[live] ⚠️ 轮询 {key} 连续失败 {n} 次：{exc}",
+              file=sys.stderr, flush=True)
+    return n
+
+
 def set_self_wxid(wxid):
     global _SELF_WXID
     _SELF_WXID = str(wxid or "")
@@ -67,6 +83,22 @@ def set_rescan_interval(seconds):
 def _q(s):
     """SQL 字符串转义（SQLite 里单引号转成两个单引号）。"""
     return str(s).replace("'", "''")
+
+
+def _like(col, value):
+    """生成一个**转义正确**的 LIKE 条件：`<col> LIKE '%值%' ESCAPE '\\'`。
+
+    为什么不能只过一遍 _q：`%` / `_` 在 LIKE 里是通配符，用户搜「50%」、
+    或者名字里带下划线的联系人（A_B）会命中一堆无关的人/消息
+    （`_` 匹配任意单字符，`A_B` 连 `AXB` 都能命中）。所以值里的 `\\`、`%`、`_`
+    都要转义，并配一个 ESCAPE 子句——**SQLite 没有默认转义符**，转义符必须自己声明，
+    否则转义写进去也只是字面反斜杠。
+
+    把整条条件（含 ESCAPE）放在这里生成，调用点就不会漏写 ESCAPE；
+    `=` 精确匹配的地方照旧用 _q，那边的语义一个字都没动。
+    """
+    s = str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{col} LIKE '%{_q(s)}%' ESCAPE '\\'"
 
 
 def _cached_positive(client, attr, builder, ttl=90):
@@ -285,14 +317,18 @@ def render_appmsg(xml, summary=""):
     所以这里把被引用的原文也带上。
     """
     if not xml:
-        return _render_nontext(0, summary)
+        return _render_nontext(49, summary)
 
     title = _xml_field(xml, "title")
     ref_block = _xml_field(xml, "refermsg")
     ref_content = _xml_field(ref_block, "content") if ref_block else ""
     ref_name = _xml_field(ref_block, "displayname") if ref_block else ""
 
-    label = "引用" if ref_block else _type_label(4 | (49 << 0))
+    # 49 是 appmsg 的**大类**（低位），这里拿不到子类型（子类型在 local_type 高 32 位，
+    # 而本函数手里只有 XML），所以按 _type_label 的约定传 49：高位 0 不在 _APPMSG_KIND
+    # 里，落到默认的「消息」。以前这里写 `4 | (49 << 0)` = 53，低位变成 53，
+    # 于是每条非引用的 appmsg 都显示成「类型53」——那是内部数字，只会误导模型。
+    label = "引用" if ref_block else _type_label(49)
     parts = []
     if ref_content:
         who = f"{ref_name}：" if ref_name else ""
@@ -302,8 +338,13 @@ def render_appmsg(xml, summary=""):
 
     said = title or _xml_field(xml, "content") or _xml_field(xml, "des") or summary
     if said:
+        # 只有 <des>（或只有 <content>）的 appmsg：上面两个分支都进不去，这里要是
+        # 光把内容塞进去，就丢了「[标签] 内容」的统一样式，模型看到的是一行没头没尾的
+        # 文本。des **必须能单独成词**，而且得带上标签。
+        if not parts:
+            parts.append(f"[{label}]")
         parts.append(str(said)[:200])
-    return " ".join(parts) if parts else _render_nontext(0, summary)
+    return " ".join(parts) if parts else _render_nontext(49, summary)
 
 
 def _fetch_message_xml(client, talker, local_id):
@@ -369,7 +410,7 @@ def _v3_query_history(client, talker, limit=50, keyword=None):
             f"WHERE StrTalker = '{t}' AND Type = 1"
         )
         if keyword:
-            sql += f" AND StrContent LIKE '%{_q(keyword)}%'"
+            sql += f" AND {_like('StrContent', keyword)}"
         sql += f" ORDER BY CreateTime DESC LIMIT {int(limit)}"
         try:
             for r in _query(client, db, sql):
@@ -388,11 +429,10 @@ def _v3_query_history(client, talker, limit=50, keyword=None):
 
 def _v3_search(client, keyword, limit=30):
     rows = []
-    k = _q(keyword)
     for db in _v3_msg_dbs(client):
         sql = (
             "SELECT StrTalker, StrContent, IsSender, CreateTime FROM MSG "
-            f"WHERE Type = 1 AND StrContent LIKE '%{k}%' "
+            f"WHERE Type = 1 AND {_like('StrContent', keyword)} "
             f"ORDER BY CreateTime DESC LIMIT {int(limit)}"
         )
         try:
@@ -450,6 +490,113 @@ def _v4_self_rowid(client, db):
     return None
 
 
+# message_N.db 分片 Name2Id 的缓存寿命（秒）。rowid -> wxid 一旦建立就稳定，
+# 但 hook 的库句柄会轮换、库也可能被重建，所以给个上限，不许永久生效。
+_N2ID_TTL = 600.0
+
+# 「这一批 real_sender_id 里有解不出来的」上次打印时间。{(库名, 缺的 id): 时间戳}
+# 为什么不做成 _POLL_ERRORS：那是「hook 查不动了」的心跳信号，health._healthy()
+# 见到任何一条就把 bot 判成不健康、还会发告警。而「某个 id 在 Name2Id 里查不到」
+# 是数据层面的缺失——hook 好得很，只是这几行拿不到发言人（上层退编号即可）。
+# 把它塞进心跳等于让 bot 永远显示不健康、还发没用的告警，真故障反而被淹掉。
+# 所以这类缺失只打 stderr（bot.log 是后台运行时唯一的信息来源），按时间限流。
+_N2ID_MISS_NOTE = {}
+_N2ID_MISS_INTERVAL = 300.0
+
+
+def _note_n2id_miss(db, missing):
+    """name2id 查得动、但里面没有这几个 id：留一行 stderr（限流），不猜名字。"""
+    key = (db, tuple(missing[:5]))
+    now = time.time()
+    if now - _N2ID_MISS_NOTE.get(key, 0.0) < _N2ID_MISS_INTERVAL:
+        return
+    if len(_N2ID_MISS_NOTE) > 200:      # 长跑进程里不许无界长（限流表本身就是个小记忆）
+        _N2ID_MISS_NOTE.clear()
+    _N2ID_MISS_NOTE[key] = now
+    print(f"[live] ⚠️ {db} 的 Name2Id 里查不到这些 real_sender_id：{missing[:5]}"
+          f"（这些行拿不到发言人，上层会退回编号；不编名字）",
+          file=sys.stderr, flush=True)
+
+
+def _v4_shard_senders(client, db, ids):
+    """该分片 Name2Id 里这几个 rowid 对应的 wxid：{rowid: user_name}。
+
+    **每个 message_N.db 各有一份 Name2Id，rowid 不通用**（所以入参带 db，
+    写法同 _v4_self_rowid）；**绝不能用 fts 库的 Name2Id 解这里的 id**——
+    那是另一套 id 空间，混用会得到张冠李戴的名字，比拿不到更坏：
+    群聊会照着错的那个人接话。
+
+    只查真正要用的那几个 rowid（`WHERE rowid IN (...)` 走主键，选择性过滤），
+    不做任何排序。解不出来的如实缺席，**不猜**。
+    """
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        return {}
+    box = getattr(client, "_lh_n2id", None)
+    if not (isinstance(box, tuple) and len(box) == 2 and isinstance(box[1], dict)
+            and time.time() - box[0] < _N2ID_TTL):
+        box = (time.time(), {})
+    per = box[1].setdefault(db, {})
+    need = [i for i in ids if i not in per]
+    key = f"{db} Name2Id"
+    if need:
+        sql = ("SELECT rowid, user_name FROM Name2Id "
+               f"WHERE rowid IN ({','.join(str(i) for i in need)})")
+        try:
+            found = _query(client, db, sql)
+        except Exception as e:
+            # 查不动 = hook 层面的故障，必须进心跳（同 fts 分片那条路）：
+            # 静默的后果是「群里所有发言人又塌回未知」，而日志里一个字都没有，
+            # 看起来只是「没人说话」。下一批查得动就会自己清掉。
+            _note_poll_error(key, e)
+            return {i: per[i] for i in ids if i in per}
+        finally:
+            try:
+                client._lh_n2id = box
+            except Exception:
+                pass
+        # 查得动就把这条故障清掉（key 的含义是「这个分片的 Name2Id 现在查不动」）。
+        _POLL_ERRORS.pop(key, None)
+        got = {}
+        for r in found:
+            rid = _as_int(_pick(r, "rowid", 0))
+            nm = str(_pick(r, "user_name", 1) or "").strip()
+            if rid and nm:
+                got[rid] = nm
+        per.update(got)              # 只记真的解出来的，空结果不记
+        miss = [i for i in need if i not in got]
+        if miss:
+            # 查得动、却没有这几个人 = 解析不出。可能是这个 id 不属于本分片，
+            # 也可能 Name2Id 里就没有它。**不编名字**，只如实留痕（见上面的注释）。
+            _note_n2id_miss(db, miss)
+    return {i: per[i] for i in ids if i in per}
+
+
+def _v4_fill_senders(client, db, sheet):
+    """把一批行的 real_sender_id 解成说话人，写进 sender / sender_name。
+
+    字段约定（CLAUDE.md「渲染谁说的」），**上层必须照这个用**：
+      * `sender` 只放 **wxid（原始 id）**，给上层拿去查联系人表换显示名。
+        它**永远不是显示名**，任何调用方都不许把它直接渲染进给模型看的文本
+        ——模型会照抄一串 wxid 回来（2026-10-01 那个坑）。
+      * `sender_name` 只放**真显示名**。这条路上拿不到微信自己算好的显示名
+        （那是 fts / SessionTable 才有的东西），所以**一律留空**，让上层退回
+        「sender 查联系人表 → 还查不到就按顺序编号」。
+        **绝不把 wxid 填进 sender_name**：那是把 id 当名字用，等于骗模型。
+    """
+    if not sheet:
+        return
+    # real_sender_id <= 0 视为「表里就没写谁发的」：没有可解析的东西，也不算
+    # 解析失败——**不能**为它报警，否则每轮都刷一条，把真正的失败淹掉。
+    # 这些行 sender 留空，上层照旧退编号。
+    ids = {sid for _d, sid in sheet if sid > 0}
+    if not ids:
+        return
+    names = _v4_shard_senders(client, db, ids)
+    for d, sid in sheet:
+        d["sender"] = str(names.get(sid) or "")
+
+
 def _v4_tables(client, db):
     try:
         rows = _query(client, db, "SELECT name FROM sqlite_master "
@@ -473,18 +620,6 @@ def _v4_contact_rows(client, where="", limit=20000):
             "alias": _pick(r, "alias", 3),
         })
     return out
-
-
-def _v4_fts_session_id(client, talker):
-    """会话名 -> 这个 fts 库里的 session_id。（目前只给调试用）"""
-    try:
-        rows = _query(client, "message_fts.db",
-                      f"SELECT rowid FROM Name2Id WHERE username = '{_q(talker)}' LIMIT 1")
-    except Exception:
-        return None
-    for r in rows:
-        return _as_int(_pick(r, "rowid", 0))
-    return None
 
 
 def _v4_fts_session_id(client, talker):
@@ -534,6 +669,13 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
     按 **local_id 倒序**（它是这张表的主键）——走 PK 索引，很便宜。
     别按 create_time 排：那列没索引，一条查询能到 1 秒以上（实测）。
     local_id 是自增的，倒序就是最近的在前。
+
+    发言人：这张表里**只有一个数字 real_sender_id**，要用**本分片自己的**
+    Name2Id 解成 wxid 才有意义（fts 库那份 id 完全不是一套，不能混）。
+    以前这里一个字都不填，于是这条路上所有非自己发的消息在上层全塌成
+    「发言人未知」——群聊里「谁在跟谁说话」的判据就没了，所以补上
+    `sender`（wxid，给上层查联系人表）/ `sender_name`（真显示名，拿不到就留空）。
+    字段语义见 _v4_fill_senders 的注释。
     """
     table = _v4_table_for(talker)
     rows = []
@@ -545,12 +687,13 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
         )
         # 关键词检索只在文本里找（非文本那列是压缩十六进制，LIKE 没意义）
         if keyword:
-            sql += f" WHERE local_type = 1 AND message_content LIKE '%{_q(keyword)}%'"
+            sql += f" WHERE local_type = 1 AND {_like('message_content', keyword)}"
         sql += f" ORDER BY local_id DESC LIMIT {int(limit)}"
         try:
             found = _query(client, db, sql)
         except Exception:
             continue  # 这个分片里没有该会话的表
+        sheet = []          # [(行, real_sender_id)]：攒齐本分片这一批再解一次 Name2Id
         for r in found:
             sid_i = _as_int(_pick(r, "real_sender_id", 2))
             lt = _as_int(_pick(r, "local_type", 1))
@@ -573,7 +716,7 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
                             content += f"（本地已解码缩略图：{p}）"
                     except Exception:
                         pass
-            rows.append({
+            d = {
                 "talker": talker,
                 "local_id": str(lid) if lid is not None else "",
                 "local_type": lt,
@@ -581,7 +724,14 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
                 "is_self": 1 if (self_id is not None and sid_i == self_id) else 0,
                 "time": _fmt_time(ct),
                 "_ts": _as_int(ct),
-            })
+                # 新加的字段（老调用方读 content/is_self/time/_ts 的行为一个字没变）。
+                # sender 只放 wxid，**不是显示名**；sender_name 拿不到就留空。
+                "sender": "",
+                "sender_name": "",
+            }
+            rows.append(d)
+            sheet.append((d, sid_i))
+        _v4_fill_senders(client, db, sheet)
     rows.sort(key=lambda m: m["_ts"])
     return rows[-limit:]
 
@@ -893,7 +1043,7 @@ _STOPWORDS = (
 def extract_keywords(query):
     """从中文问句里抽出可用于检索的关键词，按长度降序。
 
-    例：「我和李同学聊了什么」-> ['李同学']
+    例：「我和张三聊了什么」-> ['张三']
         「最近聊了什么」      -> []（没有可检索的词）
     """
     s = str(query)
@@ -999,7 +1149,7 @@ def _v4_search_by_scan(client, keyword, limit=30, max_tables=40):
     - 反正 hook 的自愈重扫（45 秒一次）会把 fts 找回来，这只是个临时退路。
     """
     rows = []
-    k = _q(keyword)
+    k = _like("message_content", keyword) if keyword else ""
     scanned = 0
     for db in _v4_msg_dbs(client):
         self_id = _v4_self_rowid(client, db)
@@ -1007,7 +1157,7 @@ def _v4_search_by_scan(client, keyword, limit=30, max_tables=40):
             if scanned >= max_tables:
                 break
             scanned += 1
-            cond = f"local_type = 1 AND message_content LIKE '%{k}%'" if k else "local_type = 1"
+            cond = f"local_type = 1 AND {k}" if k else "local_type = 1"
             sql = (
                 f"SELECT real_sender_id, create_time, message_content FROM {table} "
                 f"WHERE {cond} ORDER BY create_time DESC LIMIT {int(limit)}"
@@ -1045,15 +1195,17 @@ def all_contacts(client, limit=20000):
 
 
 def resolve_contact(client, name, limit=5):
-    """按昵称/备注/微信号模糊匹配联系人。"""
+    """按昵称/备注/微信号模糊匹配联系人。
+
+    这里是 LIKE 模糊匹配，所以走 _like（会转义 `%` / `_` 并带上 ESCAPE）。
+    用户搜「50%」或名字带下划线的（A_B）时，不转义会匹配到一堆无关的人。
+    """
     if is_wechat4(client):
-        n = _q(name)
-        where = (f"username LIKE '%{n}%' OR nick_name LIKE '%{n}%' "
-                 f"OR remark LIKE '%{n}%' OR alias LIKE '%{n}%'")
+        where = (f"{_like('username', name)} OR {_like('nick_name', name)} "
+                 f"OR {_like('remark', name)} OR {_like('alias', name)}")
         return _v4_contact_rows(client, where=where, limit=limit)
-    n = _q(name)
-    where = (f"UserName LIKE '%{n}%' OR NickName LIKE '%{n}%' "
-             f"OR Remark LIKE '%{n}%' OR Alias LIKE '%{n}%'")
+    where = (f"{_like('UserName', name)} OR {_like('NickName', name)} "
+             f"OR {_like('Remark', name)} OR {_like('Alias', name)}")
     return _v3_contact_rows(client, where=where, limit=limit)
 
 
@@ -1302,6 +1454,11 @@ def _v4_new_messages(client, cursors, limit=200):
         print("[live] ⚠️ fts 分片不可用，退回按会话表轮询", file=sys.stderr, flush=True)
         return _v4_new_messages_tables(client, cursors, limit)
 
+    # fts 这条路能走，会话兜底就不在本轮链路上：把它上一轮留下的旧错误清掉。
+    # 不清的话 fts 修好之后 bot 心跳会**永远**挂着一条「session.db 失败」的假告警
+    # （这条路不再查 session.db，也就没人清它了）。
+    _POLL_ERRORS.pop("session.db", None)
+
     smap = _v4_fts_session_map(client)
     self_id = _v4_fts_self_id(client)
     out = []
@@ -1316,12 +1473,8 @@ def _v4_new_messages(client, cursors, limit=200):
             found = _query(client, "message_fts.db", sql)
             _POLL_ERRORS.pop(tab, None)
         except Exception as e:
-            n = _POLL_ERRORS.get(tab, ("", 0))[1] + 1
-            _POLL_ERRORS[tab] = (str(e), n)
             # 只报第 1/10/50 次，避免刷屏；不静默是因为静默会让人以为「只是没消息」
-            if n in (1, 10, 50):
-                print(f"[live] ⚠️ 轮询分片 {tab} 连续失败 {n} 次：{e}",
-                      file=sys.stderr, flush=True)
+            _note_poll_error(tab, e)
             continue
         for r in found:
             rid = _as_int(_pick(r, "rowid", 0))
@@ -1378,7 +1531,18 @@ def _v4_new_messages_session(client, cursors, limit=200):
            f"ORDER BY last_timestamp ASC LIMIT {int(limit)}")
     try:
         rows = _query(client, "session.db", sql)
-    except Exception:
+        # 查得动就把上次的错误清掉，和 fts 分片那条路保持一致
+        _POLL_ERRORS.pop("session.db", None)
+    except Exception as e:
+        # 这里是**最后一道防线**：fts 分片和 Msg_ 表都已经不可用了，session.db 再失败
+        # 就等于本轮一条消息都收不到。以前这里静默 `return [], cursors`，连 _POLL_ERRORS
+        # 都不写（那时候只统计 fts 分片），于是 bot 心跳报「正常」、日志里一个字都没有。
+        # 现在必须留两处痕：stderr 一行明确告警 + _POLL_ERRORS["session.db"]，
+        # 让 poll_errors() / bot 心跳能把这件事报出来。
+        n = _note_poll_error("session.db", e)
+        if n in (1, 10, 50):
+            print("[live] ⚠️ session.db 兜底也失败：fts / Msg_ / session.db 三层都不可用，"
+                  "本轮收不到任何消息", file=sys.stderr, flush=True)
         return [], cursors
     out = []
     for r in rows:
@@ -1416,7 +1580,15 @@ def _v4_new_messages_tables(client, cursors, limit=200):
                 if m["_ts"] >= since:
                     out.append(m)
     if not out:
+        # 三层全废（fts 分片不可用 + Msg_ 分片拿不到 + session.db 也查不动）这件事的
+        # 日志由 _v4_new_messages_session 自己发——只有它手里有那个异常原文，
+        # 它会同时写 stderr 和 _POLL_ERRORS["session.db"]。这里不重复报，
+        # 只在下面接力游标。注意「session.db 查得动、只是没有新消息」是正常空闲，
+        # **不能**当成故障刷日志。
         return _v4_new_messages_session(client, cursors, limit)
+    # 这条路自己捞到了消息，会话兜底就不在本轮链路上——清掉它的旧错误，
+    # 别让一条早就恢复的告警永远挂在 bot 心跳上（同 _v4_new_messages 里那一处）。
+    _POLL_ERRORS.pop("session.db", None)
     out.sort(key=lambda m: m["_ts"])
     # 只更新 __time__，别整个替换游标字典——那样 fts 恢复后分片游标会丢，整库重放
     cursors["__time__"] = max([m["_ts"] for m in out], default=since)

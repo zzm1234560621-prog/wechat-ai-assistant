@@ -11,6 +11,7 @@
   * 输出必须清洗成「能直接发进微信」的形态：单行、无 markdown、长度可控。
     清洗后为空**一律不发**（send_text 发空串在微信里是条空消息）。
 """
+import ast
 import json
 import re
 
@@ -49,7 +50,12 @@ _GROUP_RULES = """
 例子：{"reply": null}
 """
 
-_FENCE = re.compile(r"```[a-zA-Z0-9]*\n?(.*?)```", re.S)
+_FENCE = re.compile(r"```[a-zA-Z0-9]*\r?\n?(.*?)```", re.S)
+# 只有真出现 reply 键才按 JSON 解析（见 _extract_group_reply）。
+# 用 "reply"（带引号）而不是裸单词 reply：模型在自然语言里提一句 reply
+# 不该把它自己的回复变成静默。冒号前后不一定有空格（JSON 里 "a":1 很常见），
+# 所以两处空白都是可选的。
+_REPLY_KEY = re.compile(r"""["']reply["']\s*:""", re.I)
 _LEAD = re.compile(r"^(回复|答复|reply|我)\s*[:：]\s*", re.I)
 _MD = re.compile(r"\*\*|__|`")
 
@@ -60,18 +66,49 @@ def is_group(chat_id):
 
 
 def contact_names(contacts):
-    """wxid -> 显示名（备注优先），群里标发言人用。"""
+    """wxid -> **显示名**（备注优先），群里标发言人用。
+
+    ⚠️ 只认真显示名：`remark` / `name` 都为空的联系人**不进这张表**，
+    绝不拿 wxid 顶上——那会让渲染层把一串 wxid 交给模型（CLAUDE.md 明令禁止）。
+    查不到就交给渲染层退回「对方 / 群成员」，宁可不精确也不喂 id。
+    """
     out = {}
     for c in contacts or []:
         wxid = str(c.get("wxid") or "")
-        if wxid:
-            out[wxid] = str(c.get("remark") or c.get("name") or wxid)
+        if not wxid:
+            continue
+        disp = str(c.get("remark") or c.get("name") or "").strip()
+        if disp:
+            out[wxid] = disp
     return out
 
 
-def build_transcript(msgs, names, limit=20):
-    """把历史渲染成带说话人的文本。时间从早到晚，最后一条是刚收到的。"""
+def _is_wxid(s):
+    """看起来像原始 id（wxid_xxx / 群 roomid）的字符串。给模型看的文本里绝不许出现它。"""
+    t = str(s or "").strip()
+    return t.startswith("wxid_") or t.endswith("@chatroom")
+
+
+def build_transcript(msgs, names, limit=20, unknown_note=None):
+    """把历史渲染成带说话人的文本。时间从早到晚，最后一条是刚收到的。
+
+    **为什么不能拿不到 sender 就统统写「对方」**：群聊里那条静默判定的依据
+    就是「这话是谁说的」。全部塌成一个「对方」，模型看到的就是「对方」「对方」
+    接不上话的碎句子，判断等于塌了；单聊里「对方」还说得通，群聊里就是错的。
+    几种真实来源的字段不一样，所以这里按可靠性依次取：
+      1. sender_name / last_sender_display_name —— 微信自己算好的发言人显示名
+         （群里是群昵称，比拿 wxid 去查联系人表准），SessionTable 那条路带这个字段；
+      2. sender（wxid）→ names 里查显示名 —— fts 那条路带这个字段；
+      3. 都取不到：按顺序编号「对方1/对方2…」。编号是**可区分**的兜底，
+         至少不会把两个人当成同一个人；原始 wxid 一个都不许进文本（CLAUDE.md）。
+    出现第 3 种情况时把说明写进 `unknown_note`（一个 list），由调用方放在
+    **聊天记录之外**——那段说明是给模型看的格式提示，不是群里谁说的话，
+    插进记录中间会变成一条不存在的「消息」。返回拼接好的历史文本（无内容返回 ""）。
+    """
+    if unknown_note is None:
+        unknown_note = []
     lines = []
+    unknown = 0
     for m in (msgs or [])[-int(limit):]:
         content = str(m.get("content") or "").strip()
         if not content:
@@ -79,9 +116,22 @@ def build_transcript(msgs, names, limit=20):
         if m.get("is_self"):
             who = "我"
         else:
-            # 群聊靠 sender（wxid）区分发言人；取不到就退回「对方」
-            who = names.get(str(m.get("sender") or "")) or "对方"
+            disp = str(m.get("sender_name") or m.get("last_sender_display_name")
+                       or "").strip()
+            if not disp or _is_wxid(disp):     # 显示名缺失，或字段里塞的是原始 id
+                # 没有显示名：先看能不能用 sender 去联系人表换一个显示名
+                disp = str(names.get(str(m.get("sender") or "")) or "").strip()
+            if not disp or _is_wxid(disp):
+                unknown += 1
+                who = f"对方{unknown}"
+            else:
+                who = disp
         lines.append(f"[{m.get('time', '?')}] {who}: {content}")
+    if unknown and not unknown_note:
+        unknown_note.append(
+            f"（注意：上面有 {unknown} 条消息查不到发言人的显示名，只能按先后顺序"
+            f"编成「对方1/对方2」。编号只代表第几个说话的人，"
+            f"**同一个编号不代表同一个人**。）")
     return "\n".join(lines)
 
 
@@ -109,32 +159,69 @@ def sanitize(text, max_chars=200):
     return t
 
 
+def _json_reply(raw):
+    """按 JSON 取值。返回 (是否取值成功, 值)；值 None = 模型明确说「不回」。
+
+    只认**整段就是一个 JSON 对象**的形态（可以套 ``` 围栏、前后带空白）：
+    模型真按协议输出时就是这么给的。前后还夹着人话的（「看这个 {"a":1} 的例子」）
+    不算——那种情况调用方会把整段当直接回复，不能把中间的字典当成协议。
+    """
+    t = _FENCE.sub(lambda m: m.group(1), str(raw)).strip().lstrip("\ufeff")
+    if not (t.startswith("{") and t.endswith("}")):
+        return False, None
+    try:
+        data = json.loads(t)
+    except (ValueError, TypeError):
+        # 有些模型会吐 Python 字面量（单引号：{'reply': '好'}）。那也是一次
+        # **明确的 JSON 协议回复**——解析失败就静默的话，用户这句话又被白吞了，
+        # 正是这次要修的毛病。literal_eval 只认字面量、不执行代码，安全。
+        try:
+            data = ast.literal_eval(t)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return False, None
+    if not isinstance(data, dict):
+        return False, None
+    return True, data.get("reply")
+
+
 def _extract_group_reply(raw):
     """从群聊回复里取出内容。返回 None 表示静默。
 
-    模型大概率会老实给 JSON，但也可能套一层 ```json 围栏或在外面多说一句，
-    所以先剥围栏再抓第一对花括号。
-    **完全看不到 JSON 时**（文本里没有花括号）就把整段当回复——那说明模型
-    直接答了，当静默会白白把功能废掉。解析失败才当静默（fail-safe）。
+    **「模型明确说不回」和「格式没按 JSON 走」是两件事**，不能都当静默：
+      * 模型确实按协议给了 JSON 对象（整段一个对象，可套 ``` 围栏）时：
+        `reply` 有内容 → 就发它；`reply` 是 null/空 → 明确静默；
+      * 模型没按 JSON 走（`价格是 {100} 元，回头聊`、`看这个 {"a":1} 的例子`、
+        干脆一段白话）→ 整段当直接回复，交给上层 sanitize 清洗后照发。
+    以前是「见到花括号就 json.loads，失败即 SILENT」，于是模型只要没按 JSON 输出，
+    该回的话就被吞掉（实测 `价格是 {100} 元，回头聊` 直接静默）。CLAUDE.md 说的
+    「宁可少回」指的是**判断不该接话**，不是**解析失败**——这两者不能混。
     """
     if not raw:
         return SILENT
     t = _FENCE.sub(lambda m: m.group(1), str(raw)).strip()
-    if "{" not in t:
-        return t.strip() or SILENT
-    start, end = t.find("{"), t.rfind("}")
-    if end <= start:
+    if not t:
         return SILENT
-    try:
-        data = json.loads(t[start:end + 1])
-    except (ValueError, TypeError):
+    shaped = t.startswith("{") and t.endswith("}")
+    if shaped or _REPLY_KEY.search(t):
+        ok_json, val = _json_reply(t)
+        if ok_json:
+            if val is None or not str(val).strip():
+                return SILENT      # reply 为 null / 空串 = 明确不回，也别发空消息
+            return str(val)
+        if shaped:
+            # 整段就是一个对象、却不是我们认的 reply 协议（比如 {"other":1}
+            # 或者压根没解析出来）。这时**不能**把原始 JSON 当回复发出去——
+            # 对方会收到一串花括号。这是「模型在走协议但走歪了」，按原设计静默。
+            return SILENT
+        if t.find("{") < 0:
+            # 提到了 reply 字段、却连左花括号都没有（模型没打算走 JSON，
+            # 只是话里带了 reply 这个词）。按「没按 JSON 走」处理：整段照发。
+            return t
+        # 有花括号、却不是「整段一个对象」、也解析不出来（`{"reply": ` 这种半截）。
+        # 这种半截文本发出去只会让人看不懂，按 fail-safe 静默。
         return SILENT
-    if not isinstance(data, dict):
-        return SILENT
-    val = data.get("reply")
-    if val is None:
-        return SILENT
-    return str(val)
+    # 没有 reply 字段：这不是协议回复，是模型直接说了一句话
+    return t
 
 
 def persona_for(rec, auto_cfg):
@@ -151,7 +238,9 @@ def persona_for(rec, auto_cfg):
 def make_reply(llm, rec, msgs, names, cfg, group=False):
     """生成一条可直接发送的回复。返回 "" 表示不该发（静默）。"""
     auto_cfg = cfg.get("auto_reply") or {}
-    transcript = build_transcript(msgs, names, auto_cfg.get("context_messages", 20))
+    notes = []
+    transcript = build_transcript(msgs, names, auto_cfg.get("context_messages", 20),
+                                 unknown_note=notes)
     if not transcript:
         return ""
 
@@ -162,8 +251,11 @@ def make_reply(llm, rec, msgs, names, cfg, group=False):
     else:
         ask = "请回复最后一条消息。"
 
+    # 发言人缺失的说明放在聊天记录**之外**（记录之后、提问之前）：
+    # 它是给模型的格式提示，不是群里谁说的话，混进记录会变成一条假消息。
+    note = ("\n".join(notes) + "\n\n") if notes else ""
     prompt = ("【最近的聊天记录】（时间从早到晚，最后一条是刚收到的）\n"
-              f"{transcript}\n\n{ask}")
+              f"{transcript}\n\n{note}{ask}")
     raw = llm.chat(system, [{"role": "user", "content": prompt}])
     picked = _extract_group_reply(raw) if group else raw
     return sanitize(picked, auto_cfg.get("max_reply_chars", 200))
@@ -389,6 +481,15 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
                     f"不能同时当自动回复对象。请二选一。"), False
         if wxid == "filehelper" or (str(cfg.get("self_wxid") or "") and wxid == str(cfg.get("self_wxid"))):
             return "文件传输助手 / 你自己不能加进自动回复名单（会自己回自己）。", False
+
+        # 和「盯着」名单互斥（watch.py 加人时也查这边，两个方向都要拦）：
+        # 两边都有时 bot 的 watched 分支先命中就 continue，自动回复那条**永远
+        # 走不到**——用户以为配好了自动回复，实际上人一个也没回过，还很难查。
+        import watch
+        if wxid in watch.chats(cfg):
+            return (f"{disp} 已经在「盯着」名单里了（只通知、不回他）。自动回复是"
+                    f"「代你回」，两边同时开既通知又回复，是互斥的——想自动回复就先发"
+                    f" /盯着 删 {disp}。"), False
 
         rec = next((r for r in recs if str(r.get("wxid")) == wxid), None)
         disp = str(name_hint or "").strip() or disp

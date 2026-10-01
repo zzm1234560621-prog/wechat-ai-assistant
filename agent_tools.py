@@ -17,9 +17,11 @@
     line_chars: 400            # 历史行截断长度
 """
 import os
+import sys
 import time
 
 import auto_reply
+import executor
 import file_read
 import image_cache
 import live_history
@@ -28,6 +30,31 @@ import watch
 
 # 允许发送的图片后缀
 _IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+# 一次对话最多发几次查库请求的**硬夹**。
+#
+# 为什么要有硬夹：hook 不支持并发，这个 hook 已经把微信搞崩过 6 次，而
+# `agent.max_queries` 是用户在 config.yaml 里手填的数字，以前**完全不设上限**
+# ——写 `max_queries: 99999` 就是一串不间断的查库，没有任何东西拦它。
+#
+# 上限取 20 的理由：
+#   * 默认值是 6，20 已经是它的 3 倍多，正常一轮工具调用（读历史 + 搜关键词 +
+#     查图片 + 列文件 + 未读）根本用不到；调大只是让模型多绕几圈。
+#   * 单个工具最多扣 1 次预算，而 `live_history` 里带选择性过滤的查询实测
+#     0.001~0.41 秒（见 CLAUDE.md）。20 次串行查询在最坏情况下约 8 秒，
+#     还是挂在**收消息那条线程**上的串行调用，不会和轮询叠在一起。
+#   * 上限再抬（几十上百）的唯一效果就是「模型卡住时把微信压在查询里更久」，
+#     而这正是历次崩溃的现场特征（慢查询 → hook HTTP 500 → 微信进程没了）。
+#
+# 注意：这是**上限**，不是建议值；越界只钳制并告警，不报错、不静默放行。
+_MAX_QUERIES_DEFAULT = 6
+_MAX_QUERIES_MIN = 1
+_MAX_QUERIES_MAX = 20
+
+# 「发送类」工具：它们会**真的把东西发出去**，所以异常时不能只说一句
+# 「工具 X 执行出错」——那样模型会以为一条都没发，转头跟用户说「没发出去」，
+# 而实际上可能已经发出去好几条了。见 ToolBox.run() 的异常分支。
+_SEND_TOOLS = ("send_text", "send_image", "send_images", "forward_message")
 
 
 def looks_like_id(name):
@@ -46,6 +73,11 @@ def speaker_of(m, names, chat_name="", is_group=False):
 
     群里优先用 sender_name——那是微信自己算好的显示名（群里就是**群昵称**），
     比拿 wxid 去联系人表里查更准。没有才退回联系人表 / 会话名。
+
+    ⚠️ **查不到显示名时绝不把原始 id 当名字返回**：以前这里是
+    `names.get(sender) or sender`，于是查不到就回一串 `wxid_xxx` 给模型，
+    模型照抄给你（正是 CLAUDE.md 里「看不到真正的名字」那个根因的另一面）。
+    现在查不到就退回「群成员 / 会话名 / 对方」，宁可不精确，也不喂 id。
     """
     if m.get("is_self"):
         return "我"
@@ -54,7 +86,15 @@ def speaker_of(m, names, chat_name="", is_group=False):
         return named
     sender = str(m.get("sender") or "")
     if sender:
-        return (names or {}).get(sender) or sender
+        hit = (names or {}).get(sender)
+        # 兜底再挡一道：**映射表里存的是原始 id 也不能当名字用**。
+        # （contact_names 已经不填 wxid 了，但别处仍可能构造出这种表；
+        # 这一层是渲染统一出口，谁传进来都得过。）
+        if hit and not (looks_like_id(hit) or str(hit).isdigit()):
+            return hit
+        # 不是 id 形状的才当名字用（防御：万一将来某条路塞进来的就是真名字）
+        if not (looks_like_id(sender) or sender.isdigit()):
+            return sender
     if is_group:
         return "群成员"
     return chat_name or "对方"
@@ -83,6 +123,27 @@ def format_history_lines(msgs, names, chat_name="", is_group=False, limit=20,
 def _db_fail(what, err):
     return (f"{what}失败：{err}。这多半是 hook 查库出问题了——"
             f"请如实告诉用户暂时查不到，**不要反复重试**。")
+
+
+def _auto_ok_hit(cmd, auto_ok):
+    """这条命令在不在 shell.auto_ok 免确认名单里。
+
+    **只做整条命令字符串精确相等匹配**（两边 strip 后比）。绝不做前缀、子串或
+    通配符匹配：命令原文是模型写的，任何模糊匹配都等于给模型留了绕过确认的
+    注入面（比如名单里写 `dir`，模型就能写 `dir & del ...` 蹭过去）。
+
+    名单不是 list 时当**空**处理；list 里非字符串的项（写错了的 YAML）直接
+    跳过，不做 str() 强转——`auto_ok: [5]` 不该让命令「5」免确认。
+    两条都是 fail-safe：配置写坏了只能变成"全都要确认"，不能变成"全都免确认"。
+    """
+    if not isinstance(auto_ok, (list, tuple)):
+        return False
+    want = str(cmd or "").strip()
+    if not want:
+        return False
+    return any(isinstance(x, str) and x.strip() and want == x.strip()
+               for x in auto_ok)
+
 
 # 中立格式的工具描述（llm.py 会转成各家协议要的样子）
 TOOLS = [
@@ -426,6 +487,31 @@ TOOLS = [
             "required": ["to", "contact", "local_id"],
         },
     },
+    {
+        "name": "run_command",
+        "description": (
+            "在用户本机执行**一条命令行命令**（cmd / PowerShell 都能用）。"
+            "用户说「帮我跑一下…」「执行个命令…」「看下这个目录里有什么」时用这个。\n"
+            "**本工具绝不会立即执行任何命令**：它只是把 command **原文**登记成一条"
+            "待确认动作，由用户回「确认」之后才真的跑。所以：\n"
+            "  * 调用后要把命令**原样**复述给用户，请他回「确认」；\n"
+            "  * 用户没确认之前，**绝不许说「已经跑了」「正在跑」或者编造输出**；\n"
+            "  * 命令到底跑没跑、跑出什么，以工具返回为准，别自己替它下结论。\n"
+            "真跑起来之后，超时、报错、输出被截断这些都要**如实**转述给用户。\n"
+            "（唯一例外：用户自己在配置里把某条命令列进了免确认名单，那种命令会"
+            "直接执行——这种情况工具返回里会写明「已直接执行」，没写就是没跑。）"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string",
+                            "description": "要执行的命令**原文**，一行；别改写、别加解释"},
+                "timeout": {"type": "integer",
+                            "description": "超时秒数，可不填（默认用 config.yaml 的 shell.timeout）"},
+            },
+            "required": ["command"],
+        },
+    },
 ]
 
 _AUTO_ACTIONS = ("on", "off", "add", "del", "mode", "review", "ctx", "status")
@@ -451,6 +537,76 @@ class _Budget:
 # 只存一条会互相覆盖，回「确认」时发错人。
 _PENDING = {}
 
+# 发图白名单「兜底放宽」的告警只打一次：这不是会重复的噪音，
+# 而是一条**必须让用户看见**的事实（默认白名单被放宽到整个微信数据根目录）。
+_WARNED_IMAGE_ROOT = [False]
+
+
+def _warn(msg):
+    """打一条必须被看见的告警。走 stderr：bot.log / 控制台都收得到。
+
+    这里故意不用 logging——项目里全是 print 到 stdout/stderr 的，
+    引入 logging 配置会改变现有日志形状。重点是**不能静默**。
+    """
+    print(f"⚠️ {msg}", file=sys.stderr)
+
+
+def allowed_image_dirs(cfg):
+    """解析出「发图允许的根目录」列表。**登记和发送两处都走它**，避免两套判定。
+
+    顺序：
+      1. 用户配的 `agent.send_image_dirs`（写好一个就用它，绝对路径化）；
+      2. 否则用**真正的图片缓存根目录** `image_cache.image_cache_dirs()`
+         （即 `<账号>/cache`，本模块扫缩略图的那个目录）；
+      3. 推不出来时才退回 `image_cache.data_root()`（整个微信数据目录），
+         并**向 stderr 打一条明确告警**。
+
+    第 3 条是兜底，不是默认姿势：宁可放宽并**说清楚**，也不许静默放宽，
+    更不许因为推不出来就变成「什么都不许发」把功能弄坏（那是最坏的一种
+    「安全」——用户以为在用，实际全被拒）。
+    """
+    agent_cfg = (cfg or {}).get("agent") or {}
+    raw = agent_cfg.get("send_image_dirs") or []
+    if isinstance(raw, str):        # 写成单个字符串的 YAML 不算错，按一个目录处理
+        raw = [raw]
+    dirs = [os.path.abspath(os.path.expanduser(str(d)))
+            for d in raw if str(d).strip()]
+    if dirs:
+        return dirs
+
+    real = [d for d in image_cache.image_cache_dirs() if d]
+    if real:
+        return real
+
+    root = image_cache.data_root()
+    if root:
+        if not _WARNED_IMAGE_ROOT[0]:
+            _WARNED_IMAGE_ROOT[0] = True
+            _warn("推不出微信图片缓存目录（没找到 <账号>/cache），"
+                  f"发图白名单被放宽到整个微信数据根目录：{root}。"
+                  "要收紧就在 config.yaml 的 agent.send_image_dirs 里写明目录。")
+        return [os.path.abspath(root)]
+    return []
+
+
+def _is_under(path, root):
+    """绝对路径 path 是否在 root 里（**先 realpath 再比**）。
+
+    必须 realpath：不然一个指到别处的 junction / 符号链接放在允许目录里，
+    就能把任意路径伪装成「在允许目录内」。realpath 之后链接已经解开，
+    比的是它**真正**待在哪儿。
+    commonpath 跨盘符会抛 ValueError，那种情况按「不在」处理（跳过这个根）。
+    """
+    try:
+        p = os.path.realpath(path)
+        r = os.path.realpath(root)
+    except OSError:
+        return False
+    try:
+        return os.path.commonpath([p, r]) == r
+    except ValueError:
+        return False        # 不同盘符，commonpath 会抛——不匹配
+
 
 def _alive(chat, ttl):
     """该会话里未过期的待确认项，最早的在前。"""
@@ -465,7 +621,7 @@ def _alive(chat, ttl):
 
 
 def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
-                image=None, xml=None):
+                image=None, xml=None, cmd=None, timeout=None):
     """登记一条待确认发送。kind 区分来源：agent（用户让助手发的）/ auto（自动回复草稿）。
 
     bot 对两者要求不一样：自动回复草稿只认明确的中文确认词，避免用户在控制
@@ -477,10 +633,15 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
     image / xml 用来表示「这条待确认要发的不是文本」：image 是本地图片路径，
     xml 是要转发的原始消息 XML。bot 的确认分支据此选发法（都只发一次，
     count/连发只对文本有意义）。
+
+    kind="shell" 表示「待确认执行的一条本地命令」：cmd 是**模型给的命令原文**，
+    text 也存同一份原文（bot 复述给用户用）。它没有收件人，to_wxid / to_name
+    留空，bot 的确认分支**不会**走 send_pending。timeout 是模型可选的超时秒数。
     """
     _PENDING.setdefault(str(chat), []).append(
         {"to_wxid": to_wxid, "to_name": to_name, "text": text,
          "image": image, "xml": xml,
+         "cmd": cmd, "timeout": timeout,
          "kind": kind, "count": int(count or 1), "ts": time.time()})
 
 
@@ -500,6 +661,129 @@ def pop_pending(chat, ttl=300):
 def peek_pending(chat, ttl=300):
     items = _alive(chat, ttl)
     return items[0] if items else None
+
+
+def list_pending(chat, ttl=300):
+    """该会话**未过期**的待确认项，顺序就是 FIFO 顺序。**不出队。**
+
+    为什么需要它：待确认队列是「待发送(agent/auto)」和「待执行本地命令(shell)」
+    混在一条 FIFO 里的。bot 的确认分支以前是「看队头 → 判队头那条 → 取出队头
+    来执行」——队列里同时压着两条时，用户看到的是他刚触发的那条提示，
+    实际执行的却是更早入队的另一条（executor-review 的 R5-3）。
+
+    有了这个列表，bot 就能在混合 kind 时改回**按编号的菜单**：
+    让用户选「第几条」，而不是糊里糊涂地确认了另一条。
+    """
+    return list(_alive(chat, ttl))
+
+
+def pop_pending(chat, ttl=300, index=None):
+    """取出并清除一条待确认动作；没有/全过期/越界返回 None。
+
+    * `index is None`：**保持原有行为**——取队头（最早的）。
+    * `index` 是 **1 起的序号**（对应 list_pending 返回的顺序）：取第 index 项
+      并把它从队列里移除，**其余项顺序不变**。
+    * 越界（<=0、超过条数、不是整数）返回 None 且**不改动队列**——
+      绝不能因为用户手滑选了个不存在的编号就把整条队列清掉。
+    """
+    items = _alive(chat, ttl)
+    if not items:
+        return None
+    if index is None:
+        # 老行为：队头。pop 的是 _alive 给的新列表，不是 _PENDING 里那份，
+        # 所以下面必须显式写回。
+        item = items.pop(0)
+    else:
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            return None
+        if i < 1 or i > len(items):
+            return None
+        item = items.pop(i - 1)
+    if items:
+        _PENDING[str(chat)] = items
+    else:
+        _PENDING.pop(str(chat), None)
+    return item
+
+
+def _mask_name(name):
+    """显示名兜底：万一是 wxid / roomid，就别原样写进给模型或用户看的文本。
+
+    渲染「谁说的、发给谁」一律用显示名（CLAUDE.md 的硬规矩）。正常情况
+    `to_name` 就是备注/昵称，这里只是最后一道闸：早期登记过、或者配置写歪了
+    留下一条 id 当名字时，宁可说「对方」也不能把那串 id 送到模型面前
+    ——模型会照抄给用户。
+    """
+    n = str(name or "").strip()
+    if not n or looks_like_id(n) or "@" in n:
+        return "对方"
+    return n
+
+
+def _clip(text, limit):
+    """截断并返回 (文本, 截断说明)。**截了必须明说**，不许看着像原文。"""
+    s = str(text or "")
+    if len(s) <= limit:
+        return s, ""
+    return s[:limit], f"（原文 {len(s)} 字，上面只显示前 {limit} 字，已截断）"
+
+
+def describe_pending(item):
+    """给编号菜单用的一行人类描述。**不带编号**——编号由菜单按位置自己加。
+
+    为什么不含编号：这个函数只拿得到 item，拿不到它在队列里的位置；
+    在这里编一个序号只会和真实顺序对不上。bot 拼菜单时用
+    `enumerate(list_pending(...), 1)` 加序号最稳。
+
+    硬规矩：**绝不出现 wxid / roomid**。收件人只认 `to_name`（必要时兜底成
+    「对方」）；`shell` 一律显示命令**原文**——用户审的就是这条真命令，
+    中间任何转述/改写都等于把确认闸门做废（必要时截断，但一定标注截断）。
+    """
+    if not isinstance(item, dict):
+        return "一条无法识别的待确认动作"
+
+    kind = str(item.get("kind") or "agent")
+    to_name = _mask_name(item.get("to_name"))
+
+    # 1) 待确认执行的本地命令：显示原文（防提示词注入的关键）
+    if kind == "shell":
+        raw = item.get("cmd")
+        if raw in (None, ""):
+            raw = item.get("text")
+        cmd, note = _clip(str(raw or ""), 200)
+        return f"本机命令「{cmd}」{(' ' + note) if note else ''}"
+
+    # 2) 待确认发送的图片（单张或一串路径）
+    img = item.get("image")
+    if img:
+        paths = [img] if isinstance(img, str) else list(img)
+        names = [os.path.basename(str(p)) for p in paths if str(p or "").strip()]
+        if len(names) == 1:
+            return f"发给 {to_name} 一张图片（{names[0]}）"
+        head = "、".join(names[:3]) + ("…" if len(names) > 3 else "")
+        return f"发给 {to_name} {len(names)} 张图片（{head}）"
+
+    # 3) 待确认转发的一条消息
+    if item.get("xml"):
+        return f"转发一条消息给 {to_name}"
+
+    text, note = _clip(item.get("text"), 120)
+    tail = f" {note}" if note else ""
+
+    # 4) 自动回复草稿：正文已经原样发给用户看过了，这里不重复（省 token）
+    if kind == "auto":
+        return f"自动回复草稿 → 发给 {to_name}：{text}{tail}"
+
+    # 5) 普通的待确认发送
+    try:
+        count = int(item.get("count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    if count > 1:
+        return f"发给 {to_name}「{text}」（连发 {count} 次）{tail}"
+    return f"发给 {to_name}「{text}」{tail}"
 
 
 def discard_pending(chat):
@@ -529,17 +813,38 @@ def send_repeated(client, wxid, text, count=1, interval=0.0):
     return sent, None
 
 
-def send_pending(client, item, interval=0.0):
+def send_pending(client, item, interval=0.0, allowed_dirs=None):
     """执行一条待确认动作，返回 (真正发出的条数, 错误)。**同步、串行。**
 
     文本可以连发；转发只发一次。图片可以是一个路径或**一串路径**（群发照片），
     多个之间按 interval 停顿——连发期间轮询会暂停，这是有意为之（hook 不支持并发）。
+
+    `allowed_dirs`：**发送时的二次校验**。登记（工具）时校验过一次，但从登记到
+    用户回「确认」之间隔着时间，配置可能变了、文件可能被换成链接指到别处——
+    所以真发之前再判一次目录归属。给 None = 保持原有行为不变（调用方自己负责），
+    这是为了不破坏还在按老姿势调用它的地方。
+
+    `allowed_dirs` 非 None 且这条待确认带 image 时：逐个路径 realpath 后判归属，
+    有任何一个不通过就**一条都不发**并如实返回错误——绝不允许"先发几张再说"，
+    也绝不静默跳过那一张（那等于偷偷改用户确认过的内容）。
     """
     wxid = item.get("to_wxid")
     if item.get("image"):
         imgs = item["image"]
         if isinstance(imgs, str):
             imgs = [imgs]
+
+        if allowed_dirs is not None:
+            if not allowed_dirs:
+                return 0, ("发图白名单是空的（既没配 agent.send_image_dirs，"
+                           "也找不到微信图片缓存目录），所以**一张都没发**。")
+            for p in imgs:
+                if not any(_is_under(str(p), d) for d in allowed_dirs):
+                    return 0, (f"发送前复核不通过：{p} 不在允许发送的目录里"
+                               f"（允许：{'；'.join(str(d) for d in allowed_dirs)}），"
+                               f"**一张都没发**。要换位置只能由**用户自己**去 "
+                               f"config.yaml 的 agent.send_image_dirs 里加。")
+
         sent = 0
         for i, p in enumerate(imgs):
             if i and interval:
@@ -577,7 +882,7 @@ def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None):
                 return [c]
         return [{"wxid": name, "name": name}]
 
-    # 精确相等必须单独一遍——否则「李同学」会把「李同学2」也带出来。
+    # 精确相等必须单独一遍——否则「张三」会把「张三丰」也带出来。
     exact = []
     for c in contacts or []:
         for key in (c.get("remark"), c.get("name"), c.get("alias"), c.get("wxid")):
@@ -639,7 +944,20 @@ class ToolBox:
         agent_cfg = self.cfg.get("agent") or {}
         self.whitelist = [str(x).strip() for x in (agent_cfg.get("auto_send_whitelist") or []) if str(x).strip()]
         self.confirm_ttl = int(agent_cfg.get("confirm_ttl", 300))
-        self.budget = _Budget(int(agent_cfg.get("max_queries", 6)))
+        # 查库预算：**必须有硬上限**。以前这里直接 int(...) 接用户填的数，
+        # 写 9999 就是 9999 次串行查库——hook 不支持并发、已经搞崩微信 6 次，
+        # 所以这里越界一律**钳制并告警**（既不报错中断，也绝不放行）。
+        # 上下限的理由见模块顶部的 _MAX_QUERIES_MIN / _MAX_QUERIES_MAX 注释。
+        try:
+            want = int(agent_cfg.get("max_queries", _MAX_QUERIES_DEFAULT))
+        except (TypeError, ValueError):
+            want = _MAX_QUERIES_DEFAULT
+        self.max_queries = max(_MAX_QUERIES_MIN, min(want, _MAX_QUERIES_MAX))
+        if want != self.max_queries:
+            _warn(f"agent.max_queries={want} 越界，已钳制为 {self.max_queries}"
+                  f"（允许 {_MAX_QUERIES_MIN}~{_MAX_QUERIES_MAX}；"
+                  f"hook 不支持并发，不能放开查库次数）。")
+        self.budget = _Budget(self.max_queries)
         # 连发的两条闸：单次请求的条数上限，以及每条之间的间隔。
         # 都是防「一口气刷屏把 hook 打崩」，不是给模型参考的建议值。
         self.max_send_count = max(1, int(agent_cfg.get("max_send_count", 20)))
@@ -647,16 +965,26 @@ class ToolBox:
         # 允许发图的目录。**这是安全边界，不是便利设置**：模型自己填 path，
         # 不设边界就等于让它从你硬盘上挑任意文件发出去。留空 = 只放行微信
         # 自己的图片缓存目录（也就是「聊天里已有的图」）。
-        self.send_image_dirs = [str(d).strip()
-                                for d in (agent_cfg.get("send_image_dirs") or [])
-                                if str(d).strip()]
+        # 白名单解析集中到模块级 allowed_image_dirs()：bot 在**发送时**也要用
+        # 同一套（那边只拿得到 cfg，拿不到 ToolBox 实例），两处必须一致。
+        self.send_image_dirs = allowed_image_dirs(self.cfg)
         # 历史行截断长度。以前写死 200，长消息被截得看不懂，模型答非所问。
         self.line_chars = max(80, int(agent_cfg.get("line_chars", 400)))
         # wxid -> 显示名，群里标发言人用（构造时算一次，别每条消息重算）
         self._names = auto_reply.contact_names(self.contacts)
         self.sent = []          # 本轮真正发出去的 [(name, text)]
+        # 本轮真正发出去的**条数**（单独的计数器，不从 self.sent 的长度推：
+        # self.sent 里一条可能代表「连发 5 次」也可能代表「一张图」，语义不齐，
+        # 拿它当条数一定算错）。run() 的异常分支靠它算出「已经发出去几条」。
+        self._sent_count = 0
         self._img_cache = {}    # wxid -> 图片列表（本轮复用，见 _images）
         self._file_cache = {}   # wxid -> 文件列表（同上，见 _files）
+        # 本轮**是否真的登记过**一条待确认的本地命令（见 t_run_command）。
+        #
+        # 这是给 bot.py 当**事实依据**用的：真机上抓到过模型不调工具、自己演一段
+        # 「我已经把命令提交上去了，等你回确认」——用户回「确认」时什么都不会发生
+        # （没有任何待确认项）。bot 那边靠这个标记核对「说的」和「做的」是否一致。
+        self.shell_queued = False
 
     def _image_path_ok(self, path):
         """校验发图路径。返回 (绝对路径, 错误文本)。
@@ -680,34 +1008,31 @@ class ToolBox:
         return p, None
 
     def _allowed_dirs(self):
-        """允许发送的根目录。
+        """允许发送的根目录。**解析逻辑集中在模块级 allowed_image_dirs()**。
 
-        **默认只放行微信自己的图片缓存目录**（也就是「聊天里已有的图」）。
-        要发别处的文件，必须由**用户**去 config.yaml 的 `agent.send_image_dirs`
-        加目录——助手不许自己改配置绕过这条。
+        以前这里自己拼一遍、bot 那边又拼一遍，两套判定迟早会不一致——
+        而这是个安全边界，两套判定等于两个洞。
+
+        默认放行的是**真正的图片缓存目录**（`<账号>/cache`，也就是「聊天里
+        已经出现过的图」），不是整个 `~/Documents/xwechat_files`（那里面还有
+        配置、db_storage、收来的文件）。推不出缓存目录时才退回 data_root 并告警，
+        见 allowed_image_dirs()。
         """
-        dirs = [os.path.abspath(os.path.expanduser(str(d)))
-                for d in self.send_image_dirs if str(d).strip()]
-        if not dirs:
-            root = image_cache.data_root()
-            if root:
-                dirs = [os.path.abspath(root)]
-        return dirs
+        return allowed_image_dirs(self.cfg)
 
     def _in_allowed_dirs(self, p):
-        """绝对路径 p 在不在允许目录里。返回 (p, 错误文本)。"""
+        """绝对路径 p 在不在允许目录里。返回 (p, 错误文本)。
+
+        用 `_is_under()`：**先 realpath 再 commonpath**——不然允许目录里放一个
+        指到别处的 junction/符号链接，就等于把任意路径伪装成「在允许目录内」。
+        """
         dirs = self._allowed_dirs()
         if not dirs:
             return "", ("没配可发文件的目录（agent.send_image_dirs），"
                         "也找不到微信图片缓存目录，所以不让发。")
-        target = os.path.normcase(p)
         for d in dirs:
-            dd = os.path.normcase(d)
-            try:
-                if os.path.commonpath([target, dd]) == dd:
-                    return p, None
-            except ValueError:
-                continue        # 不同盘符时 commonpath 会抛，跳过
+            if _is_under(p, d):
+                return p, None
         return "", (f"这个位置不在允许发送的目录里。允许：{'；'.join(dirs)}。\n"
                     f"（要发别处的，得**用户自己**去 config.yaml 的 "
                     f"agent.send_image_dirs 加目录——你不要改配置绕过。）")
@@ -799,9 +1124,12 @@ class ToolBox:
 
         if self._in_whitelist(wxid, nm) or self._in_whitelist(wxid, to):
             n, err = send_repeated(self.client, wxid, text, count, self.send_interval)
+            # 先记「真发出去几条」再往下：中途失败时 n 就是已经发出去的条数，
+            # self.sent 那条记录是给人看的摘要，两者用途不同（见 _sent_count）。
+            self._sent_count += n
             self.sent.append((nm, text if count == 1 else f"{text} ×{n}"))
             if err is not None:
-                return f"发给 {nm} 时失败（已发出 {n}/{count} 条）：{err}"
+                self._send_fail(f"发给 {nm} 时失败（已发出 {n}/{count} 条）：{err}")
             if count == 1:
                 return f"已发送给 {nm}。"
             return f"已给 {nm} 连发 {n} 条「{text}」。"
@@ -1141,7 +1469,8 @@ class ToolBox:
             try:
                 self.client.send_image(path, wxid)
             except Exception as e:
-                return f"给 {nm} 发图片失败：{e}"
+                self._send_fail(f"给 {nm} 发图片失败：{e}")
+            self._sent_count += 1
             self.sent.append((nm, desc))
             return f"已把 {base} 发给 {nm}。"
         set_pending(self.chat, wxid, nm, desc, image=path)
@@ -1182,7 +1511,11 @@ class ToolBox:
             return (f"「{folder}」里第一层没有图片。"
                     f"（只扫一层，子目录不算；支持的格式：{'/'.join(sorted(_IMG_EXT))}）")
 
-        agent_cfg = self.cfg.get("agent") or {}
+        # **实时读配置**（和 t_run_command 一致）：self.cfg 是构造时的快照，
+        # 而 bot.py 那边是实时读盘的。同一轮会话里如果用户用 /命令 改过
+        # max_send_count / send_interval，快照就会让两处对不上——
+        # 「一次最多发几张」这种事绝不能用过期数字。
+        agent_cfg = (self.cfg_provider() or self.cfg).get("agent") or {}
         cap = max(1, int(agent_cfg.get("max_send_count", 20)))
         want = int(args.get("limit") or cap)
         want = max(1, min(want, cap))
@@ -1208,7 +1541,11 @@ class ToolBox:
                 try:
                     self.client.send_image(p, wxid)
                 except Exception as e:
-                    return f"发到第 {i + 1} 张失败（前面 {i} 张已发出）：{e}"
+                    # 已经发出去几张先记进计数器，再抛给 run() 统一汇总说明
+                    # （见 _send_fail）：少说一张就等于让模型对用户说「一张都没发」。
+                    self._sent_count += i
+                    self._send_fail(f"发到第 {i + 1} 张失败（前面 {i} 张已发出）：{e}")
+            self._sent_count += len(picked)
             self.sent.append((nm, desc))
             return f"已把 {len(picked)} 张图片发给 {nm}。{trunc}"
 
@@ -1248,13 +1585,76 @@ class ToolBox:
             try:
                 self.client.send_xml(xml, wxid)
             except Exception as e:
-                return f"转发给 {nm} 失败：{e}"
+                self._send_fail(f"转发给 {nm} 失败：{e}")
+            self._sent_count += 1
             self.sent.append((nm, desc))
             return f"已把「{snm}」里那条消息转发给 {nm}。"
         set_pending(self.chat, wxid, nm, desc, xml=xml)
         return (f"「{nm}」不在自动发送名单里，转发**尚未发出**。"
                 f"请告诉用户：准备把「{snm}」里那条消息转给 {nm}，"
                 f"让他回复「确认」后再发。")
+
+    def t_run_command(self, args):
+        """登记一条「待确认执行」的本地命令。**这里一个字都不执行。**
+
+        微信消息是远程执行入口，等于把本机 shell 的口子开在聊天里，所以规矩只有
+        一条：不管模型多想跑，都必须**先把命令原文给用户看、等用户回「确认」**。
+        本方法只 set_pending(kind="shell")，真正的执行在 bot.py 的确认分支里
+        （那里才有「用户确实回了确认」这个事实）。
+
+        绝不在这里 import/调用 executor.run_command——那等于「模型说跑就跑」。
+        """
+        raw = str(args.get("command") or "").strip()
+        if not raw:
+            return "参数不全：需要 command（要执行的命令原文）。"
+
+        cfg = self.cfg_provider() or self.cfg
+        shell_cfg = cfg.get("shell") or {}
+        if not shell_cfg.get("enabled", False):
+            # 如实报错，绝不偷偷换个动作糊弄过去
+            return ("本地执行没开（config.yaml 的 shell.enabled）。"
+                    "这条命令**没有**登记、也**没有**执行；"
+                    "请如实告诉用户「本地命令执行是关着的」，"
+                    "让用户自己去 config.yaml 把 shell.enabled 打开。")
+
+        timeout = args.get("timeout")
+        if timeout is not None:
+            try:
+                timeout = int(timeout)
+            except (TypeError, ValueError):
+                return f"timeout 得是秒数，收到的是「{args.get('timeout')}」。"
+            if timeout <= 0:
+                return "timeout 得是正数秒。"
+
+        # shell.auto_ok：**用户**在 config.yaml 里逐条写死的命令，命中就直接跑、免确认。
+        #
+        # 这是用户自己指定的旁路，**不是模型能触发的东西**——模型只能写 command
+        # 字符串，写不出"让这条命中白名单"的效果（匹配规则见 _auto_ok_hit：整条
+        # 精确相等，没有前缀/子串/通配符）。**以后别把它当成"忘了加确认"删掉**：
+        # 默认空列表 = 每条都确认，这才是推荐的姿势。
+        if _auto_ok_hit(raw, shell_cfg.get("auto_ok")):
+            print(f"[bot] 命中 shell.auto_ok，免确认执行: {raw}")
+            kw = {"cfg": cfg}
+            if timeout is not None:
+                kw["timeout"] = timeout
+            try:
+                _ok, text = executor.run_command_text(raw, **kw)
+            except Exception as e:
+                return f"执行「{raw}」时出错：{e}"
+            return (f"这条命令在用户的 shell.auto_ok 名单里，**已直接执行**"
+                    f"（不用确认——是用户自己在 config.yaml 里指定的）。\n{text}")
+
+        # text 也存命令原文：bot 复述给用户用，且保证**显示模型给的原话**，
+        # 不是模型事后转述的版本（转述会把命令改掉，用户确认的就不是真跑的那条）。
+        set_pending(self.chat, "", "", text=raw, kind="shell", cmd=raw,
+                    timeout=timeout)
+        # 真的登记上了才置位（auto_ok 那支直接执行、不走这里，也就不置位）。
+        # bot 用它核对回答里说的「已提交、等你确认」是不是真的。
+        self.shell_queued = True
+        return (f"命令**尚未执行**。请把下面这条命令**原文**发给用户看一眼，"
+                f"请他回复「确认」之后才会真的在他本机执行：\n"
+                f"{raw}\n"
+                f"（用户没回「确认」之前，**不许说已经跑了**，也不许编造执行结果。）")
 
     def t_auto_reply(self, args):
         args = args or {}
@@ -1331,11 +1731,47 @@ class ToolBox:
 
     # ---------- 分发 ----------
 
+    @staticmethod
+    def _send_fail(msg):
+        """发送类工具中途失败的**统一出口**：包成异常抛给 run()。
+
+        为什么不让工具自己拼一句错误文本返回：以前 t_send_image / t_send_images
+        出错时各自 return 一句话，异常根本没冒到 run() 那里，于是
+        「已经发出去几张」这个事实**没人汇总**，模型只能看到一句「发图片失败」
+        ——它会转头跟用户说「没发出去」，而对方其实已经收到两张了。
+
+        现在四个发送类工具所有失败路径都走这里：真正发出去几张由 run() 用
+        `_sent_count` 统一算（工具自己数容易漏、容易和 self.sent 的语义对不上），
+        再配一句「该怎么办」，风格同 _db_fail()。
+        """
+        raise RuntimeError(msg)
+
     def run(self, name, args):
         fn = getattr(self, f"t_{name}", None)
         if fn is None:
             return f"没有名为 {name} 的工具。"
+        before = self._sent_count
         try:
             return str(fn(args or {}))
         except Exception as e:
+            # 发送类工具的异常**必须带上「已经发出去几条」这个事实**。
+            #
+            # 真机上踩过：t_send_images 发到第 3 张才出错，工具只回一句
+            # 「发图片失败」，模型就去跟用户说「没发出去」——而对方实际已经
+            # 收到两张了。发消息是不可逆动作，假装没发等于把用户放在
+            # 「以为没发、其实发了」的错误位置上（跟 run_command 那条
+            # 「没跑就是没跑」是同一类规矩，只是这里反过来了：发了就是发了）。
+            n = self._sent_count - before
+            if name in _SEND_TOOLS:
+                if n > 0:
+                    return (f"工具 {name} 执行到一半失败：{e}\n"
+                            f"**已经成功发出 {n} 条/张**（发消息不可逆，"
+                            f"这部分收不回来，不要在用户面前说「都没发出去」）。"
+                            f"请如实告诉用户：已经发出 {n} 条/张，剩下的**没有发**，"
+                            f"并说清失败原因；要补发就**先问用户**，不要自己重发"
+                            f"（重发会让对方收到重复消息）。")
+                return (f"工具 {name} 执行失败：{e}\n"
+                        f"**这条还没有发出去**（失败的时机在发送之前，"
+                        f"或者第一条就失败了）。请如实告诉用户没发成、原因是什么，"
+                        f"**不要说自己重发过了**。")
             return f"工具 {name} 执行出错：{e}"

@@ -61,6 +61,27 @@ def account_dirs():
     return out
 
 
+def image_cache_dirs():
+    """**真正的图片缓存根目录**——把发图白名单限制到「聊天里已有的图」本身。
+
+    为什么要单独有个函数：`data_root()` 是**整个**微信数据目录
+    （`~/Documents/xwechat_files`），里面除了图片缓存还有配置、db_storage、
+    msg 收来的文件等等。发图的默认白名单如果直接用 data_root()，等于把整个
+    微信数据目录都放行了，和「只放行图片缓存」这句话完全不是一回事。
+
+    这个路径不是猜的，是按本模块真正扫描缩略图的路径推出来的：见 cache_index()，
+    它扫的是 `<账号>/cache/<YYYY-MM>/Message/<md5>/Thumb/`，所以**图片缓存根
+    就是 `<账号>/cache`**——月份目录在它下面，thumb 也在它下面。
+
+    （同名兄弟目录 Emoticon / HttpResource / Sns / WeAppIcon 也在这个 cache 下，
+    都算微信自己解码出来的缓存图片，一并放行是合理的。）
+
+    返回账号 cache 目录的**列表**（多账号时全都要放行）；一个都没有就返回 []，
+    调用方必须自己决定怎么兜底，**别在这里偷偷放宽**。
+    """
+    return [os.path.join(d, "cache") for d in account_dirs()]
+
+
 def cache_index(chat_hash, account=None, ttl=_INDEX_TTL):
     """建索引 {(local_id, create_time): 文件路径}，跨所有月份。
 

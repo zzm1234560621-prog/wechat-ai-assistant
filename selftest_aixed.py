@@ -150,7 +150,7 @@ class _NoDbStub(Stub):
 # 老代码在这里会静默收不到任何消息；期望修好后能靠 SessionTable.summary 兜住。
 
 V4_SESSION_TS = NOW + 40
-V4_SESSION_SUMMARY = "给李同学发10次你好"
+V4_SESSION_SUMMARY = "给张三发10次你好"
 
 # 真实抓到的 chat_room.ext_buffer（群 11111111111@chatroom），用来验群成员解码。
 # 结构：repeated { 1=wxid  2=群昵称  3=角色(群主=9)  4=邀请人 }
@@ -386,9 +386,11 @@ def main():
                 bot._msg_speaker(
                     {"talker": "11111111111@chatroom", "is_self": 0, "sender": ""},
                     bnames) == "165汉阙总群/群成员")
-    ok &= check("认不出的 wxid 不硬编名字",
+    # 这条以前期望返回裸 `wxid_zzz`——那**正是** CLAUDE.md 明令禁止的
+    # 「把 talker 原样塞进给模型的文本」。改成：查不到显示名就退回「对方」。
+    ok &= check("认不出的 wxid 不外泄原始 id（退回「对方」）",
                 bot._msg_speaker({"talker": "wxid_zzz", "is_self": 0, "sender": ""},
-                                 bnames) == "wxid_zzz")
+                                 bnames) == "对方")
 
     print("\n── 群成员解码（用真抓到的 ext_buffer，纯函数）──")
     mem = live_history.decode_room_members(ROOM_BUF)

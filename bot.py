@@ -21,6 +21,7 @@ import yaml
 
 import agent_tools
 import auto_reply
+import executor
 import live_history
 import settings
 import providers
@@ -38,6 +39,37 @@ from live_history import (
     set_self_wxid,
 )
 from aixed_api import AixedClient, AixedError
+
+# 运维 / 隐私侧的后加模块。**故意写成可缺省导入**：万一哪个没跟着部署上来，
+# 不许把 bot 直接拦死在启动阶段（那就等于整台助手全废），但用到处会明确告警，
+# 绝不静默当它不存在。
+try:
+    import health
+except ImportError:                                     # pragma: no cover
+    health = None
+try:
+    import usage
+except ImportError:                                     # pragma: no cover
+    usage = None
+try:
+    import redact
+except ImportError:                                     # pragma: no cover
+    redact = None
+try:
+    import status_page
+except ImportError:                                     # pragma: no cover
+    status_page = None
+
+# health.Health 的实例，main() 里建。
+# **故意不叫 health**：`health` 这个名字留给模块本身（模块级的 rotate_log 等函数
+# 要用它），实例单独放这里，避免「调了实例上不存在的方法、被 try/except 静默吞掉」。
+_HEALTH = None
+
+
+def _h():
+    """当前健康看护实例；health.py 缺失或还没初始化时返回 None。"""
+    return _HEALTH
+
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
@@ -72,6 +104,13 @@ class _Tee:
 
 
 def setup_logging():
+    # 先轮转再打开：日志是 `open(..., "a")` 无限追加的，后台长期跑会一直涨。
+    # 轮转失败不许挡住启动（拿不到日志也总比没有 bot 强），但会如实打出来。
+    if health is not None:
+        try:
+            health.rotate_log(LOG_PATH)
+        except Exception:
+            traceback.print_exc()
     try:
         logf = open(LOG_PATH, "a", encoding="utf-8")
     except OSError:
@@ -120,7 +159,8 @@ HELP_TEXT = (
     "/temp <0-1>     设置 temperature，如 /temp 0.7\n"
     "/addchat <wxid> 添加要响应的聊天\n"
     "/delchat <wxid> 移除聊天\n"
-    "/status         查看当前配置\n"
+    "/status         查看当前配置 + 运行健康（轮询 / 分片错误 / 登录态）\n"
+    "/用量 [天数]     看 token 用量和估算费用（默认最近 7 天）\n"
     "/help           显示本帮助\n"
     "\n"
     "—— 自动回复（让 AI 代替我本人回某个人）——\n"
@@ -223,18 +263,6 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
         settings.set_value("model", arg)
         return f"模型已改为 {arg}。", True
 
-    if cmd in ("/provider", "/协议"):
-        if not arg:
-            return f"当前协议：{cfg.get('provider', 'anthropic')}", False
-        v = arg.lower()
-        if v not in ("anthropic", "openai"):
-            return "只支持 anthropic 或 openai。", False
-        settings.set_value("provider", v)
-        tip = ""
-        if v == "openai" and not cfg.get("base_url"):
-            tip = "\n注意：openai 协议还需要接口地址，发 /baseurl <url> 设置。"
-        return f"协议已改为 {v}。{tip}", True
-
     if cmd in ("/baseurl", "/接口"):
         if not arg:
             return f"当前接口地址：{cfg.get('base_url') or '（默认）'}", False
@@ -287,7 +315,49 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
             f"目标聊天: {cfg.get('target_chats')}",
             f"实时查库: {'开启' if live_ok else '关闭（静态导出模式）'}",
         ]
+        # 运行健康（纯内存快照，不查库）。以前 /status 只报配置，
+        # 而用户最需要知道的恰恰是「它现在到底还收不收得到消息」。
+        h = _h()
+        if h is not None:
+            try:
+                snap = h.snapshot()
+                up = int(snap.get("uptime_seconds") or 0)
+                lines.append(f"运行时长: {up // 3600} 小时 {(up % 3600) // 60} 分")
+                if snap.get("last_poll_text"):
+                    lines.append(f"最近轮询: {snap.get('last_poll_text')}")
+                if snap.get("login_ok") is False:
+                    lines.append("⚠️ 登录态: 已掉登录（要在微信里重新扫码）")
+                sendf = snap.get("send_failures") or 0
+                if sendf:
+                    lines.append(f"⚠️ 发送失败累计: {sendf} 次（看 bot.log）")
+            except Exception:
+                lines.append("（运行健康快照取不出来，看 bot.log）")
+        else:
+            lines.append("⚠️ health.py 不在：健康看护/状态页不可用（安装不完整）")
+        try:
+            errs = live_history.poll_errors()
+        except Exception:
+            errs = {}
+        if errs:
+            names = "、".join(f"{k}({v[1]}次)" for k, v in errs.items())
+            lines.append(f"⚠️ 分片查询失败: {names}")
         return "\n".join(lines), False
+
+    if cmd in ("/用量", "/usage", "/花费"):
+        if usage is None:
+            return "这个版本没带上 usage.py，用量统计不可用（安装不完整）。", False
+        days = 7
+        if arg:
+            try:
+                days = max(1, min(365, int(arg)))
+            except (TypeError, ValueError):
+                return "用法：/用量 [天数]，例如 /用量 30", False
+        try:
+            return usage.summarize(days), False
+        except Exception as e:
+            # 统计坏了也得如实说，不许回一句「暂无记录」糊过去
+            traceback.print_exc()
+            return f"用量统计失败：{e}", False
 
     if cmd in ("/auto", "/自动回复"):
         # 重新读一次配置再处理：连着发几条 /auto 时，传进来的 cfg 还是上一条
@@ -344,10 +414,15 @@ def _msg_speaker(m, names):
     群聊标成「群名/发言人」，单聊就是对方的名字。
     """
     talker = str(m.get("talker") or "")
-    tname = names.get(talker) or talker
+    # ⚠️ 查不到显示名时**不要把 talker 当会话名**：talker 是 wxid / roomid
+    # （无 fts 兜底那条路甚至可能是 `Msg_<md5>` 表名），拿它当名字就等于把原始 id
+    # 交给模型（CLAUDE.md 明令禁止）。查不到就给空串，由 speaker_of 退回「对方/群成员」。
+    tname = names.get(talker) or ""
     group = auto_reply.is_group(talker)
     who = agent_tools.speaker_of(m, names, tname, group)
-    return f"{tname}/{who}" if group and who != tname else who
+    if group and who != tname:
+        return f"{tname or '群'}/{who}"
+    return who
 
 
 def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
@@ -411,7 +486,18 @@ def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
 
     parts.append("")
     parts.append(f"【用户的问题】{query}")
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    # 送云端前脱敏：**默认关闭**（config.yaml 的 privacy.redact）。
+    # 只作用于「送出去的那一份」，本地原文一个字都不动。命中数要打日志，
+    # 让用户知道这次真打了码——不许悄悄改内容还装作没发生。
+    if redact is not None:
+        try:
+            text, hits = redact.redact(text, cfg)
+            if hits:
+                print(f"[bot] 已对送出的历史脱敏，命中 {hits} 处（privacy.redact）")
+        except Exception:
+            traceback.print_exc()
+    return text
 
 
 # ============================================================
@@ -446,6 +532,24 @@ def is_strict_confirm(text):
 
 def is_cancel(text):
     return _norm_word(text) in _CANCEL_WORDS
+
+
+# 「确认 2」「第2条」「执行 2」这类**整句就是选号**的写法。
+# 句子里夹带数字（例如「确认下 2 点的会」「2 是谁」）一律**不认**——
+# 宁可多问一次，也绝不猜他要确认哪一条。
+_PENDING_SEL_RE = re.compile(
+    r"^(?:确认|确定|确认发送|执行|ok|yes|y)?\s*第?\s*(\d{1,3})\s*条?$", re.I)
+
+
+def pending_index_of(text):
+    """这句里显式点了第几条待确认项。没有就返回 None（1 起）。"""
+    m = _PENDING_SEL_RE.match(_norm_word(text))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 # ============================================================
@@ -567,8 +671,128 @@ def dialog_forget(chat):
         _dialog_save()
 
 
+# ============================================================
+#  落盘运行状态：轮询游标 + 待确认队列
+# ============================================================
+#
+# 为什么必须有：
+#   * 游标以前只活在内存里，重启就是 `prime()`「把当前最新那批标成已见」——
+#     停机期间来的消息**直接被丢掉**，用户看到的是「重启后漏了一段」。
+#   * 待确认队列以前只在内存里（`agent_tools._PENDING`）：重启之后用户照着
+#     刚才看到的提示回「确认」，什么都不会发生，白等一场。
+#
+# 落盘策略与对话记忆一致：先写临时文件再 `os.replace`，半截崩了不会把整份弄没。
+
+STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "state.json")
+_STATE = None
+# 游标落盘的节流时间戳（没必要每 5 秒就写一次盘）
+_LAST_CURSOR_SAVE = 0.0
+
+
+def _state_load():
+    """读一次盘，之后走内存。文件坏了就当空的——状态文件不该挡住启动。"""
+    global _STATE
+    if _STATE is not None:
+        return _STATE
+    _STATE = {}
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return _STATE
+    if isinstance(data, dict):
+        _STATE = data
+    return _STATE
+
+
+def _state_save():
+    if _STATE is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_STATE, f, ensure_ascii=False)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        traceback.print_exc()
+
+
+def state_get(key, default=None):
+    return _state_load().get(key, default)
+
+
+def state_set(key, value):
+    _state_load()[key] = value
+    _state_save()
+
+
+def save_pending(chats, cfg=None):
+    """把待确认队列落盘。**队列一变就调**——不能等节流窗口过去，
+
+    否则「用户已确认并执行/已发送」和「盘上还记着这条」之间就有个窗口，
+    崩溃重启后那条会被恢复出来，可能被再执行一次。
+    """
+    try:
+        ttl = int(((cfg or {}).get("agent") or {}).get("confirm_ttl", 300))
+    except (TypeError, ValueError):
+        ttl = 300
+    snap = {}
+    for c in list(chats or []):
+        try:
+            items = agent_tools.list_pending(c, ttl)
+        except Exception:
+            traceback.print_exc()
+            continue
+        if items:
+            snap[str(c)] = items
+    try:
+        state_set("pending", snap)
+    except Exception:
+        traceback.print_exc()
+
+
+def restore_pending(chats, cfg):
+    """把盘上的待确认队列恢复到内存。返回恢复了几条。
+
+    只恢复**还在 `confirm_ttl` 时效内**的：过期的恢复出来只会让用户
+    对着一句早就没意义的提示回「确认」。
+    """
+    data = state_get("pending")
+    if not isinstance(data, dict):
+        return 0
+    try:
+        ttl = int((cfg.get("agent") or {}).get("confirm_ttl", 300))
+    except (TypeError, ValueError):
+        ttl = 300
+    allowed = {str(c) for c in (chats or [])}
+    now = time.time()
+    n = 0
+    for chat, items in data.items():
+        if str(chat) not in allowed or not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                if now - float(it.get("ts") or 0) > ttl:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                agent_tools.set_pending(
+                    chat, it.get("to_wxid") or "", it.get("to_name") or "",
+                    it.get("text") or "", kind=it.get("kind") or "agent",
+                    count=it.get("count") or 1, image=it.get("image"),
+                    xml=it.get("xml"), cmd=it.get("cmd"), timeout=it.get("timeout"))
+                n += 1
+            except Exception:
+                traceback.print_exc()
+    return n
+
+
 def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
-              cfg_provider=None, history=None):
+              cfg_provider=None, history=None, state=None):
     """带工具的问答循环。返回 (最终要回复的文本, 工具是否改动了配置)。
 
     hook 不能并发查询，所以工具是**串行**执行的；查询次数由
@@ -579,9 +803,15 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
 
     history 是该会话之前的几轮对话（见 dialog_history），拼在本轮提问前面，
     这样「刚才那个」「再帮我问他一句」才接得上。
+
+    state：可选的 dict。传了就写入本轮的工具事实（目前只有 shell_queued：
+    本轮**是否真的登记过**一条待确认的本地命令），给主循环做确定性兜底用
+    （见 with_shell_truth_note）。返回值形状**故意不动**，免得破坏现有解包。
     """
     agent_cfg = cfg.get("agent") or {}
-    max_rounds = max(1, int(agent_cfg.get("max_rounds", 3)))
+    # 夹到 [1, 10]：轮次直接线性放大对 hook 的调用次数，而 CLAUDE.md 记着
+    # 「hook 不能并发、已被并发查询搞崩 6 次」。光靠注释劝人「别放开」不算闸门。
+    max_rounds = max(1, min(10, int(agent_cfg.get("max_rounds", 3))))
     box = agent_tools.ToolBox(wcf, cfg, contacts, self_wxid, chat, cfg_provider)
 
     messages = list(history or []) + [{"role": "user", "content": prompt}]
@@ -590,6 +820,8 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
         result = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
         last_text = result.text or last_text
         if not result.tool_calls:
+            if state is not None:
+                state["shell_queued"] = box.shell_queued
             return result.text or "（模型没有返回内容）", box.cfg_changed
 
         messages.append({
@@ -607,6 +839,8 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
     # 轮次用完：再要一次纯文本答复
     messages.append({"role": "user",
                      "content": "（工具调用轮次已用完，请直接给出最终答复，不要再调用工具。）"})
+    if state is not None:
+        state["shell_queued"] = box.shell_queued
     try:
         final = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
         return (final.text or last_text or "（工具调用次数用完了，没能给出答复）",
@@ -632,6 +866,131 @@ def is_own_reply(text):
     """这条是不是我们自己刚发出去的回复。"""
     t = _SENT_RECENT.get(str(text).strip())
     return t is not None and (time.time() - t) < _SENT_TTL
+
+
+def shell_command_text(item, cfg):
+    """执行一条已确认的本地命令，返回要回给用户的文本。
+
+    只在用户**真的回了「确认」**之后才会走到这里——命令原文早在
+    agent_tools.t_run_command 里登记过、也给用户看过了。
+
+    同步阻塞、故意不开线程：hook 不支持并发，主循环是单线程的，跑命令期间
+    就停下轮询（消息在库里排着，回来照收）。超时 / 非零退出 / 输出被截断
+    一律由 executor.format_result 如实写在文本里，绝不假装成功。
+    """
+    cmd = str(item.get("cmd") or "")
+    # 模型给的 timeout 优先；没给就让 executor 自己去读 shell.timeout。
+    kw = {}
+    try:
+        if item.get("timeout") is not None:
+            kw["timeout"] = int(item["timeout"])
+    except (TypeError, ValueError):
+        pass
+
+    print(f"[bot] 已确认，执行命令: {cmd}")
+    try:
+        # cfg 一并传进去：executor 自己读 shell.cwd / timeout / max_output，
+        # 边界（夹到 [1,600] 等）也由它管，这里不重复实现一套。
+        res = executor.run_command(cmd, cfg=cfg, **kw)
+    except Exception as e:
+        # 连跑都没跑起来（executor 自己抛了）——如实说，不编输出
+        return f"执行「{cmd}」时出错：{e}"
+    try:
+        # 不自己截长度：format_result 的默认额度就是**按微信消息体量**定的，
+        # 而且它带命令原文 + 目录 + 状态 + 截断说明，比自己拼的文本可信。
+        text = executor.format_result(res)
+    except Exception as e:
+        return f"命令跑完了，但结果渲染不出来：{e}"
+    print(f"[bot] 命令结束 ok={getattr(res, 'ok', None)} "
+          f"exit={getattr(res, 'exit_code', None)}")
+    return text
+
+
+# ============================================================
+#  本地执行的**确定性兜底**：说的和做的必须对得上
+# ============================================================
+
+# 真机踩过（2026-10-01）：用户说「在电脑上跑一条命令看看：dir /b」，模型**没有**
+# 调用 run_command 工具，直接自己演了一段「好的，我来提交这条命令，但它不会立刻
+# 执行——需要你回『确认』后才真跑。命令原文：dir /b」。
+# 日志里没有 `工具 run_command` 行、也没有任何待确认项——用户以为登记好了，回
+# 「确认」时什么都不会发生。这直接踩中项目硬规矩「没跑就是没跑」。
+#
+# 光靠 system_prompt 叮嘱不管用（提示词是建议，不是保证）。所以这里做一层
+# **确定性**兜底：answer 里出现了「已经提交 / 已登记 / 等你确认」这类话，而本轮
+# ToolBox 的 shell_queued 为假（= 一个字都没登记），就固定追加一句真话。
+#
+# 判据宁可少触发，分两档（**不按长度卡**：长度不是"有没有声称执行"的判据，
+# 话术才是，而且按长度早退会把长一点的谎报正好放过去——真机那条原话就不短）：
+#   ① 明确的**完成态**说法（带「已/了」）：单独出现就算；
+#   ② 「提交/登记/排队/待确认」这类**动作词**，必须和确认词**出现在同一行**才算。
+#      —— 真机原话是「好的，我来提交这条命令，但它不会立刻执行——需要你回
+#      「确认」后才真跑」，正好落在这一档。
+#   ③ 出现**否定 / 反问 / 假设**语义一律不追加：模型在如实说"我这边什么都没有"
+#     或反问用户"是不是指跑命令"时，不能再被追加一句真话，那是自相矛盾的啰嗦。
+#      真实反例：「目前挂着的只有一条**命令待确认**：dir /b」——用了「待确认」，
+#      但那是**说明现状**，不是声称自己刚登记，所以必须被这一档拦下。
+#      按 lead 的取舍：**简单可预期的子串判断优先于聪明**（宁可少触发）。
+#   ④ 只在同一句里出现「命令」「执行」这类词**不算**——否则正常聊天老被追加。
+_PENDING_CLAIM_DONE = (
+    "已提交", "已经提交", "提交了", "已登记", "已经登记", "登记了",
+    "已排队", "已经排队", "排队了", "已待确认", "已加入待确认", "已生成待确认",
+)
+_PENDING_CLAIM_ACT = ("提交", "登记", "排队", "待确认")
+_PENDING_CLAIM_CONFIRM = ("确认", "等你", "待你", "等您", "待您")
+# 否定 / 反问 / 假设（整段里出现任意一个 → 不追加）
+_PENDING_CLAIM_NEG = (
+    "没有", "没什么", "没看到", "没查", "没提交", "没登记", "没排队",
+    "没待确认", "未提交", "未登记", "未排队", "未找到",
+    "不是", "不确定", "是不是", "如果你要", "如果你", "请明确", "要不要",
+    "只有一条", "挂着", "没有任何",
+)
+
+# 没有真登记时固定追加的真话。**别删**——这是真机上唯一能拦住
+# 「模型自己演一段已登记」的东西（见上）。
+SHELL_NOT_QUEUED_NOTE = ("\n\n（补充：我这边其实**还没有登记任何本地命令**。"
+                         "要真在电脑上跑，我得先调用工具把命令原文提交上来、"
+                         "你再回「确认」——刚才那条如果你要执行，请回「确认」或再说一次。）")
+
+
+def looks_like_pending_claim(text):
+    """这句话像不像在声称「我已经把命令提交上去、等你确认了」。
+
+    两档判据 + 一道否定闸，见上面注释。**宁可少触发**：只说「命令/执行」
+    不算；拿不准的一律当"不是声称"（少追一句补充，好过把实话再包一层）。
+    """
+    t = str(text or "")
+    if not t:
+        return False
+    # ③ 否定 / 反问 / 假设闸（门在最前面，简单子串，宁可少触发）
+    if any(w in t for w in _PENDING_CLAIM_NEG):
+        return False
+    # ① 完成态
+    if any(w in t for w in _PENDING_CLAIM_DONE):
+        return True
+    # ② 动作词 + 确认词同一行（真机原话就是这一档）
+    for line in t.splitlines():
+        if any(a in line for a in _PENDING_CLAIM_ACT) \
+                and any(c in line for c in _PENDING_CLAIM_CONFIRM):
+            return True
+    return False
+
+
+def with_shell_truth_note(answer, shell_queued):
+    """回答里声称「已提交命令」但本轮根本没登记时，追加一句真话。
+
+    shell_queued 来自本轮 ToolBox（真的 set_pending 过才为真）。
+    不追加的三种情况：文本为空（shell.auto_ok 那轮工具直接执行、模型可能没回话）、
+    本轮真登记过、以及判据没命中（没声称、或者说的是"我这边没有待确认"）。
+    """
+    text = str(answer or "")
+    if not text or shell_queued:
+        return text
+    if looks_like_pending_claim(text):
+        # 记一笔日志：这类"说的和做的不一致"值得回头统计（模型行为问题）
+        print("[bot] 回答声称已提交命令，但本轮没有登记任何 shell 项 → 追加真话")
+        return text + SHELL_NOT_QUEUED_NOTE
+    return text
 
 
 # ============================================================
@@ -762,10 +1121,51 @@ def iter_wcferry_messages(wcf, tick=None):
         yield msg
 
 
-def iter_aixed_messages(client, interval, tick=None):
-    """aixed 没有收消息接口，只能轮询数据库拿新消息。"""
+def _probe_login(client):
+    """探一次登录态，返回 (是否在线, 说明)。
+
+    只用 hook 的只读接口，**不碰数据库句柄表**（不触发那 700MB 进程里的全内存扫描）。
+    探测本身失败时按「不在线」处理并如实记下原因——分诊要保守，宁可多报一次。
+    """
+    try:
+        ok = bool(client.is_login())
+    except Exception as e:
+        return False, f"探登录态失败：{e}"
+    if not ok:
+        return False, "IsLogin: 0（微信可能停在登录界面）"
+    return True, ""
+
+
+def iter_aixed_messages(client, interval, tick=None, cfg=None):
+    """aixed 没有收消息接口，只能轮询数据库拿新消息。
+
+    传了 `cfg` 才有「重启续上」——见下面 resume_window 的说明。
+    """
+    global _LAST_CURSOR_SAVE
     tick = tick or (lambda: None)
-    cursor, seen = client.prime()
+    st = (cfg or {}).get("state") or {}
+    try:
+        resume_window = max(0, int(st.get("resume_window", 1800)))
+    except (TypeError, ValueError):
+        resume_window = 1800
+
+    # 重启后从**上次的游标**接着收，而不是一刀切到「最新」。
+    # 以前 `prime()` 把当前最新那批直接标成已见，停机期间来的消息就永远丢了，
+    # 用户看到的是「重启后漏了一段」。窗口外的（比如关机一整晚）不续——
+    # 续了等于把一大段历史当新消息重放。
+    saved = state_get("cursor")
+    cursor, seen = None, {}
+    if resume_window > 0 and isinstance(saved, dict) and saved.get("cursor"):
+        try:
+            age = time.time() - float(saved.get("ts") or 0)
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and age <= resume_window:
+            cursor = saved["cursor"]
+            print(f"[bot] 从上次的游标继续（{int(age)} 秒前的位置）："
+                  f"停机期间的旧消息只通知、不自动回复")
+    if cursor is None:
+        cursor, seen = client.prime()
     print(f"[bot] 轮询模式：游标 = {cursor}，间隔 {interval}s")
     polls = 0
     while True:
@@ -780,7 +1180,21 @@ def iter_aixed_messages(client, interval, tick=None):
         except Exception:
             # 以前这里只捕 AixedError，别的异常会被静默吞掉，排查时很难受
             traceback.print_exc()
+        # 游标落盘（节流 10 秒一次）
+        if time.time() - _LAST_CURSOR_SAVE >= 10:
+            _LAST_CURSOR_SAVE = time.time()
+            try:
+                state_set("cursor", {"cursor": cursor, "ts": time.time()})
+            except Exception:
+                traceback.print_exc()
         polls += 1
+        h = _h()
+        if h is not None:
+            # 每轮都喂一次（实现是纯内存的，不做 IO）；心跳那行再带上分片错误
+            try:
+                h.note_poll(cursor=cursor)
+            except Exception:
+                traceback.print_exc()
         if polls % 30 == 0:
             errs = live_history.poll_errors()
             extra = ""
@@ -788,6 +1202,17 @@ def iter_aixed_messages(client, interval, tick=None):
                 names = "、".join(f"{k}({v[1]}次)" for k, v in errs.items())
                 extra = f"  ⚠️ 分片查询失败：{names}"
             print(f"[bot] 轮询心跳 #{polls}，游标={cursor}{extra}")
+            if h is not None:
+                # 定期分诊「是不是掉登录了」。CLAUDE.md 记着：微信会自己重启到
+                # 登录界面，表现和 fts 静默失效几乎一样，而恢复只能人工扫码——
+                # 所以必须主动探测并告警，不能等用户自己发现「bot 没反应」。
+                try:
+                    h.note_poll(cursor=cursor, errors=errs)
+                    if h.due_login_check():
+                        h.note_login(*_probe_login(client))
+                    h.write_status()
+                except Exception:
+                    traceback.print_exc()
         for m in msgs:
             yield m
         if not msgs:
@@ -829,6 +1254,21 @@ def main():
     base_cfg = load_config()
     cfg = settings.effective(base_cfg)
 
+    # 本进程的启动时刻。「重启补齐」判定靠它：**早于它**的消息只可能来自
+    # 落盘游标续上来的那批（正常运行时起点就是「最新」，不会造出更早的消息）。
+    _START_TS = time.time()
+
+    # 健康看护：只收「已经发生的事实」，自己绝不查库 —— 不碰 hook 并发那条铁律。
+    global _HEALTH
+    if health is not None:
+        try:
+            _HEALTH = health.Health(cfg, notify_fn=health.notify)
+        except Exception:
+            traceback.print_exc()
+            _HEALTH = None
+    else:
+        print("[bot] ⚠️ 没找到 health.py：健康看护 / 日志轮转 / 状态页都不可用。")
+
     llm = make_llm(cfg)
     history_file = cfg.get("history_file", "data/history.jsonl")
     if not os.path.isabs(history_file):
@@ -837,9 +1277,15 @@ def main():
 
     # 连接微信；后台自启时微信可能还没启动，两种后端都会重试等待（最多约 5 分钟）
     backend = cfg.get("backend", "wcferry")
-    poll_interval = cfg.get("poll_interval", 2)
+    # 默认值必须跟 config.yaml / CLAUDE.md 一致（5 秒）。以前这里写 2，而
+    # config.yaml 的注释明确写着「实测 2 秒间隔会把微信卡到 CPU 999 秒」——
+    # 配置里一漏这一行，代码就挑了个注释亲口反对的值。
+    poll_interval = cfg.get("poll_interval", 5)
     if backend == "aixed":
-        wcf = connect_aixed(cfg.get("aixed_base_url", "http://127.0.0.1:8080"))
+        # 兜底端口必须跟 config.yaml / CLAUDE.md / postman 一致（30001）。
+        # 这里以前写 8080：配置里一旦漏了 aixed_base_url，就会连错端口，
+        # 而报错文案却指向「微信没启动、version.dll 没加载」，排查方向全错。
+        wcf = connect_aixed(cfg.get("aixed_base_url", "http://127.0.0.1:30001"))
         if wcf is None:
             print("[bot] 连不上 aixed 服务。请确认微信已启动、version.dll 已加载、aixed_base_url 端口正确。")
             sys.exit(1)
@@ -891,6 +1337,33 @@ def main():
     watch_recs = watch.chats(cfg)
     # 审核模式把草稿往哪儿发：第一个控制会话（默认文件传输助手）
     control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
+    # 待确认项总是登记在**控制会话**上（工具层的 self.chat / 审核草稿都发这儿）。
+    # 控制会话可能不在 target_chats 里（例如一个都没配、默认文件传输助手），
+    # 所以落盘/恢复的会话集合要把两边并起来，否则那条队列永远存不下来。
+    pending_chats = sorted(set(targets) | {control_chat})
+
+    # 把盘上的待确认队列捡回来：不然重启之后用户照着刚才看到的提示回「确认」，
+    # 什么都不会发生（以前就是这样，白等一场）。
+    try:
+        n_back = restore_pending(pending_chats, cfg)
+        if n_back:
+            print(f"[bot] 从盘上恢复了 {n_back} 条待确认动作（还在时效内）")
+            try:
+                items = []
+                for c in pending_chats:
+                    items += agent_tools.list_pending(
+                        c, int((cfg.get("agent") or {}).get("confirm_ttl", 300)))
+                lines = [f"重启后还有 {n_back} 条待确认的动作（还在时效内）："]
+                for i, it in enumerate(items, 1):
+                    lines.append(f"{i}) {agent_tools.describe_pending(it)}")
+                lines.append("要执行/发送请回「确认 <编号>」，不要了回「不发」。")
+                send("\n".join(lines), control_chat)
+            except Exception:
+                traceback.print_exc()
+                send(f"重启后还有 {n_back} 条待确认的动作。回「确认」可执行第一条，"
+                     f"回「不发」全部取消。", control_chat)
+    except Exception:
+        traceback.print_exc()
 
     # 同一个会话不能既是控制会话又是自动回复对象，否则对方发来的消息会被当命令解析。
     # /auto add 时已经拦了，这里是兜底（比如用户手改了 config.yaml）。
@@ -900,8 +1373,41 @@ def main():
         auto_recs.pop(chat, None)
 
     def send(text, to):
-        wcf.send_text(text, to)
+        """发消息。**绝不抛异常**，返回是否真的发出去了。
+
+        以前这里是裸调用：hook 一抖、`send_text` 抛 AixedError，异常就顺着主循环
+        冒泡把整个进程带走（三条入口都是后台无窗口起的，没人会把它拉起来）。
+        收消息那条路本来有 try 兜着，命令 / 盯着 / 确认这几条没有——坏在一处就全下线。
+        现在统一在这里兜住，并且把失败**如实报出来**。
+
+        **故意不自动重试**：发消息不可逆，超时/HTTP 500 的情况下第一次到底发没发出去
+        无法确认，重试就可能给对方发两条。宁可如实说「没发出去」。
+        """
+        try:
+            wcf.send_text(text, to)
+        except Exception as e:
+            print(f"[bot] ⚠️ 发送失败（未重试）→ {to}：{e}")
+            h = _h()
+            if h is not None:
+                try:
+                    h.note_send_failure(e)
+                except Exception:
+                    pass
+            # 尽量让用户知道。这条用裸调用并吞异常：失败告警自己再失败不许绕成递归。
+            if to != control_chat:
+                try:
+                    wcf.send_text(f"⚠️ 有一条消息没能发出去（对象 {to}）：{e}", control_chat)
+                except Exception:
+                    pass
+            return False
         remember_sent(text)
+        h = _h()
+        if h is not None:
+            try:
+                h.note_sent()
+            except Exception:
+                pass
+        return True
 
     print(f"[bot] 后端：{backend}  |  监听中，控制会话：{targets}  |  只回目标：{reply_only}")
     if auto_recs:
@@ -911,6 +1417,28 @@ def main():
         print("[bot] 自动回复：未配置（在微信里发 /auto add <昵称> 添加）")
     print("[bot] 在微信里发 /help 查看可用的配置命令。Ctrl+C 退出。")
     print(f"[bot] {scheduler.summary_line(cfg)}  |  {watch.summary_line(cfg)}")
+
+    # 只读状态页（默认关闭，见 config.yaml 的 status 段）。
+    # **只渲染内存快照、绝不查库**，所以它不违反「hook 不支持并发」那条铁律。
+    # 只允许绑回环地址；status_page 自己会拒绝其它地址。
+    status_srv = None
+    _st_cfg = cfg.get("status") or {}
+    if status_page is not None and _st_cfg.get("enabled") is True:
+        def _status_snapshot():
+            h = _h()
+            return h.snapshot() if h is not None else {}
+
+        try:
+            status_srv = status_page.start(
+                host=str(_st_cfg.get("host") or "127.0.0.1"),
+                port=int(_st_cfg.get("port") or 39002),
+                snapshot_fn=_status_snapshot,
+                log=print,
+            )
+        except Exception:
+            traceback.print_exc()
+    elif status_page is None:
+        print("[bot] ⚠️ 没找到 status_page.py：只读状态页不可用。")
 
     def reload_cfg():
         """配置被改后重建主循环的状态。
@@ -952,10 +1480,14 @@ def main():
                                        static_history, live_ok)
             history = dialog_history(control_chat, cfg)
             if agent_enabled(cfg):
+                run_state = {}
                 answer, changed = run_agent(
                     llm, system, prompt, wcf, contacts, cfg, control_chat, self_wxid,
                     cfg_provider=lambda: settings.effective(base_cfg),
-                    history=history)
+                    history=history, state=run_state)
+                # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
+                # 本轮其实没登记时，同样要追一句真话（否则用户回「确认」白等）。
+                answer = with_shell_truth_note(answer, run_state.get("shell_queued", False))
             else:
                 answer = llm.chat(system, history + [{"role": "user", "content": prompt}])
                 changed = False
@@ -976,158 +1508,317 @@ def main():
         if fired:
             print(f"[bot] 定时任务已触发：{'、'.join(fired)}")
 
-    source = (iter_aixed_messages(wcf, poll_interval, tick=_Ticker(run_scheduled))
-              if backend == "aixed"
-              else iter_wcferry_messages(wcf, tick=_Ticker(run_scheduled)))
+    def make_source():
+        """建收消息的迭代器。
 
-    try:
-        while True:
-            msg = next(source)
+        它是生成器：内部一旦抛出异常，这个生成器就死了、再也取不到消息，
+        所以必须包成函数，好在它死掉之后重建一个——微信自己重启、hook 掉了都会遇上。
+        """
+        return (iter_aixed_messages(wcf, poll_interval, tick=_Ticker(run_scheduled),
+                                    cfg=cfg)
+                if backend == "aixed"
+                else iter_wcferry_messages(wcf, tick=_Ticker(run_scheduled)))
 
-            if getattr(msg, "type", 0) != 1:  # 1 = 文本
-                continue
+    # 「重启补齐」：只提示一次，别每条都发
+    _catchup_announced = False
+    _catchup_total = 0
 
-            sender = msg.roomid or msg.sender
-            in_targets = sender in targets
-            rec = auto_recs.get(sender) if auto_on else None
-            watched = watch_recs.get(sender) if watch_on else None
+    source = make_source()
 
-            if not in_targets and rec is None and watched is None and reply_only:
-                continue
-
-            query = (msg.content or "").strip()
-            if not query:
-                continue
-
-            if msg.from_self():
-                # 自己发的消息默认忽略（否则会回复自己）。
-                # 但「文件传输助手」这类自聊场景需要响应自己——
-                # 这时用 is_own_reply 排除掉刚发出去的回复，避免自己回自己无限循环。
-                own_reply = is_own_reply(query)
-                if own_reply:
-                    print(f"[bot] 跳过（这是自己刚发出的回复）: {query[:30]}")
-                    continue
-                if rec is not None:
-                    # 自动回复只回对方。少了这一条，我们自己刚发出去的那句回复
-                    # 会以 from_self 回来、被当成新问题再答一遍 —— 死循环。
-                    continue
-                if not respond_to_self:
-                    print(f"[bot] 跳过（自己发的消息，respond_to_self=false）: {query[:30]}")
-                    continue
-                print(f"[bot] 自聊模式，处理自己的消息: {query[:30]}")
-
-            # 盯着：他发消息就通知我，**一个字都不回他**。
-            # 和自动回复一样，这条路不解析命令——对方随口发个「/help」不该触发命令表。
-            if watched is not None and not msg.from_self():
-                send(watch.format_hit(watched, query), control_chat)
-                print(f"[bot] 盯着命中 {watched.get('name') or sender}: {query[:40]}")
-                continue
-
-            # 自动回复：代我回对方。这条路**不解析命令**——
-            # 对方随口发个「/help」不该触发助手的命令表。
-            if rec is not None:
-                min_gap = (cfg.get("auto_reply") or {}).get("min_gap", 6)
-                if auto_due(sender, min_gap):
-                    try:
-                        do_auto_reply(wcf, llm, cfg, sender, rec, contacts,
-                                      control_chat, send)
-                    except Exception:
-                        traceback.print_exc()  # 自动路径抛异常绝不能杀掉主循环
-                else:
-                    print(f"[bot] 自动回复跳过（冷却中）: {rec.get('name') or sender}")
-                continue
-
-            # 1) 命令优先
-            reply, changed = handle_command(query, wcf, cfg, live_ok, contacts)
-            if reply is not None:
-                send(reply, sender)
-                if changed:
-                    reload_cfg()
-                print(f"[bot] 命令回复: {reply[:60]}")
-                continue
-
-            # 1.5) 待确认的发送动作：用户回「确认」才真发
-            #      不再限定 agent_enabled：审核模式下的自动回复草稿也要走这里，
-            #      而 pop_pending 没内容时返回 None，本就不会误触发。
-            if is_confirm(query) or is_cancel(query):
-                ttl = int((cfg.get("agent") or {}).get("confirm_ttl", 300))
-                head = agent_tools.peek_pending(sender, ttl)
-                # 自动回复草稿是要发给**别人**的，只认明确的中文确认词，
-                # 免得在控制会话里随口一句「ok」就把草稿发出去。
-                if head and head.get("kind") == "auto" \
-                        and not is_strict_confirm(query) and not is_cancel(query):
-                    send("这条是自动回复草稿。要发请回「确认」，不发请回「不发」。", sender)
-                    continue
-                if is_cancel(query):
-                    n = agent_tools.discard_pending(sender)
-                    if n:
-                        send(f"已取消 {n} 条待确认的发送。", sender)
-                        continue
-                item = agent_tools.pop_pending(sender, ttl)
-                if item:
-                    agent_cfg = cfg.get("agent") or {}
-                    count = max(1, int(item.get("count") or 1))
-                    interval = max(0.0, float(agent_cfg.get("send_interval", 1.5)))
-                    # 连发是同步做的：中途轮询会暂停几秒（消息在库里排着，回来照收）。
-                    # 故意不开线程——并发碰 hook 会把微信搞崩。
-                    # 图片和转发只发一次，count/连发对它们没意义（见 send_pending）。
-                    n, err = agent_tools.send_pending(wcf, item, interval)
-                    is_text = not item.get("image") and not item.get("xml")
-                    if is_text:
-                        # 记一下，免得发给自己时又被当成新消息回一遍
-                        remember_sent(item["text"])
-                    what = "转发" if item.get("xml") else "图片"
-                    if err is not None:
-                        print(f"[bot] 确认发送失败（已发 {n}/{count}）: {err}")
-                        send(f"发给 {item['to_name']} 失败：{err}", sender)
-                    elif is_text:
-                        print(f"[bot] 确认发送 -> {item['to_name']}: {item['text'][:40]} ×{n}")
-                        send(f"已发送给 {item['to_name']}。" if n == 1
-                             else f"已给 {item['to_name']} 连发 {n} 条。", sender)
-                    else:
-                        print(f"[bot] 确认发送 -> {item['to_name']}: {what} ×{n}")
-                        send(f"已把 {n} 张{what}发给 {item['to_name']}。" if n > 1
-                             else f"已把{what}发给 {item['to_name']}。", sender)
-                    continue
-
-            # 2) 否则走 AI 问答（开了 agent 就带工具）
-            print(f"[bot] 收到 {sender}: {query}")
-            if llm is None:
-                send("还没设置 API Key。发 /api sk-ant-xxx 设置（或告诉我接本地模型）。", sender)
-                continue
-
-            try:
-                prompt = build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok)
-                history = dialog_history(sender, cfg)
-                if history:
-                    print(f"[bot] 带上 {len(history)} 条对话记忆")
-                if agent_enabled(cfg):
-                    # cfg_provider：工具要读「当前最新配置」而不是这一轮开始时的快照，
-                    # 否则连着改两次（比如加了人再开开关）第二次会基于旧快照覆盖前一次。
-                    answer, cfg_changed = run_agent(
-                        llm, system, prompt, wcf, contacts, cfg, sender, self_wxid,
-                        cfg_provider=lambda: settings.effective(base_cfg),
-                        history=history)
-                else:
-                    answer = llm.chat(system,
-                                      history + [{"role": "user", "content": prompt}])
-                    cfg_changed = False
-                send(answer, sender)
-                if cfg_changed:
-                    reload_cfg()
-                # 只记原始提问和最终答复。命令、审核确认那些路径在上面就 continue 了，
-                # 压根走不到这儿——它们是操作，不是对话。
-                dialog_append(sender, "user", query, cfg)
-                dialog_append(sender, "assistant", answer, cfg)
-                print(f"[bot] 已回复: {answer[:60]}...")
-            except Exception:
-                traceback.print_exc()
+    # 外层守护：**任何未预期的异常都不许让进程退出。**
+    # 这是后台无窗口进程（三条入口都会起它）：一旦退出就没人收消息、也没人把它拉起来，
+    # 用户只会觉得「bot 没反应」——正是 CLAUDE.md 里最怕的那种静默失效。
+    # 所以这里兜一层：把栈打出来、等 5 秒、接着跑。
+    while True:
+        try:
+            while True:
                 try:
-                    send("出错了，看终端日志。", sender)
+                    msg = next(source)
+                except StopIteration:
+                    print("[bot] ⚠️ 收消息通道结束了，重建一个（微信可能重启过）")
+                    time.sleep(5)
+                    source = make_source()
+                    continue
+
+                if getattr(msg, "type", 0) != 1:  # 1 = 文本
+                    continue
+
+                sender = msg.roomid or msg.sender
+                in_targets = sender in targets
+                rec = auto_recs.get(sender) if auto_on else None
+                watched = watch_recs.get(sender) if watch_on else None
+
+                if not in_targets and rec is None and watched is None and reply_only:
+                    continue
+
+                query = (msg.content or "").strip()
+                if not query:
+                    continue
+
+                # 「重启补齐」判定：比 stale_after 秒还旧、**且早于本进程启动**的消息，
+                # 只可能是从落盘游标续上来的那一批。按年龄判、不按「第几轮」判，
+                # 所以停机期间积压多少条都不会漏判、也不会把正常消息误判成补齐。
+                try:
+                    catchup_after = int((cfg.get("state") or {}).get("stale_after", 120))
+                except (TypeError, ValueError):
+                    catchup_after = 120
+                try:
+                    _msg_ts = float(getattr(msg, "create_time", 0) or 0)
+                except (TypeError, ValueError):
+                    _msg_ts = 0.0
+                # 上界：机器时钟被往前拨、或 DB 时间戳落在未来时，
+                # 「早于本进程启动」和「够旧」可能同时成立，把**新**消息误判成补齐 → 静默丢掉。
+                # 所以再要求它不在未来（留 5 分钟余量给时钟漂移）。
+                _now = time.time()
+                catchup = (bool(catchup_after) and _msg_ts > 0
+                           and _msg_ts <= _now + 300
+                           and _msg_ts < _START_TS
+                           and (_now - _msg_ts) > catchup_after)
+
+                if msg.from_self():
+                    # 自己发的消息默认忽略（否则会回复自己）。
+                    # 但「文件传输助手」这类自聊场景需要响应自己——
+                    # 这时用 is_own_reply 排除掉刚发出去的回复，避免自己回自己无限循环。
+                    own_reply = is_own_reply(query)
+                    if own_reply:
+                        print(f"[bot] 跳过（这是自己刚发出的回复）: {query[:30]}")
+                        continue
+                    if rec is not None:
+                        # 自动回复只回对方。少了这一条，我们自己刚发出去的那句回复
+                        # 会以 from_self 回来、被当成新问题再答一遍 —— 死循环。
+                        continue
+                    if not respond_to_self:
+                        print(f"[bot] 跳过（自己发的消息，respond_to_self=false）: {query[:30]}")
+                        continue
+                    print(f"[bot] 自聊模式，处理自己的消息: {query[:30]}")
+
+                # 盯着：他发消息就通知我，**一个字都不回他**。
+                # 和自动回复一样，这条路不解析命令——对方随口发个「/help」不该触发命令表。
+                if watched is not None and not msg.from_self():
+                    try:
+                        hit_text = watch.format_hit(watched, query)
+                    except Exception:
+                        # 渲染失败也必须把「他发消息了」告诉用户，别整条吞掉
+                        traceback.print_exc()
+                        hit_text = (f"【盯着】{watched.get('name') or sender} "
+                                    f"发了一条消息（内容渲染失败）")
+                    send(hit_text + ("（重启补齐）" if catchup else ""), control_chat)
+                    print(f"[bot] 盯着命中 {watched.get('name') or sender}: {query[:40]}")
+                    continue
+
+                # 补齐期的旧消息：除了上面「盯着」的通知，**一律不处理**。
+                # 自动回复尤其不能补——那是在替用户本人说话，几小时前的话现在代回
+                # 比漏掉更糟；命令和提问也不补（用户当时的意图早就过去了）。
+                if catchup:
+                    _catchup_total += 1
+                    if not _catchup_announced:
+                        _catchup_announced = True
+                        send("⚠️ 重启补齐：停机期间还有消息没处理。这些**只通知、"
+                             "不自动回复**（几小时前的话现在代你回，比漏掉更糟）。",
+                             control_chat)
+                    print(f"[bot] 补齐跳过（{int(time.time() - _msg_ts)} 秒前的消息）: "
+                          f"{query[:30]}")
+                    continue
+
+                # 自动回复：代我回对方。这条路**不解析命令**——
+                # 对方随口发个「/help」不该触发助手的命令表。
+                if rec is not None:
+                    min_gap = (cfg.get("auto_reply") or {}).get("min_gap", 6)
+                    if auto_due(sender, min_gap):
+                        try:
+                            do_auto_reply(wcf, llm, cfg, sender, rec, contacts,
+                                          control_chat, send)
+                        except Exception:
+                            traceback.print_exc()  # 自动路径抛异常绝不能杀掉主循环
+                        # 审核模式会在上面登记一条草稿 → 立刻落盘
+                        save_pending(pending_chats, cfg)
+                    else:
+                        print(f"[bot] 自动回复跳过（冷却中）: {rec.get('name') or sender}")
+                    continue
+
+                # 1) 命令优先
+                #    命令处理器会读盘（settings.effective(load_config())），config.yaml
+                #    写坏了会抛 YAML 错误——那属于「这一条消息没处理成功」，
+                #    不该让整个 bot 下线。
+                try:
+                    reply, changed = handle_command(query, wcf, cfg, live_ok, contacts)
+                except Exception as e:
+                    traceback.print_exc()
+                    send(f"这条命令没处理成功：{e}", sender)
+                    continue
+                if reply is not None:
+                    send(reply, sender)
+                    if changed:
+                        try:
+                            reload_cfg()
+                        except Exception as e:
+                            traceback.print_exc()
+                            send(f"命令生效了，但重新加载配置失败：{e}", sender)
+                    print(f"[bot] 命令回复: {reply[:60]}")
+                    continue
+
+                # 1.5) 待确认的动作：用户回「确认」才真发 / 真跑
+                #      不再限定 agent_enabled：审核模式下的自动回复草稿也要走这里。
+                pending_sel = pending_index_of(query)
+                if is_confirm(query) or is_cancel(query) or pending_sel is not None:
+                    ttl = int((cfg.get("agent") or {}).get("confirm_ttl", 300))
+                    item = None
+
+                    # 「不发」= 取消该会话全部待确认项
+                    if is_cancel(query):
+                        n = agent_tools.discard_pending(sender)
+                        if n:
+                            save_pending(pending_chats, cfg)      # 队列已变，立刻落盘
+                            send(f"已取消 {n} 条待确认的动作。", sender)
+                            continue
+
+                    pending = agent_tools.list_pending(sender, ttl)
+                    if not pending:
+                        # 没有待确认项：这句话不是给队列的，落到下面走普通问答
+                        pending_sel = None
+                    else:
+                        want = pending_sel if len(pending) > 1 else None
+                        if len(pending) > 1 and want is None:
+                            # **队列压着多条时绝不猜。** 以前只对队头判严格词、再 pop
+                            # 出同一个队头，于是「心里想确认 A、实际执行 B」是可达的
+                            # （项目自己的复核报告 R5-3 就是这个）。先让用户点编号。
+                            lines = [f"待确认的有 {len(pending)} 条，"
+                                     f"回「确认 <编号>」指明是哪一条："]
+                            for i, it in enumerate(pending, 1):
+                                lines.append(f"{i}) {agent_tools.describe_pending(it)}")
+                            send("\n".join(lines), sender)
+                            continue
+                        if want is not None and not (1 <= want <= len(pending)):
+                            send(f"只有 {len(pending)} 条待确认项，没有第 {want} 条。", sender)
+                            continue
+                        head = pending[0] if want is None else pending[want - 1]
+                        # 自动回复草稿是要发给**别人**的，只认明确的中文确认词，
+                        # 免得在控制会话里随口一句「ok」就把草稿发出去。
+                        if head.get("kind") == "auto" and not is_strict_confirm(query):
+                            send("这条是自动回复草稿。要发请回「确认」，不发请回「不发」。",
+                                 sender)
+                            continue
+                        # 本地执行比发消息更不可逆（发错了能解释，命令跑了就跑了），
+                        # 所以比 agent 发送**更严**：只有「确认/确定/确认发送」才算数，
+                        # 随口一句 ok / y / 发送 一律不算。判定方式和 kind="auto" 一致，
+                        # 但理由不同：那边是防手滑发错人，这边是防手滑在本机真跑一条命令。
+                        if head.get("kind") == "shell" and not is_strict_confirm(query):
+                            send(f"这条是本地命令，要真在电脑上跑它。确认请回「确认」"
+                                 f"（**不是**「ok」，本地执行只认「确认/确定/确认发送」），"
+                                 f"不跑请回「不发」。\n命令原文：{head.get('cmd') or ''}", sender)
+                            continue
+                        # 既没点号、也不是确认词（例如一句带数字的闲聊）：不当成确认
+                        if want is None and not is_confirm(query):
+                            pending_sel = None
+                        else:
+                            item = agent_tools.pop_pending(sender, ttl, index=want)
+                            # 队列已经变了就**立刻**落盘：否则「这条已经执行了」
+                            # 和「盘上还记着它」之间有窗口，崩溃重启会把它恢复出来。
+                            save_pending(pending_chats, cfg)
+                    if item and item.get("kind") == "shell":
+                        # 本地执行：用户回「确认」才真跑。shell 没有收件人——绝不走
+                        # send_pending、也绝不发给 item["to_wxid"]（它是空的），
+                        # 只把结果发回**发起确认的那个会话**（sender）。
+                        if not executor.enabled(cfg):
+                            # 登记之后用户把开关关了：如实说没跑，不偷偷执行
+                            send(f"本地执行已经关掉了（config.yaml 的 shell.enabled），"
+                                 f"这条命令**没有执行**。", sender)
+                            continue
+                        secs = (cfg.get("shell") or {}).get("timeout") or executor.DEFAULT_TIMEOUT
+                        send(f"好的，开始执行（超过 {secs} 秒就算超时）：\n"
+                             f"{item.get('cmd') or ''}", sender)
+                        send(shell_command_text(item, cfg), sender)
+                        continue
+                    if item:
+                        agent_cfg = cfg.get("agent") or {}
+                        count = max(1, int(item.get("count") or 1))
+                        interval = max(0.0, float(agent_cfg.get("send_interval", 1.5)))
+                        # 连发是同步做的：中途轮询会暂停几秒（消息在库里排着，回来照收）。
+                        # 故意不开线程——并发碰 hook 会把微信搞崩。
+                        # 图片和转发只发一次，count/连发对它们没意义（见 send_pending）。
+                        # 发送时**再校验一次**目录归属：登记时校验过，但登记之后
+                        # 用户可能改了配置、路径本身也可能是个软链——发出去就收不回。
+                        try:
+                            dirs_now = agent_tools.allowed_image_dirs(cfg)
+                        except Exception:
+                            traceback.print_exc()
+                            dirs_now = None
+                        n, err = agent_tools.send_pending(wcf, item, interval,
+                                                          allowed_dirs=dirs_now)
+                        is_text = not item.get("image") and not item.get("xml")
+                        if is_text:
+                            # 记一下，免得发给自己时又被当成新消息回一遍
+                            remember_sent(item["text"])
+                        what = "转发" if item.get("xml") else "图片"
+                        if err is not None:
+                            print(f"[bot] 确认发送失败（已发 {n}/{count}）: {err}")
+                            send(f"发给 {item['to_name']} 失败：{err}", sender)
+                        elif is_text:
+                            print(f"[bot] 确认发送 -> {item['to_name']}: {item['text'][:40]} ×{n}")
+                            send(f"已发送给 {item['to_name']}。" if n == 1
+                                 else f"已给 {item['to_name']} 连发 {n} 条。", sender)
+                        else:
+                            print(f"[bot] 确认发送 -> {item['to_name']}: {what} ×{n}")
+                            send(f"已把 {n} 张{what}发给 {item['to_name']}。" if n > 1
+                                 else f"已把{what}发给 {item['to_name']}。", sender)
+                        continue
+
+                # 2) 否则走 AI 问答（开了 agent 就带工具）
+                print(f"[bot] 收到 {sender}: {query}")
+                if llm is None:
+                    send("还没设置 API Key。发 /api sk-ant-xxx 设置（或告诉我接本地模型）。", sender)
+                    continue
+
+                try:
+                    prompt = build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok)
+                    history = dialog_history(sender, cfg)
+                    if history:
+                        print(f"[bot] 带上 {len(history)} 条对话记忆")
+                    if agent_enabled(cfg):
+                        # cfg_provider：工具要读「当前最新配置」而不是这一轮开始时的快照，
+                        # 否则连着改两次（比如加了人再开开关）第二次会基于旧快照覆盖前一次。
+                        run_state = {}
+                        answer, cfg_changed = run_agent(
+                            llm, system, prompt, wcf, contacts, cfg, sender, self_wxid,
+                            cfg_provider=lambda: settings.effective(base_cfg),
+                            history=history, state=run_state)
+                        # 确定性兜底：模型没调 run_command 却自己说「已提交/等你确认」时，
+                        # 固定追一句真话。**别删**——真机上就是这么骗到用户的。
+                        answer = with_shell_truth_note(
+                            answer, run_state.get("shell_queued", False))
+                    else:
+                        answer = llm.chat(system,
+                                          history + [{"role": "user", "content": prompt}])
+                        cfg_changed = False
+                    send(answer, sender)
+                    # 工具可能刚登记了待确认动作（发消息/发图/跑命令）→ 立刻落盘
+                    save_pending(pending_chats, cfg)
+                    if cfg_changed:
+                        reload_cfg()
+                    # 只记原始提问和最终答复。命令、审核确认那些路径在上面就 continue 了，
+                    # 压根走不到这儿——它们是操作，不是对话。
+                    dialog_append(sender, "user", query, cfg)
+                    dialog_append(sender, "assistant", answer, cfg)
+                    print(f"[bot] 已回复: {answer[:60]}...")
                 except Exception:
-                    pass
-    except KeyboardInterrupt:
-        print("\n[bot] 已退出。")
+                    traceback.print_exc()
+                    try:
+                        send("出错了，看终端日志。", sender)
+                    except Exception:
+                        pass
+        except KeyboardInterrupt:
+            print("\n[bot] 已退出。")
+            break
+        except Exception:
+            traceback.print_exc()
+            print("[bot] ⚠️ 主循环抛了一个未预期的异常：已记录，5 秒后继续（进程不退出）。")
+            time.sleep(5)
+
+    if status_page is not None and status_srv is not None:
+        try:
+            status_page.stop(status_srv)
+        except Exception:
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

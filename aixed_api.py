@@ -25,7 +25,10 @@ import time
 import urllib.error
 import urllib.request
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+# hook 的默认端口是 **30001**（config.yaml 的 aixed_base_url、CLAUDE.md、
+# docs/aixed-api.postman.json 三处都是它）。这里只是配置缺失时的兜底默认值，
+# 以前写成 8080，兜底生效时就会去连一个没人监听的端口，报「连不上」而不是真因。
+DEFAULT_BASE_URL = "http://127.0.0.1:30001"
 
 # 超过这个秒数的查询会被打上警告。
 # hook 是「内存扫描找数据库句柄」的实现，开始劣化时最直观的信号就是查询变慢，

@@ -6,7 +6,8 @@
   provider: "openai"     -> OpenAI 兼容的 /chat/completions 接口
                             DeepSeek、Ollama、各类中转都走这个
 
-API Key 从 config / 环境变量 ANTHROPIC_API_KEY（或 OPENAI_API_KEY）读取，显式传入优先。
+API Key 从 config / 环境变量读取，显式传入优先；**环境变量按 provider 各用各的**
+（anthropic → ANTHROPIC_API_KEY，openai → OPENAI_API_KEY，绝不互相回退，见 _KEY_ENV）。
 具体用哪家由 provider + base_url + model 三者决定，默认模型会跟着 provider 走。
 """
 import json
@@ -16,6 +17,39 @@ import urllib.request
 
 DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com"
 DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
+
+# 每个协议只认自己那把 key 对应的环境变量。
+# **绝不能互相回退**：provider=openai 时拿本机的 ANTHROPIC_API_KEY 去请求
+# OpenAI/DeepSeek，服务端只会回一个莫名的 401；而 Claude 桌面应用恰恰会给子进程
+# 注入 ANTHROPIC_* 环境变量（见 CLAUDE.md「编译期踩过的坑」），用户根本查不到原因。
+_KEY_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
+def _key_from_env(provider):
+    """按协议挑环境变量；不认识的自定义协议仍按 openai 兼容那套取。"""
+    name = _KEY_ENV.get(provider, "OPENAI_API_KEY")
+    return os.getenv(name)
+
+
+def _temperature_unsupported(e):
+    """这个异常是不是「服务端不认 temperature 参数」？
+
+    **判据必须严**：只有两种情形才算——
+      * `TypeError`：SDK 版本把 temperature 从 create() 签名里去掉了（本地参数就错了）；
+      * HTTP 400 且报错正文里**明确出现** temperature（服务端说这个参数不合法）。
+    原来的写法是「错误文本里含 temperature 就降级重发」，于是任何一条恰好带了
+    这个词的失败（400 无效字段、网关报错）都会把请求**再发一遍**——重复计费，
+    而且把真实错误吞掉了。其它异常一律往上抛。
+    """
+    if isinstance(e, TypeError):
+        return True
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+    return status == 400 and "temperature" in str(e).lower()
 
 
 class ChatLLM:
@@ -31,11 +65,13 @@ class ChatLLM:
         self.max_tokens = max_tokens
         self.temperature = temperature
 
-        api_key = api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+        api_key = api_key or _key_from_env(self.provider)
         if not api_key:
             raise RuntimeError(
-                "缺少 API Key。可在微信里发 /api <key> 设置，"
-                "或设环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY。"
+                f"缺少 API Key（当前协议 provider={self.provider}）。"
+                f"可在微信里发 /api <key> 设置，"
+                f"或设环境变量 {_KEY_ENV.get(self.provider, 'ANTHROPIC_API_KEY')}。"
+                f"（两种协议的 key 不通用，环境变量也不通用，别互相借。）"
             )
         # HTTP 头只能放 latin-1，key 里混进中文/全角字符会在发请求时才报
         # 「'latin-1' codec can't encode ...」这种看不懂的错，这里提前拦掉。
@@ -78,14 +114,58 @@ class ToolCall:
 
 
 class ChatResult:
-    __slots__ = ("text", "tool_calls")
+    """一次带工具调用的答复结果。
 
-    def __init__(self, text="", tool_calls=None):
+    `truncated` = 「这次答复被 max_tokens 截断了」，**只暴露事实，不在这里拼提示**：
+    要不要提醒用户、文案怎么写由上层（bot / auto_reply）决定。
+    半句话被当成完整答复、还被 auto_reply 再截一刀发出去，是用户能看见的错。
+    """
+
+    __slots__ = ("text", "tool_calls", "truncated")
+
+    def __init__(self, text="", tool_calls=None, truncated=False):
+        # truncated 带默认值、排在最后：ChatResult(text, calls) 这种位置调用继续可用
         self.text = text or ""
         self.tool_calls = list(tool_calls or [])
+        self.truncated = bool(truncated)
 
     def __repr__(self):
-        return f"ChatResult(text={self.text[:40]!r}, tool_calls={[c.name for c in self.tool_calls]})"
+        return (f"ChatResult(text={self.text[:40]!r}, "
+                f"tool_calls={[c.name for c in self.tool_calls]}, "
+                f"truncated={self.truncated})")
+
+
+def _record_usage(provider, model, pt, ct, kind="chat"):
+    """把这次调用的 token 用量记到本地账本（微信里的 `/用量` 就是读它）。
+
+    两条硬要求：
+      * **绝不许因为记账失败影响一次正常调用** —— `usage.record` 自己不会抛，
+        这里是第二道保险；
+      * 只记 provider/model/token 数，**不记请求内容、不记密钥**（落盘格式由 usage.py 管）。
+    """
+    try:
+        import usage
+        usage.record(provider, model, pt, ct, kind=kind)
+    except Exception as e:                                  # pragma: no cover
+        print(f"[llm] ⚠️ 用量没记上（不影响本次调用）：{e}", flush=True)
+
+
+def _rec_anthropic(model, resp, kind):
+    try:
+        import usage
+        pt, ct = usage.extract_anthropic_usage(resp)
+    except Exception:                                       # pragma: no cover
+        return
+    _record_usage("anthropic", model, pt, ct, kind)
+
+
+def _rec_openai(model, body, kind):
+    try:
+        import usage
+        pt, ct = usage.extract_openai_usage(body)
+    except Exception:                                       # pragma: no cover
+        return
+    _record_usage("openai", model, pt, ct, kind)
 
 
 
@@ -118,18 +198,20 @@ class _AnthropicImpl:
         )
         # 新版 anthropic SDK（实测 1.8.0）已把 temperature 从 create() 签名中去掉，
         # 只能通过 extra_body 透传；服务端不支持时降级为不带它重试一次。
+        # 判据见 _temperature_unsupported —— 只有「确实是这个参数不被支持」才重试，
+        # 别的一律抛（否则会重复计费，还把真实错误吞掉）。
         if self.temperature is not None:
             try:
                 resp = self.client.messages.create(
                     **kwargs, extra_body={"temperature": self.temperature}
                 )
+                _rec_anthropic(self.model, resp, "chat")
                 return _anthropic_text(resp)
-            except TypeError:
-                pass
             except Exception as e:
-                if "temperature" not in str(e).lower():
+                if not _temperature_unsupported(e):
                     raise
         resp = self.client.messages.create(**kwargs)
+        _rec_anthropic(self.model, resp, "chat")
         return _anthropic_text(resp)
 
     def chat_with_tools(self, system, messages, tools):
@@ -143,17 +225,17 @@ class _AnthropicImpl:
                     "input_schema": t.get("parameters") or {"type": "object", "properties": {}}}
                    for t in tools],
         )
+        resp = None
         if self.temperature is not None:
             try:
                 resp = self.client.messages.create(
                     **kwargs, extra_body={"temperature": self.temperature})
-            except TypeError:
-                resp = self.client.messages.create(**kwargs)
             except Exception as e:
-                if "temperature" not in str(e).lower():
+                # 与 chat() 分支保持对称：只有「temperature 不被支持」才降级重发一次，
+                # 其余异常直接抛给上层。
+                if not _temperature_unsupported(e):
                     raise
-                resp = self.client.messages.create(**kwargs)
-        else:
+        if resp is None:
             resp = self.client.messages.create(**kwargs)
 
         text, calls = "", []
@@ -164,7 +246,7 @@ class _AnthropicImpl:
             elif bt == "tool_use":
                 calls.append(ToolCall(getattr(b, "id", ""), getattr(b, "name", ""),
                                       getattr(b, "input", None)))
-        return ChatResult(text, calls)
+        return ChatResult(text, calls, truncated=_is_truncated(resp))
 
 
 def _anthropic_messages(messages):
@@ -193,6 +275,15 @@ def _anthropic_messages(messages):
 
 def _anthropic_text(resp) -> str:
     return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+def _is_truncated(resp) -> bool:
+    """这个响应是不是被 max_tokens 截断了（anthropic 侧）。
+
+    `stop_reason == "max_tokens"` 就是「没说完就被上限砍了」。
+    取不到这个字段时按「没截断」处理——不能因为 SDK 换了字段名就谎报截断。
+    """
+    return getattr(resp, "stop_reason", None) == "max_tokens"
 
 
 # ============================================================
@@ -244,6 +335,9 @@ class _OpenAICompat:
         except (urllib.error.URLError, OSError) as e:
             raise RuntimeError(f"连不上 {self.base_url}：{e}") from e
 
+        # 记账放在解析之前：body 已经拿到了，且**绝不许**让记账失败被下面那个
+        # except 当成「返回格式看不懂」误报。
+        _rec_openai(self.model, body, "chat")
         try:
             return body["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
@@ -269,7 +363,8 @@ class _OpenAICompat:
 
         body = self._post(payload)
         try:
-            msg = body["choices"][0]["message"]
+            choice = body["choices"][0]
+            msg = choice["message"]
         except (KeyError, IndexError, TypeError):
             raise RuntimeError(f"返回格式看不懂：{str(body)[:200]}")
 
@@ -284,7 +379,9 @@ class _OpenAICompat:
                 except json.JSONDecodeError:
                     args = {}
             calls.append(ToolCall(tc.get("id", ""), fn.get("name", ""), args))
-        return ChatResult(text, calls)
+        # finish_reason == "length" 即「撞到 max_tokens 上限」。只暴露事实，不拼文案。
+        _rec_openai(self.model, body, "tools")
+        return ChatResult(text, calls, truncated=(choice.get("finish_reason") == "length"))
 
     def _post(self, payload):
         req = urllib.request.Request(

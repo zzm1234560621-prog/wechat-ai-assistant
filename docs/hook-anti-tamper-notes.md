@@ -5,7 +5,8 @@
 记录时间 2026-09-30。对照的两份源码：
 
 - `installers/wechat-4.1.10.27/src-4.1.10.27/WeChat-Hook-4.1.10.27`（项目内，用户改过）
-- `C:\Users\zzm12\Downloads\WeChat-Hook-411027_.zip`（2026-06-24 版）
+- 作者发布包里解出来的那份（2026-06-24 版，**放在项目外的任意目录**；具体路径按各人本机情况，
+  本文不写死——想复现就自己解一份放在项目同级）
 
 两份全量 diff 后只有 4 处不同（README 链接、global.h 空行、`inline_weixin_dll_load.cpp`、
 新增 `other_version_fix.md` 与 `防止微信自动更新/`），**代码实质相同**。

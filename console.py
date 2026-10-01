@@ -11,15 +11,57 @@ import envsetup as env
 BASE = env.BASE
 
 
+def _ps_quote(s):
+    """把字符串变成 PowerShell 单引号字面量：内部的 ' 双写转义。
+
+    PowerShell 里单引号串中只有 ' 需要转义（写成 ''），
+    所以含空格/单引号/中文/反斜杠的路径都能安全放进去，不会被拆成多个参数或注入。
+    """
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def build_admin_command(script, args=None, python=None, base=None):
+    """构造控制台用来提权跑脚本的 PowerShell 命令行（纯函数，便于自测）。
+
+    坑（曾让菜单 [1] 降级必然失败）：以前写成
+        Start-Process -FilePath '...' -ArgumentList '' -WorkingDirectory '...' -Verb RunAs
+    `-ArgumentList` 空串会被 PowerShell 的参数校验直接拒掉
+    （Cannot validate argument on parameter 'ArgumentList'. The argument is null or empty）。
+    所以：**没有参数时整条 -ArgumentList 都不写**；
+    有参数时按 PowerShell 原生命令的参数规则逐个引用（含空格就整体加一层双引号）。
+    仍然只用 -Verb RunAs 提权，不换别的方式。
+    """
+    exe = python if python is not None else sys.executable
+    workdir = base if base is not None else BASE
+    argv = [str(script)] + [str(a) for a in (args or [])]
+    # PowerShell 把这条字符串交给原生程序（CreateProcess）时要走 CRT 的参数解析：
+    # 参数里含空格/制表符/双引号就必须整体包一层双引号，内部的双引号用 \" 表示。
+    quoted = []
+    for a in argv:
+        if a == "" or any(c in a for c in ' \t"'):
+            quoted.append('"' + a.replace('"', '\\"') + '"')
+        else:
+            quoted.append(a)
+    parts = [
+        "Start-Process",
+        "-FilePath", _ps_quote(exe),
+    ]
+    if quoted:
+        parts += ["-ArgumentList", _ps_quote(" ".join(quoted))]
+    parts += [
+        "-WorkingDirectory", _ps_quote(workdir),
+        "-Verb", "RunAs",
+    ]
+    return " ".join(parts)
+
+
 def run(script, args=None, admin=False):
     cmd = [script] + (args or [])
     if admin:
-        # 用系统 python 在新管理员窗口里跑（降级需要提权）
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command",
-             f"Start-Process -FilePath '{sys.executable}' "
-             f"-ArgumentList '{' '.join(cmd)}' "
-             f"-WorkingDirectory '{BASE}' -Verb RunAs"])
+        # 用系统 python 在新管理员窗口里跑（降级需要提权）。
+        # powershell 收到的是**一条完整命令字符串**，不是 argv 列表，所以不能用 list 形式。
+        subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                          build_admin_command(script, args)])
     else:
         subprocess.run([sys.executable] + cmd, cwd=BASE)
 
@@ -44,7 +86,18 @@ def auto():
     print(f"[自动] {msg}")
 
     if not wcfer:
-        print("\n[自动] 当前版本不能用，必须先降级到 3.9.x。")
+        if str(wver).startswith("4."):
+            # 4.x 是**主线**（微信 4.1.10.27 + aixed hook），跟 wcferry 没有关系。
+            # 以前这里会直接把 4.x 用户推向「降级到 3.9.x」——那是把主线用户带沟里，
+            # 而且降级会掉登录态、还要重新扫码。这里改成指路，不再劝降级。
+            print("\n[自动] 检测到的是微信 4.x。4.x 走的是 **aixed hook** 这条主线"
+                  "（version.dll 注入 + 本地 HTTP :30001），**不需要 wcferry，"
+                  "也不要降级到 3.9.x**。")
+            print("[自动] 请照 README 的「微信 4.x 主线」一节：先用"
+                  " installers/wechat-4.1.10.27/ 里的脚本装好 hook，再双击 启动助手.bat。")
+            return
+        print("\n[自动] 当前版本配不上 wcferry。要么降级到 3.9.x，要么改用 4.x 主线"
+              "（4.x 要装 aixed hook，见 README）。")
         ans = input("[自动] 现在启动降级程序吗？(y/n)：").strip().lower()
         if ans in ("y", "yes", "是"):
             run("downgrade.py", admin=True)
@@ -115,7 +168,7 @@ def menu():
             print("再见！")
             break
         else:
-            print("无效选择，请输入 0~7。")
+            print("无效选择，请输入 0~8。")
 
         input("\n按回车返回菜单 ...")
 

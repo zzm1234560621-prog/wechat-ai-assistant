@@ -13,14 +13,19 @@ import subprocess
 import sys
 import time
 
-from wechat_version import detect, match_wcferry
+from wechat_version import WX_TO_WCFER, detect, match_wcferry
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 INSTALLERS_DIR = os.path.join(BASE, "installers")
 
+
+# 版本对应关系**只有一份真源**：`wechat_version.WX_TO_WCFER`。
+# 这里以前手抄了一份，而且抄成了三位短号（39.5.2 / 39.4.4）——那在 PyPI 上根本不存在，
+# `pip install wcferry==39.4.4` 会直接 No matching distribution。
+# 以后加微信版本**只改 WX_TO_WCFER 那张表**，别再在这里抄第二份。
 TARGETS = {
-    "1": {"ver": "3.9.12.51", "wcferry": "39.5.2"},
-    "2": {"ver": "3.9.12.17", "wcferry": "39.4.4"},
+    "1": {"ver": "3.9.12.51", "wcferry": WX_TO_WCFER.get("3.9.12.51", "")},
+    "2": {"ver": "3.9.12.17", "wcferry": WX_TO_WCFER.get("3.9.12.17", "")},
 }
 
 

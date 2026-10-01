@@ -43,7 +43,7 @@ _USAGE = (
     "  /定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
     "  /定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
     "  /定时 删 <编号> —— 删掉\n"
-    "  /定时 开|关 <编号|all> —— 恢复 / 暂停\n"
+    "  /定时 开|关 —— 总开关（只有这两个子命令，不能带编号）\n"
     "时间写法：9:00 是每天，明天9:00 是只一次，"
     "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段。\n"
     "例：/定时 加 明天9:00 张三 记得带伞\n"
@@ -77,11 +77,39 @@ def _save(**changes):
 
 
 def _next_id(recs):
-    used = {str(r.get("id")) for r in recs}
-    i = 1
-    while f"t{i}" in used:
-        i += 1
-    return f"t{i}"
+    """挑一个没用过的编号。
+
+    为什么不用「第一个空位」（以前是 t1 空着就发 t1）：编号被删掉后**复用**的话，
+    「删第 2 个」这种说法就有歧义了——你刚看到的是 [t2]，删完再发命令，
+    那个 t2 已经是另一个任务了，很容易删错人、改错人。
+    所以从现有最大编号往后接着排，编号只增不复用。
+    """
+    used = []
+    for r in recs:
+        m = re.fullmatch(r"t(\d+)", str(r.get("id") or ""))
+        if m:
+            used.append(int(m.group(1)))
+    n = (max(used) + 1) if used else 1
+    # 还要躲开**本次运行里删掉过的**编号：删除和新增在同一个 tick 里发生时
+    # （定时任务动作里跑 agent 加/删任务），只看盘上现存的列表会以为 t2 空着，
+    # 于是新任务又叫 t2 —— 旧 t2 可能还挂在别处（比如本轮结算的合并表里），
+    # 编号一撞，「删 t2」就删错东西。记性只保留本次运行，不整份写盘。
+    while f"t{n}" in _RETIRED_IDS:
+        n += 1
+    return f"t{n}"
+
+
+# 本次运行里被删掉的编号（只为不复用，不落盘）。坏/极端情况下也不会无限涨。
+_RETIRED_IDS = []
+_RETIRED_MAX = 500
+
+
+def _retire_id(tid):
+    tid = str(tid or "")
+    if tid and tid not in _RETIRED_IDS:
+        _RETIRED_IDS.append(tid)
+        if len(_RETIRED_IDS) > _RETIRED_MAX:
+            del _RETIRED_IDS[0]
 
 
 # ---------------- 时间解析 ----------------
@@ -297,29 +325,51 @@ def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
     now_ts = now.timestamp()
     recs = tasks(cfg)
 
-    # 先排好「谁该触发、下次什么时候」，落盘，**再**执行动作。
-    # 顺序很要紧：动作里可能会跑一次 agent，而 agent 可能改配置（加/删定时任务），
-    # 那时候才写盘就会把我们手里这份旧列表盖回去。先写盘就没这问题。
+    def _warn(text):
+        """给用户报错。notify 自己炸了也不能拖垮这一轮。"""
+        if notify:
+            try:
+                notify(text)
+            except Exception as e:
+                print(f"[定时] ⚠️ 告警发不出去：{e}")
+
     fire = []
-    dirty = False
+    touched = {}
     for t in recs:
         if not t.get("enabled", True):
             continue
         nx = t.get("next_ts")
-        if nx is None or float(nx) > now_ts:
+        try:
+            if nx is None or float(nx) > now_ts:
+                continue
+        except (TypeError, ValueError):
+            # next_ts 是坏的（比如手工编辑 settings.json 写成了 "明天"）。
+            # 只跳过这一条——不能让它把整轮都带走（见下面的 _next_after）。
+            _bad_task(t, f"next_ts 不是数字（{nx!r}），这条没法算下次时间", _warn)
+            continue
+        try:
+            # 注意：**先算 next 再落字段**。_next_after 会解析 at / 日期，
+            # 数据坏掉时在这里抛异常——那时 last_ts/next_ts 还没被改，
+            # 这条任务就停在原地，等用户修好数据下次还能正常触发。
+            nxt = _next_after(t, now)
+        except Exception as e:
+            # **一条坏任务不许停摆整轮**。以前这里没兜住：_hhmm 抛 ValueError，
+            # 整轮一个任务都不排、不执行、不写盘，bot 只 print_exc，
+            # 用户那边毫无提示，而且 next_ts 永远留在过去，每 5 秒重犯一次。
+            _bad_task(t, f"时间数据有问题：{e}", _warn)
             continue
         t["last_ts"] = now_ts
-        nxt = _next_after(t, now)
         if nxt is None:
             # 一次性任务：跑完就停，但**不删**——留着让用户看得到
             t["next_ts"] = None
             t["enabled"] = False
         else:
             t["next_ts"] = nxt
+        # 记下「这一轮改了哪几条任务的什么字段」，执行完之后照这个合并回盘上。
+        touched[str(t.get("id"))] = {"next_ts": t["next_ts"],
+                                     "last_ts": t["last_ts"],
+                                     "enabled": t.get("enabled", True)}
         fire.append(t)
-        dirty = True
-    if dirty:
-        _save(tasks=recs)
 
     fired = []
     for t in fire:
@@ -329,13 +379,11 @@ def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
             act = t.get("action")
             if act == "ask":
                 if ask is None:
-                    if notify:
-                        notify(f"⏰ 定时任务 [{tid}] 到点了，但没法执行——"
-                               f"主循环没提供 ask 回调。")
+                    _warn(f"⏰ 定时任务 [{tid}] 到点了，但没法执行——"
+                          f"主循环没提供 ask 回调。")
                 else:
                     answer = ask(t.get("text") or "")
-                    if notify:
-                        notify(answer)
+                    _warn(answer)
             elif act == "call":
                 # 语音通话的发送路径还没打通（见记忆里的逆向记录）。
                 # 这里**必须报错**，不能悄悄改成发文本——那会骗用户。
@@ -343,18 +391,69 @@ def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
                     err = "语音通话的发送功能还没做出来（本机逆向没打通发送路径）"
                 else:
                     err = call(t.get("to"), name)
-                if err and notify:
-                    notify(f"⏰ 定时任务 [{tid}] 到点了：本来要给 {name} 打电话，"
-                           f"但没有执行——{err}")
+                if err:
+                    _warn(f"⏰ 定时任务 [{tid}] 到点了：本来要给 {name} 打电话，"
+                          f"但没有执行——{err}")
             else:
                 send_text(t.get("to"), t.get("text") or "")
-                if notify:
-                    notify(f"⏰ 定时任务 [{tid}]：已给 {name} 发出「{(t.get('text') or '')[:30]}」")
+                _warn(f"⏰ 定时任务 [{tid}]：已给 {name} 发出「{(t.get('text') or '')[:30]}」")
         except Exception as e:  # 一条任务炸了不能拖垮主循环
-            if notify:
-                notify(f"⏰ 定时任务 [{tid}] 执行失败：{e}")
+            _warn(f"⏰ 定时任务 [{tid}] 执行失败：{e}")
         fired.append(tid)
+
+    # **最后**才写盘，而且只把本轮真正改过的那几条任务的字段并回盘上。
+    #
+    # 为什么不能像以前那样 `_save(tasks=recs)`：recs 是 tick 一开始的快照，
+    # 而动作（ask 那条会跑一整轮 agent）中间可能加/删任务，那些改动已经落盘了。
+    # 拿旧列表整份盖回去 = 动作里新增的任务丢了、删掉的复活。现在以**盘上的
+    # 最新列表**为基准，只覆盖我们自己算出来的 next_ts/last_ts/enabled：
+    #   * 动作新增的任务：盘上有、我们没碰它的字段 → 原样保留（不丢）；
+    #   * 动作删掉的任务：盘上已经没有 → 我们根本不会把它写回去（不复活）；
+    #   * 本轮触发的任务：字段照着合并进去，不会在下一 tick 又触发一遍。
+    # 同时上面的改动是**就地改 recs**（cfg 里那份），主循环即使不 reload_cfg
+    # 也不会重复触发——这条和以前一致，别改成只写盘。
+    if touched:
+        _merge_save(touched)
     return fired
+
+
+# 坏任务告警节流：轮询间隔默认 5 秒，不节流的话同一条坏数据会每 5 秒刷一条。
+# 只在「距上次告警够久」或「错误内容变了」时再报——同一件事不重复刷屏，
+# 但用户修好之前也不会彻底静默（否则又是「静默失效」）。
+_BAD_WARN_GAP = 600.0
+_bad_warned = {}
+
+
+def _bad_task(t, reason, warn):
+    tid = str(t.get("id"))
+    now = time.time()
+    prev = _bad_warned.get(tid)
+    if prev and prev[0] == reason and now - prev[1] < _BAD_WARN_GAP:
+        return
+    try:
+        warn(f"⏰ 定时任务 [{tid}] 数据有问题，本轮**只跳过它自己**，"
+             f"其他任务照常：{reason}。发 /定时 删 {tid} 可删掉，或 /定时 看列表核对。")
+    except Exception:
+        # warn 不该抛，真抛了就算了：不能因为「报警失败」把调度搞停
+        pass
+    _bad_warned[tid] = (reason, now)
+
+
+def _merge_save(touched):
+    """把本轮改动合并进盘上的 tasks（见 run_due 末尾的说明）。"""
+    try:
+        base = settings.load().get("schedule")
+        on_disk = tasks({"schedule": base if isinstance(base, dict) else {}})
+    except Exception:
+        on_disk = []
+    if not on_disk:
+        # 盘上读不出来（或本来就是空的）就别猜，宁可少写一次也不能拿旧列表盖盘的。
+        return
+    for t in on_disk:
+        upd = touched.get(str(t.get("id")))
+        if upd:
+            t.update(upd)
+    _save(tasks=on_disk)
 
 
 # ---------------- 命令 / 工具 ----------------
@@ -406,7 +505,9 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
     if sub in ("off", "关", "关闭"):
         if not rest:
             _save(enabled=False, tasks=recs)
-            return "定时总开关已关闭，所有任务都不会触发。", True
+            return ("定时总开关已关闭，所有任务都不会触发。"
+                    "（再发 /定时 开 恢复时，每个任务会按各自时间**重新排下一次**，"
+                    "不会把暂停期间漏掉的补发出去。）"), True
         return f"已暂停：{_touched(_toggle(recs, rest, False) or recs, rest)}", True
 
     if sub in ("del", "delete", "删", "删除"):
@@ -416,6 +517,7 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         if len(keep) == len(recs):
             return f"没有编号 {rest} 的任务。发 /定时 看列表。", False
         _save(tasks=keep)
+        _retire_id(rest)      # 本次运行内不再把 rest 发给新任务（编号撞了就删错人）
         return f"已删除任务 {rest}。", True
 
     if sub in ("add", "加", "添加", "addcall", "加通话", "加电话", "加提问", "ask"):
@@ -470,9 +572,15 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         task.update(spec)
         task["next_ts"] = initial_next(task)
         recs.append(task)
-        _save(tasks=recs, enabled=True)
+        # **绝不在这里写 enabled=True**：总开关是用户自己的意图，加一个任务不该
+        # 顺手把它打开。以前硬写 True，而下面文案又说「总开关是关着的」——
+        # 落盘和文案自相矛盾：用户以为「加了不生效」，实际上总开关已被打开，
+        # 下一次 tick 所有**本来就该跑**的任务会一起触发（含群发）。
+        # 这里只写 tasks，总开关保持磁盘上的原状；文案也就跟着变成真话。
+        _save(tasks=recs)
         tail_msg = ("" if enabled(cfg) else
-                    "\n（定时总开关是关着的，发 /定时 开 才会生效）")
+                    "\n（定时总开关是关着的，这次只登记了任务，不会触发；"
+                    "发 /定时 开 才会生效）")
         warn = ("\n\n⚠️ 语音通话的发送路径还没打通，到点只会给你报错，不会真打出去。"
                 if want_call else "")
         return (f"已加定时任务 [{task['id']}]：{describe(task)}\n"
@@ -482,17 +590,26 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
 
 
 def _toggle(recs, which, on):
+    def _rearm(t):
+        """恢复一个任务时，重算一个**将来**的触发点。
+
+        为什么要重算：暂停期间 next_ts 一直留在过去，恢复时若原样留着，
+        下一次 tick（5 秒内）就会按那个过期时间**补跑一次**——用户只是「开回来」，
+        却收到一条本该在暂停期间发的消息，群里就是一次没人想要的群发。
+        """
+        nx = t.get("next_ts")
+        if on and (nx is None or float(nx) <= datetime.now().timestamp()):
+            t["next_ts"] = initial_next(t)
+
     if not which or which.lower() == "all":
         for t in recs:
             t["enabled"] = on
-            if on and t.get("next_ts") is None:
-                t["next_ts"] = initial_next(t)
+            _rearm(t)
         return recs
     for t in recs:
         if str(t.get("id")) == which:
             t["enabled"] = on
-            if on and t.get("next_ts") is None:
-                t["next_ts"] = initial_next(t)
+            _rearm(t)
     return recs
 
 

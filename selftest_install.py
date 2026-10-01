@@ -1,0 +1,446 @@
+"""安装/环境链路的回归自测：依赖清单单一真源、控制台提权命令、版本探测、绕过更新。
+
+跑：.venv/Scripts/python.exe selftest_install.py
+
+不联网、不真的安装、不碰 30001、不改任何注册表、不执行降级。
+覆盖的是 2026 年那次外部审计报出来的 4 个必修项：
+
+  T1 官方安装路径装不全依赖（requirements.txt 里的 pypdf 从来没被装过）
+  T2 console.py 管理员分支必然参数绑定失败（-ArgumentList '' 是空串）
+  T3 bypass_update.py 对微信 4.x 静默无效（缺 xwechat 路径、找不到还退出码 0）
+  T4 wechat_version.py 把路径拼进 PowerShell 单引号串（含 ' 就坏 / 可注入）
+
+风格照抄 selftest_aixed.py / selftest_executor_chain.py：ok/FAIL + 结尾汇总 + 失败 sys.exit(1)。
+"""
+import importlib.util
+import io
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from contextlib import redirect_stdout
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import bypass_update
+import console
+import envsetup as env
+import wechat_version as wv
+
+_FAIL = []
+REQ = os.path.join(HERE, "requirements.txt")
+
+
+def chk(cond, msg):
+    print(("  ok  " if cond else "  FAIL") + "  " + msg)
+    if not cond:
+        _FAIL.append(msg)
+
+
+def grab(fn, *a, **kw):
+    """跑一个函数并捕获它的 stdout（用来断言「明确报错」而不是静默）。"""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ret = fn(*a, **kw)
+    return ret, buf.getvalue()
+
+
+def load_installer():
+    """加载 installer.py。
+
+    installer.py 里 `import envsetup as env` 指的是**顶层 envsetup.py**，
+    所以先把它塞进 sys.modules，installer 就不会再去解析（也就不会真去建 venv）。
+    """
+    sys.modules.setdefault("envsetup", env)
+    spec = importlib.util.spec_from_file_location("installer_under_test",
+                                                 os.path.join(HERE, "installer.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ── 从需求串里拆出原生 argv（只用于断言，不是产品代码） ──────────────
+def split_args(s):
+    out, cur, in_q = [], [], False
+    for ch in s:
+        if ch == '"':
+            in_q = not in_q
+            cur.append(ch)
+        elif ch == " " and not in_q:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return [a[1:-1].replace('\\"', '"') if a.startswith('"') and a.endswith('"') else a
+            for a in out]
+
+
+def cmd_to_native(cmd):
+    """从 build_admin_command 生成的命令行里反解出 -FilePath / -ArgumentList。"""
+    spans = [(m.start(), m.end(), m.group(1))
+             for m in re.finditer(r"'((?:[^']|'')*)'", cmd)]
+    tokens = []
+    i = 0
+    while i < len(cmd):
+        if cmd[i] == "'":
+            for s, e, val in spans:
+                if s == i:
+                    tokens.append(val.replace("''", "'"))
+                    i = e
+                    break
+            else:
+                tokens.append("'")
+                i += 1
+        elif cmd[i] == " ":
+            i += 1
+        else:
+            j = i
+            while j < len(cmd) and cmd[j] not in " '":
+                j += 1
+            tokens.append(cmd[i:j])
+            i = j
+    fpath = argv = workdir = None
+    verb = False
+    for k, t in enumerate(tokens):
+        if t == "-FilePath" and k + 1 < len(tokens):
+            fpath = tokens[k + 1]
+        elif t == "-ArgumentList" and k + 1 < len(tokens):
+            argv = split_args(tokens[k + 1])
+        elif t == "-WorkingDirectory" and k + 1 < len(tokens):
+            workdir = tokens[k + 1]
+        elif t == "-Verb" and k + 1 < len(tokens):
+            verb = tokens[k + 1] == "RunAs"
+    return fpath, argv, workdir, verb
+
+
+def main():
+    print("=" * 60)
+    print("安装 / 环境链路自测（不联网、不安装、不碰微信、不改注册表）")
+    print("=" * 60)
+
+    # ── T1 依赖清单单一真源 ────────────────────────────────────────────
+    print("\n1) T1 依赖清单以 requirements.txt 为唯一真源")
+    specs_file = env.requirements_specs()          # 默认读的就是 requirements.txt
+    direct = env.requirements_specs(REQ)
+    names_file = [env.requirement_name(s) for s in specs_file]
+    lower = [n.lower() for n in names_file]
+    chk(specs_file == direct, "requirements_specs() 默认读的就是项目根 requirements.txt")
+    chk("pypdf" in lower, "requirements.txt 里有 pypdf（读收到的 PDF 要用）")
+    chk("wcferry" in lower, "requirements.txt 里有 wcferry")
+    chk(all(s and not s.startswith("#") for s in specs_file),
+        f"注释/空行都被过滤掉（解析出 {len(specs_file)} 条：{names_file}）")
+    chk("yaml" in env.REQUIRED_PKGS, "REQUIRED_PKGS 含 yaml（PyYAML 的导入名）")
+    chk("pypdf" in env.REQUIRED_PKGS, "★ REQUIRED_PKGS 含 pypdf（审计报的漏项）")
+    chk("wcferry" in env.REQUIRED_PKGS, "REQUIRED_PKGS 仍含 wcferry（wcferry 后端要它）")
+    chk(set(env.REQUIRED_PKGS) == set(env.required_import_names()),
+        "REQUIRED_PKGS 等于「从 requirements.txt 派生」的结果（不是手写名单）")
+    chk(env.required_import_names(REQ) == list(env.REQUIRED_PKGS),
+        "★ 直接解析 requirements.txt 的结果与 REQUIRED_PKGS 完全一致（单一真源的硬证据）")
+    chk("PyYAML" not in env.REQUIRED_PKGS and "yaml" in env.REQUIRED_PKGS,
+        "PyYAML 映射成 import 名 yaml（find_spec 查的是 yaml）")
+
+    # requirements.txt 里的 wcferry 说明要讲清「只有 3.9.x 后端才需要」
+    raw = open(REQ, "r", encoding="utf-8").read()
+    chk("只有走 wcferry 后端" in raw and "aixed" in raw,
+        "requirements.txt 的 wcferry 注释说清「只有 wcferry(3.9.x) 后端才需要，主线 4.x+aixed 不需要」")
+    chk("3.9.12.51" in raw and "39.5.2" in raw and "39.4.4" in raw,
+        "requirements.txt 写明 wcferry 与微信版本的对应表（和 wechat_version.py 对齐）")
+
+    # 空清单不许静默通过
+    empty = os.path.join(tempfile.gettempdir(), "_selftest_empty_reqs.txt")
+    open(empty, "w", encoding="utf-8").write("# 只有注释\n\n")
+    chk(env.requirements_specs(empty) == [], "全是注释的清单解析成空列表（不报错、不臆造）")
+
+    # wcferry 只在 wcferry 后端必需：否则「wcferry 装不上」会把 4.x 主线整个卡住
+    print("\n1b) wcferry 只在 wcferry 后端必需")
+    aixed_pkgs = env.required_pkgs("aixed")
+    wcf_pkgs = env.required_pkgs("wcferry")
+    chk("wcferry" not in aixed_pkgs, "★ aixed 主线下 wcferry 不算必需（装不上也不挡启动）")
+    chk("pypdf" in aixed_pkgs and "yaml" in aixed_pkgs and "anthropic" in aixed_pkgs,
+        f"aixed 主线仍然必需 anthropic / yaml / pypdf：{aixed_pkgs}")
+    chk(set(wcf_pkgs) == set(env.REQUIRED_PKGS), "wcferry 后端下必需集合 = REQUIREMENTS 全量")
+    chk(set(aixed_pkgs) <= set(env.REQUIRED_PKGS), "过滤只做减法：不会凭空多出包里没有的依赖")
+    chk(env.backend_from_config() in ("aixed", "wcferry"),
+        f"能从 config.yaml 读出 backend：{env.backend_from_config()}")
+
+    # ── T1b installer 的依赖清单 ──────────────────────────────────────
+    print("\n2) T1b installer.py 读 requirements.txt 来装（不执行安装）")
+    inst = load_installer()
+    wcfer = "39.5.2"
+    pip_specs = inst.build_pip_specs(wcfer)
+    pip_names = [env.requirement_name(s) for s in pip_specs]
+    chk(len(pip_specs) == len(specs_file),
+        f"装的需求条目数与 requirements.txt 相同（{len(pip_specs)} 条）")
+    chk(set(pip_names) == set(names_file), "包集合与 requirements.txt 完全一致（没漏 pypdf、没多塞）")
+    chk(f"wcferry=={wcfer}" in pip_specs, f"wcferry 版本被覆盖成 =={wcfer}（保持原逻辑）")
+    chk(all(s == p for s, p in zip(pip_specs, specs_file) if "wcferry" not in s.lower()),
+        "除 wcferry 外，其余需求串一字不动地来自 requirements.txt")
+    chk("pypdf>=4.0" in pip_specs, "★ 安装清单里有 pypdf>=4.0")
+
+    # requirements.txt 被清空时必须明确报错，不许静默装个空单
+    real_req = env.REQUIREMENTS_TXT
+    try:
+        env.REQUIREMENTS_TXT = empty
+        err = ""
+        try:
+            inst.build_pip_specs(wcfer)
+        except RuntimeError as e:
+            err = str(e)
+        chk("安装无法继续" in err, "requirements.txt 空/坏时 build_pip_specs 明确报错（不静默）")
+    finally:
+        env.REQUIREMENTS_TXT = real_req
+
+    # ── T1c 启动助手.bat 模板 ────────────────────────────────────────
+    print("\n3) T1c installer 生成的 启动助手.bat 自检清单含全部依赖")
+    text = inst.launcher_text()
+    chk("{pkg_repr}" not in text, "模板占位符已被替换")
+    chk("'pypdf'" in text, "★ 启动脚本的自检清单里有 pypdf（漏了就会「缺依赖还照跑」）")
+    # ⚠️ 自检清单必须**按当前后端过滤**：4.x 主线故意不装 wcferry，清单里若还写着它，
+    # 自检永远失败 → 每次启动都去装依赖 → 永远进不了 bot。
+    _backend = env.backend_from_config() or "aixed"
+    for m in env.required_pkgs(_backend):
+        chk(f"'{m}'" in text, f"启动脚本自检清单含 {m}（后端 {_backend} 下必需的）")
+    chk(("'wcferry'" in text) == (_backend == "wcferry"),
+        f"★ 自检清单里的 wcferry 与后端匹配（当前后端 {_backend}）："
+        f"4.x 主线**必须不含** wcferry，否则全新机器「装完还是起不来」")
+    chk("bot.py" in text and "install.bat" in text, "启动脚本仍然是「缺依赖自动装 + 起 bot」")
+    real = open(os.path.join(HERE, "启动助手.bat"), "r", encoding="utf-8").read()
+    chk([l.rstrip("\r") for l in real.splitlines()] ==
+        [l.rstrip("\r") for l in text.splitlines()],
+        "★ 仓库里现成的 启动助手.bat 与模板渲染结果逐行一致（未漂移）")
+    chk(real == text, "两份内容连行尾也一致（模板 newline='\\r\\n'）")
+
+    # install.bat 里不应有第二份依赖清单（它只负责挑解释器然后交给 installer.py）
+    bat = open(os.path.join(HERE, "install.bat"), "r", encoding="utf-8").read()
+    chk("installer.py" in bat and "py -%%V" in bat,
+        "install.bat 只负责挑解释器 → 转给 installer.py")
+    chk(not re.search(r"pip install", bat) and not re.search(r"^(anthropic|PyYAML|setuptools|pypdf)",
+                                                             bat, re.M),
+        "★ install.bat 里没有第二份依赖清单（没有 pip install、没有包名行）")
+
+    # ── T2 console.py 提权命令 ────────────────────────────────────────
+    print("\n4) T2 console.py 管理员分支的命令拼接")
+    line = console.build_admin_command("downgrade.py", None)
+    chk("-ArgumentList" not in line or "-ArgumentList ''" not in line,
+        "★ 无参数时不再出现 `-ArgumentList ''`（原来 PowerShell 直接拒收）")
+    chk("-Verb RunAs" in line, "仍然只用 -Verb RunAs 提权（没换别的方式）")
+    fp, argv, wd, verb = cmd_to_native(line)
+    chk(fp == sys.executable, f"-FilePath 是本解释器：{fp}")
+    chk(argv == ["downgrade.py"], f"无参数时 ArgumentList 就是脚本名：{argv}")
+    chk(wd == HERE, f"-WorkingDirectory 是项目根：{wd}")
+    chk(verb, "-Verb 解析出来是 RunAs")
+
+    line2 = console.build_admin_command("autostart.py", ["on"])
+    _, argv2, _, _ = cmd_to_native(line2)
+    chk(argv2 == ["autostart.py", "on"], f"带参数时逐个传：{argv2}")
+
+    pretty = r"C:\Program Files\a b\downgrade.py"
+    line3 = console.build_admin_command(pretty, ["a b", "it's"])
+    chk("''" in line3, "参数里的单引号被 PowerShell 单引号串规则转义成 ''")
+    fp3, argv3, _, _ = cmd_to_native(line3)
+    chk(fp3 == sys.executable,
+        "脚本路径不是 -FilePath（-FilePath 永远是解释器，脚本是第一个参数）")
+    chk(argv3 == [pretty, "a b", "it's"],
+        f"★ ArgumentList 里含空格的脚本路径与含单引号的参数都还是独立一项：{argv3}")
+
+    # 脚本路径里带单引号：'' 转义要能原样还原
+    quote_path = r"C:\Program Files\a b\it's\downgrade.py"
+    _, argv_q, _, _ = cmd_to_native(console.build_admin_command(quote_path, []))
+    chk(argv_q == [quote_path], f"脚本路径含单引号也能原样还原：{argv_q}")
+
+    # 真让 PowerShell 解析（只解析不执行；不碰降级、不提权）
+    env2 = dict(os.environ)
+    env2["WX_SELFTEST_CMD"] = line
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "[void][scriptblock]::Create($env:WX_SELFTEST_CMD); Write-Output PARSE_OK"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env2, timeout=60)
+    chk(r.returncode == 0 and "PARSE_OK" in (r.stdout or ""),
+        f"★ PowerShell 能解析这条命令（rc={r.returncode}）")
+
+    # 空参数这条是审计实测的复现点：确认「空 ArgumentList」确实会被 PowerShell 拒掉
+    bad = "Start-Process -FilePath 'cmd.exe' -ArgumentList '' -Verb RunAs"
+    env3 = dict(os.environ)
+    env3["WX_SELFTEST_CMD"] = bad
+    r_bad = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "$ErrorActionPreference='Stop'; try { [void][scriptblock]::Create($env:WX_SELFTEST_CMD);"
+         " Write-Output PARSE_OK } catch { Write-Output ('PARSE_FAIL: ' + $_.Exception.Message) }"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env3, timeout=60)
+    chk("PARSE_FAIL" not in (r_bad.stdout or ""),
+        "语法层面 `-ArgumentList ''` 能通过（所以必须靠参数校验，见下条）")
+
+    # 等价绑定验证：-FilePath 换成无害的自写「脚本」，只看 Start-Process 的参数校验过不过、
+    # 以及参数到底有没有原样送到子进程（不含 RunAs，不提权，不执行任何真流程）。
+    cmdexe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    work = tempfile.mkdtemp(prefix="wx selftest console ")   # 名字故意带空格
+    try:
+        safe = console.build_admin_command("/c", ["exit", "0"], python=cmdexe, base=work)
+        r2 = subprocess.run(["powershell", "-NoProfile", "-Command", safe],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+        err = r2.stderr or ""
+        chk("ParameterBindingException" not in err and "Cannot validate argument" not in err,
+            f"★ 等价验证（cmd.exe /c exit 0，无害）参数绑定通过：rc={r2.returncode}")
+        r3 = subprocess.run(["powershell", "-NoProfile", "-Command", bad],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+        chk("ArgumentList" in (r3.stderr or ""),
+            "对照组：旧写法 `-ArgumentList ''` 确实被 PowerShell 报 ArgumentList 错（复现审计结论）")
+
+        # 参数送达验证：worker 把收到的 argv 写成 JSON，Start-Process 是异步的所以轮询等它
+        worker = os.path.join(work, "argv_worker.py")
+        with open(worker, "w", encoding="utf-8") as f:
+            f.write("import json,sys\n"
+                    "open(sys.argv[1],'w',encoding='utf-8').write(json.dumps(sys.argv[2:]))\n")
+        for label, extra in (("普通参数", ["one", "two"]),
+                             ("带空格与单引号的参数", ["a b", "it's"])):
+            out_json = os.path.join(work, "argv.json")
+            if os.path.exists(out_json):
+                os.remove(out_json)
+            line_ok = console.build_admin_command(worker, [out_json] + extra,
+                                                 python=sys.executable, base=work)
+            subprocess.run(["powershell", "-NoProfile", "-Command", line_ok],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+            got = None
+            for _ in range(100):                      # 最多等 ~20 秒
+                if os.path.exists(out_json):
+                    try:
+                        import json
+                        got = json.load(open(out_json, encoding="utf-8"))
+                        break
+                    except ValueError:
+                        pass
+                import time
+                time.sleep(0.2)
+            chk(got == extra, f"★ 参数原样送达子进程（{label}）：{got}")
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+    # ── T3 bypass_update ──────────────────────────────────────────────
+    print("\n5) T3 bypass_update.py：4.x 路径 / 非零退出码 / 只对当前用户")
+    cands = bypass_update.candidate_paths()
+    chk(any("xwechat" in p for p in cands), "★ 候选路径含 Tencent\\xwechat\\Weixin.exe（微信 4.x 实际路径）")
+    chk(any(p.endswith(r"Tencent\Weixin\Weixin.exe") for p in cands), "候选路径也含 Tencent\\Weixin\\Weixin.exe")
+    chk(any(p.endswith(r"Tencent\WeChat\WeChat.exe") for p in cands), "3.9.x 的 WeChat.exe 路径保留")
+    chk(len(cands) == len(set(cands)), "候选路径无重复")
+
+    real_paths = bypass_update.COMMON_PATHS
+    fake = os.path.join(tempfile.gettempdir(), "wx-selftest-no-such-dir") + r"\nope.exe"
+    try:
+        bypass_update.COMMON_PATHS = [fake]
+        ret, out = grab(bypass_update.find_wechat, [fake], False)
+        chk(ret is None, "★ find_wechat() 找不到时不抛异常、返回 None（不看 PATH、没副作用）")
+        chk(out == "", "find_wechat() 自己不打印（打印交给调用方，便于复用）")
+        chk(len(bypass_update.candidate_paths()) > 1,
+            "candidate_paths() 还会从 ProgramFiles 环境变量补充候选（不只是硬编码表）")
+        chk(bypass_update.find_wechat([fake], False) is None
+            and bypass_update.find_wechat([__file__], False) == __file__,
+            "find_wechat(路径表) 是真的按「文件在不在」判断")
+
+        for fn, label in ((bypass_update.on, "on"), (bypass_update.off, "off"),
+                          (bypass_update.status, "status")):
+            ret2, out2 = grab(fn, [fake], False)
+            chk(ret2 is False and "未找到微信主程序" in out2,
+                f"{label}() 找不到微信时明确报错并返回 False（不是静默成功）")
+            chk("AppCompatFlags" in out2 and "新建字符串值" in out2,
+                f"{label}() 的提示里给了可操作建议（手改注册表的位置）")
+
+        argv_backup = sys.argv
+        find_backup = bypass_update.find_wechat
+        try:
+            # main() 不接受注入参数，这里直接把探测函数换掉（等价于这台机器上没装微信）
+            bypass_update.find_wechat = lambda *a, **k: None
+            sys.argv = ["bypass_update.py", "on"]
+            code, out3 = grab(bypass_update.main)
+            chk(code == 1, "★ main() 在找不到微信时返回退出码 1（原来恒为 0）")
+            chk("退出码 1" in out3, "main() 明说了退出码 1")
+            sys.argv = ["bypass_update.py", "status"]
+            code_s, out_s = grab(bypass_update.main)
+            chk(code_s == 1 and "退出码 1" in out_s,
+                "status 在找不到微信时也不是「假装成功」")
+            sys.argv = ["bypass_update.py", "在看吗"]
+            code2, out4 = grab(bypass_update.main)
+            chk(code2 == 1 and "未知参数" in out4, "未知参数也明确报错 + 退出码 1")
+        finally:
+            bypass_update.find_wechat = find_backup
+            sys.argv = argv_backup
+    finally:
+        bypass_update.COMMON_PATHS = real_paths
+
+    src = open(os.path.join(HERE, "bypass_update.py"), "r", encoding="utf-8").read()
+    chk("HKEY_LOCAL_MACHINE" in src and "不动 HKEY_LOCAL_MACHINE" in src,
+        "注释里写明只写 HKCU、不动 HKLM")
+    chk("只对当前用户生效" in src, "输出/注释里说清「只对当前用户生效」")
+
+    # ── T4 wechat_version 取文件版本 ──────────────────────────────────
+    print("\n6) T4 wechat_version.py：不拼字符串、路径含空格/单引号都能用")
+    p_plain = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
+    p_quote = r"C:\Program Files\Wei'xin\Weixin.exe"
+    p_cn = "C:\\程序 文件\\微信 目录\\Weixin.exe"
+    argv_p = wv._file_version_cmd(p_plain)
+    chk(argv_p[0] == "powershell" and argv_p[1] == "-NoProfile", "用的是 powershell")
+    chk("-EncodedCommand" in argv_p, "脚本走 -EncodedCommand（命令行里看不到路径、无法被解析坏）")
+    chk(argv_p[-1] == wv._PS_ENC_CMD, "路径不在命令行里，最后一个参数就是编码后的脚本")
+    chk(all(p_plain not in a and p_quote not in a and p_cn not in a for a in argv_p),
+        "★ argv 里任何一项都不含路径原文（不做字符串拼接）")
+    for a in argv_p:
+        chk(a.isascii(), f"argv 项全是 ASCII，cmd 解析不会碰多字节字符：{a[:24]}…")
+    chk(wv._file_version_cmd(p_plain) == wv._file_version_cmd(p_quote) == wv._file_version_cmd(p_cn),
+        "三个不同路径构造出的 argv 完全一样（路径根本不进命令行）")
+    chk("LiteralPath" in wv._PS_SCRIPT and "$env:" in wv._PS_SCRIPT,
+        "脚本用 Get-Item -LiteralPath $env:WX_VER_PATH（-LiteralPath 不做通配符展开）")
+
+    # 不存在 -> 返回 None 且打印原因
+    ret, out = grab(wv._file_version, r"C:\这个目录不存在\nope.exe")
+    chk(ret is None, "不存在的路径返回 None（返回语义不变）")
+    chk("文件不存在" in out, "★ 并且打印了明确原因（不是静默 None）")
+
+    # 存在但 powershell 失败 -> 返回 None 且打印 stderr
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "At line:1 报错啦"
+    real_exists, real_run = os.path.exists, subprocess.run
+    seen = {}
+    try:
+        os.path.exists = lambda p: True
+        subprocess.run = lambda argv, **kw: (seen.update(argv=argv, env=kw.get("env") or {}),
+                                             _R())[1]
+        ret2, out2 = grab(wv._file_version, p_quote)
+    finally:
+        os.path.exists, subprocess.run = real_exists, real_run
+    chk(ret2 is None and "powershell 退出码 1" in out2,
+        "powershell 失败时返回 None 并打印退出码（原来异常被吞成静默 None）")
+    chk(seen["env"].get("WX_VER_PATH") == p_quote,
+        f"★ 路径是通过环境变量 {wv._PS_PATH_ENV} 传进去的，值原样（含单引号也不变形）")
+    chk(seen["argv"] == wv._file_version_cmd(p_quote), "真正跑的就是 _file_version_cmd 构造的 argv")
+
+    # 文件存在时真实跑一次（不碰微信进程，只读一个文件版本号）
+    if os.path.exists(p_plain):
+        v = wv._file_version(p_plain)
+        chk(isinstance(v, str) and v.count(".") >= 2,
+            f"真实安装的 Weixin.exe 能读出文件版本：{v!r}")
+
+    # ── 汇总 ──────────────────────────────────────────────────────────
+    print()
+    if _FAIL:
+        print(f"失败 {len(_FAIL)} 项 ❌")
+        for f in _FAIL:
+            print("  - " + f)
+        return 1
+    print("全部通过 ✅")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
