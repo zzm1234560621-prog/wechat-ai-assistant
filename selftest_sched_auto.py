@@ -513,6 +513,66 @@ def t9_review_scope_is_explicit():
         _ = tmp
 
 
+def t10_relative_time():
+    """相对时间：「10分钟后 / 半小时后 / 2小时后 / 3天后」= **只触发一次**。
+
+    真机踩过（2026-10-01）：用户说「10分钟后给李同学发你好」，`parse_when` 里没有
+    相对分支 → 掉到最下面的 `_hhmm()` 兜底 → `int("10分钟后")` 抛错 →
+    工具回「时间「10分钟后」没看懂。例：9:00、09:30」，于是让用户改说具体时刻。
+    **是缺分支，不是有意拒绝**（代码里连一条相关测试都没有）。
+    """
+    print("T10. 相对时间：10分钟后 / 半小时后 / 几小时后 / 几天后")
+    now = datetime(2026, 10, 1, 19, 23, 45)
+    for when, date, at in (
+        ("10分钟后", "2026-10-01", "19:34"),       # 19:33:45 → 向上取整到 19:34
+        ("十分钟后", "2026-10-01", "19:34"),
+        ("半个小时后", "2026-10-01", "19:54"),
+        ("半个小时以后", "2026-10-01", "19:54"),
+        ("2小时后", "2026-10-01", "21:24"),
+        ("2个钟头后", "2026-10-01", "21:24"),
+        ("3天后", "2026-10-04", "19:24"),
+        ("再过20分钟后", "2026-10-01", "19:44"),
+    ):
+        spec = scheduler.parse_when(when, now=now)
+        chk(spec == {"repeat": "once", "date": date, "at": at},
+            f"「{when}」→ 只一次 {date} {at}（实际 {spec}）")
+
+    spec = scheduler.parse_when("10分钟后", now=datetime(2026, 10, 1, 23, 55, 10))
+    chk(spec == {"repeat": "once", "date": "2026-10-02", "at": "00:06"},
+        f"跨午夜要落到第二天（实际 {spec}）")
+
+    spec = scheduler.parse_when("10分钟后", now=datetime(2026, 10, 1, 19, 23, 0))
+    chk(spec["at"] == "19:33", f"整分时不多加一分钟（实际 {spec['at']}）")
+
+    chk(scheduler.parse_when("9点半", now=now) == {"repeat": "daily", "at": "09:30"},
+        "「9点半」= 每天 09:30")
+    chk(scheduler.parse_when("每天9点半", now=now) == {"repeat": "daily", "at": "09:30"},
+        "「每天9点半」= 每天 09:30")
+
+    spec = scheduler.parse_when("10分钟后", now=now)
+    nx = scheduler.initial_next(spec, now=now)
+    chk(nx is not None and 9 * 60 <= nx - now.timestamp() <= 11 * 60,
+        f"next_ts 落在 10 分钟附近（实际差 {(nx - now.timestamp()) if nx else None} 秒）")
+
+    for bad in ("半分钟后", "0分钟后", "0小时后"):
+        try:
+            scheduler.parse_when(bad, now=now)
+            chk(False, f"「{bad}」应当如实报错")
+        except ValueError:
+            chk(True, f"「{bad}」如实报错（不静默当成别的）")
+
+    # 回归：老的写法一个都不能变
+    chk(scheduler.parse_when("9:00", now=now) == {"repeat": "daily", "at": "09:00"},
+        "回归：「9:00」仍是每天")
+    chk(scheduler.parse_when("明天9:00", now=now)["repeat"] == "once",
+        "回归：「明天9:00」仍是只一次")
+    chk(scheduler.parse_when("每30分钟", now=now) ==
+        {"repeat": "interval", "every_minutes": 30},
+        "回归：「每30分钟」仍是间隔，没被相对分支抢走")
+    chk(scheduler.parse_when("每周一 9:00", now=now)["repeat"] == "weekly",
+        "回归：「每周一 9:00」仍是每周")
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -524,7 +584,7 @@ def main():
                t3_bad_at_only_skips_itself, t4_mutual_exclusion,
                t5_group_reply_parsing, t6_transcript_speakers,
                t7_id_not_reused, t8_usage_matches_impl,
-               t9_review_scope_is_explicit):
+               t9_review_scope_is_explicit, t10_relative_time):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

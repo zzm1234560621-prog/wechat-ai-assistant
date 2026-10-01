@@ -45,7 +45,8 @@ _USAGE = (
     "  /定时 删 <编号> —— 删掉\n"
     "  /定时 开|关 —— 总开关（只有这两个子命令，不能带编号）\n"
     "时间写法：9:00 是每天，明天9:00 是只一次，"
-    "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段。\n"
+    "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段，"
+    "10分钟后 / 半小时后 / 2小时后 / 3天后 是只一次（从**现在**起算）。\n"
     "例：/定时 加 明天9:00 张三 记得带伞\n"
     "    /定时 加提问 每天8:00 整理一下谁还没回我、昨天有什么漏的"
 )
@@ -122,19 +123,54 @@ def _norm(s):
 
 
 def _hhmm(s):
-    """解析 "9:00" / "09:00" / "9"（只有小时）。返回 (h, m)。"""
+    """解析 "9:00" / "09:00" / "9"（只有小时）/ "9点半"。返回 (h, m)。"""
     s = str(s or "").strip().rstrip("分").strip()
     try:
         if ":" in s:
             a, b = s.split(":", 1)
-            h, m = int(a), int(b or 0)
+            b = b.strip()
+            h = int(a)
+            # 「9点半」会被 _norm 归一化成「9:半」
+            m = 30 if b == "半" else int(b or 0)
         else:
             h, m = int(s), 0
     except ValueError:
-        raise ValueError(f"时间「{s}」没看懂。例：9:00、09:30")
+        raise ValueError(f"时间「{s}」没看懂。例：9:00、09:30、9点半")
     if not (0 <= h <= 23 and 0 <= m <= 59):
         raise ValueError(f"时间「{s}」不对：小时要 0~23、分钟要 0~59。")
     return h, m
+
+
+# 中文数字：「十分钟后」「半小时后」「两小时后」都得认
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+# 相对**一次性**：「10分钟后」「半个小时后」「2小时后」「3天后」「过20分钟后」
+# ⚠️ 和上面「每N分钟」区分：那是**重复**规则，这一支只触发一次。
+_REL_RE = re.compile(
+    r"^(?:(?:过|再)\s*){0,2}(\d+|[一二两三四五六七八九十]+|半)\s*个?\s*"
+    r"(分钟|分|小时|钟头|天)\s*(?:后|以后|之后)$")
+
+
+def _rel_minutes(num_s, unit):
+    """把「10 分钟 / 半 小时 / 2 天」换算成分钟数；看不懂抛 ValueError。"""
+    half = num_s == "半"
+    if half:
+        if unit in ("分钟", "分"):
+            raise ValueError("「半分钟后」太短了（调度精度是一分钟），写成「1分钟后」。")
+        n = 1
+    elif num_s.isdigit():
+        n = int(num_s)
+    else:
+        n = _CN_NUM.get(num_s)
+        if n is None:
+            raise ValueError(f"时间里的数字「{num_s}」没看懂。例：10分钟后、半小时后")
+    if n <= 0:
+        raise ValueError("时间要是正数。")
+    if unit in ("分钟", "分"):
+        return n
+    if unit in ("小时", "钟头"):
+        return n * 30 if half else n * 60
+    return n * 720 if half else n * 24 * 60      # 天
 
 
 def parse_when(when, now=None):
@@ -145,7 +181,8 @@ def parse_when(when, now=None):
     now = now or datetime.now()
     s = _norm(when)
     if not s:
-        raise ValueError("要写时间。例：明天9:00 / 9:00 / 每周一 9:00 / 每30分钟")
+        raise ValueError("要写时间。例：明天9:00 / 9:00 / 每天8:00 / 每周一 9:00 / "
+                         "10分钟后 / 每30分钟")
 
     # 每周X [HH:MM]
     m = re.match(r"^(?:每周|每星期)\s*([一二三四五六日天1-7])\s*(.*)$", s)
@@ -162,6 +199,21 @@ def parse_when(when, now=None):
         if mult == 1 and n < 1:
             raise ValueError("间隔至少要 1 分钟。")
         return {"repeat": "interval", "every_minutes": n * mult}
+
+    # 相对一次性：「10分钟后」「半小时后」「2小时后」「3天后」
+    # 以前没有这一支，用户说「10分钟后」会掉到最下面的 _hhmm() 兜底，
+    # 报「时间「10分钟后」没看懂」——**是缺分支，不是有意拒绝**。
+    # 实现方式：换算成绝对时刻，复用现成的 once（date + at）表示法，
+    # 这样 next_ts 照旧是墙上时钟、落盘后重启也不会漂。
+    m = _REL_RE.match(s)
+    if m:
+        mins = _rel_minutes(m.group(1), m.group(2))
+        target = now + timedelta(minutes=mins)
+        # 调度精度只到分钟，**向上取整**：宁可晚十几秒，也绝不比用户说的更早触发
+        if target.second or target.microsecond:
+            target = target.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        return {"repeat": "once", "date": target.date().isoformat(),
+                "at": f"{target.hour:02d}:{target.minute:02d}"}
 
     # 今天 / 明天 / 后天 [HH:MM] → 一次性
     m = re.match(r"^(今天|明天|后天)\s*(.*)$", s)

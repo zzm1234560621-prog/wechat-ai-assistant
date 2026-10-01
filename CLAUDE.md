@@ -79,6 +79,14 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   自测：`.venv/Scripts/python.exe executor.py`（另有两份：`executor_selftest.py` 纯逻辑、`selftest_executor_chain.py` 确认闸门链路）。
 - `scheduler.py` — 定时任务（到点自动给对方发文本或打电话）。任务存在 `settings.json` 的 `schedule` 段，命令 `/定时` 维护；**必须跑在收消息那条线程上**，见下面「改代码时的约定」。
   - `action` 有三种：`text` 发固定内容 / `ask` 到点把 `text` 当提问跑一遍 agent、答案回控制会话（「每天早8点给我整理谁还没回我」就是这么做的）/ `call` 打电话（还没打通，只报错）。
+  - **时间写法**（`scheduler.parse_when`）认：`9:00`=每天、`明天9:00`/`10-02 9:00`=只一次、
+    `每周一 9:00`、`每30分钟`、`9点半`，以及**相对一次性** `10分钟后` / `半小时后` /
+    `2小时后` / `3天后`（换算成 `date`+`at` 的绝对时刻，**向上取整到分钟**——宁可晚十几秒，
+    也绝不比用户说的更早触发；这样 `next_ts` 仍是墙上时钟，重启不漂）。
+    ⚠️ 相对这一支以前**没有**：用户说「10分钟后」，`parse_when` 会掉到最后的 `_hhmm()` 兜底，
+    报「时间「10分钟后」没看懂」，然后助手让用户改说具体时刻——真机踩过（2026-10-01），
+    别再删。**改 `parse_when` 要顺带看 `_REL_RE` 别把「每N分钟」（重复规则）抢走**。
+    回归：`selftest_sched_auto.t10_relative_time`。
 - `file_read.py` — 读**别人发来的文件**（pdf/docx/xlsx/pptx/文本）。微信把收到的文件明文放在 `<数据目录>/<账号>/msg/file/<年-月>/`，不用解密；文件名从消息的 appmsg XML 里拿。**只允许读那个目录**，按文件名匹配，不接任意路径。PDF 走 `pypdf`（在 `requirements.txt` 里）。
 - `image_read.py` / `file_read.py` 都是「把本地文件变成文字喂给模型」，区别是图片要 OCR、文件要解析。
 - `image_cache.py` — 找微信 4.x 的**明文缩略图缓存**（`<账号>/cache/<月>/Message/<md5>/Thumb/`）。`send_image` 的默认白名单就是这里的 `image_cache_dirs()`（即 `<账号>/cache`），**不再是整个 `xwechat_files`**。
