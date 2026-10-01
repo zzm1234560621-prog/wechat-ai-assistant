@@ -20,6 +20,7 @@
 .venv/Scripts/python.exe selftest_redact_usage.py   # redact / usage
 .venv/Scripts/python.exe selftest_health.py         # health / status_page
 .venv/Scripts/python.exe selftest_bot_loop.py       # bot 主循环侧改动
+.venv/Scripts/python.exe selftest_audio.py          # 语音输入（音频转文字）
 .venv/Scripts/python.exe selftest_install.py        # 安装/环境链路
 .venv/Scripts/python.exe selftest_executor_chain.py # 本地执行确认闸门
 .venv/Scripts/python.exe executor_selftest.py       # executor 独立自测
@@ -30,6 +31,10 @@
 # 真机自检（**必须先停 bot**；只读，脚本自己会拒绝「bot 在跑」的情况）
 # 查：hook/登录态、库结构、游标、联系人、发图白名单、落盘状态与账本
 .venv/Scripts/python.exe verify_real.py
+
+# 语音输入（音频 → 文字）。模型**只由用户显式执行才下**，绝不从聊天路径触发：
+.venv/Scripts/python.exe audio_read.py --setup          # 下本地模型（走 hf-mirror）
+.venv/Scripts/python.exe audio_read.py --transcribe x.m4a
 
 # 看 bot 日志（后台无窗口运行时唯一的信息来源；会自动轮转，见下）
 tail -f bot.log
@@ -89,6 +94,24 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
     回归：`selftest_sched_auto.t10_relative_time`。
 - `file_read.py` — 读**别人发来的文件**（pdf/docx/xlsx/pptx/文本）。微信把收到的文件明文放在 `<数据目录>/<账号>/msg/file/<年-月>/`，不用解密；文件名从消息的 appmsg XML 里拿。**只允许读那个目录**，按文件名匹配，不接任意路径。PDF 走 `pypdf`（在 `requirements.txt` 里）。
 - `image_read.py` / `file_read.py` 都是「把本地文件变成文字喂给模型」，区别是图片要 OCR、文件要解析。
+- `audio_read.py` — **语音输入**：把**音频文件**（`.m4a/.mp3/.wav/.amr`…）转成文字，
+  由 `file_read.extract()` 按扩展名分派过来（**没有新工具，还是 `read_file`**）。规格：`docs/voice-input-spec.md`。
+  - **范围**：只处理**当文件发来**的音频（明文在 `<账号>/msg/file/<月>/`）。
+    ❌ **微信语音条**（那个小喇叭，`local_type=34`）**不在这里** —— 真机实测拿不到音频字节
+    （82 个 `Rec/` 目录全空、全盘无 `.silk/.amr`），可行性见 `docs/voice-msg-feasibility.md`。
+    ❌ 发语音 / 语音通话：hook 做不到。
+  - **三条硬约束**（改之前先读规格）：① 转写跑在**收消息那条线程**上 → `audio.max_seconds`（默认 120）
+    + `file.max_bytes` 是**硬上限，超了如实拒绝、绝不静默截断音频**；
+    ② **绝不在聊天里静默下模型** —— 推理只认本地目录（结构上不可能联网），下载只由
+    `--setup` 触发（走 `HF_ENDPOINT=https://hf-mirror.com`，本机 huggingface.co 不通）；
+    ③ 默认 `local` → **音频一个字节都不出本机**；配 `cloud` 才上传，**上传必打日志**。
+  - **`_looks_garbled` 那条「短于 20 字当可疑」对音频不适用**（它是为「字节解码错了」设计的）：
+    一句 3 秒的「好的」只有两个字，按那条会被拒。所以 `extract()` 里音频分支**跳过**这个判据。
+  - **`faster-whisper` 绝不能写成 `requirements.txt` 的正式需求行**（真踩过）：
+    `envsetup.requirements_specs()` 读**所有非注释行**，「可选段」只是文件里的约定；
+    写成正式行它就会进 `required_import_names()` → 启动助手.bat 自检要求它 →
+    没装的人「装完还是起不来」死循环（H1 那类），installer 还会去装这个重包。
+    **可选依赖一律写成注释**（pywxdump 一直是这么写的）。回归：`selftest_audio.py`。
 - `image_cache.py` — 找微信 4.x 的**明文缩略图缓存**（`<账号>/cache/<月>/Message/<md5>/Thumb/`）。`send_image` 的默认白名单就是这里的 `image_cache_dirs()`（即 `<账号>/cache`），**不再是整个 `xwechat_files`**。
   - **只有「别人发来的图」才有 `Thumb/<local_id>_<create_time>_thumb.jpg`。自己发出去的图，微信只留加密原图（`Bubble/<md5>_b.dat`，实测 filehelper 那条会话连 `Thumb/` 目录都没有）** → `read_image` 对这类图**读不了内容**，只能在消息里如实说「看不了」。这是微信的存储事实，不是本项目的 bug；**别顺手去解密 `.dat`**（那是另一件事，见 `docs/wechat4-dat-image-notes.md`）。
   - 渲染图片消息时**带上 `local_id`**（`live_history` 里做），模型据此能直接 `read_image(contact, local_id)`；不带的话它得先 `find_images` 再 `read_image`，白多一次查库。

@@ -280,6 +280,27 @@ file:
   max_bytes: 31457280    # 超过 30MB 的不读（抽出来多半没意义，还慢）
   max_chars: 20000       # 抽出的正文最多给模型多少字，超了截断并说明是节选
 
+# ============ 语音输入（audio_read.py）============
+# 把**音频文件**转成文字（read_file 认 .m4a/.mp3/.wav/.amr 这类）。
+#   范围：别人（或你自己）**当文件发来**的音频，明文放在 <数据目录>/<账号>/msg/file/<月>/。
+#   ❌ 微信**语音条**（那个小喇叭）不在这里——真机实测拿不到音频字节，见
+#      docs/voice-msg-feasibility.md；❌ 发语音/TTS 也做不到（hook 只能发文本和图片）。
+# 三条硬约束（改之前先读 docs/voice-input-spec.md）：
+#   1) 转写**跑在收消息那条线程上**，所以有硬上限、超了如实拒绝，绝不静默截断音频；
+#   2) **绝不在聊天里静默下模型**：只有你显式执行 `python audio_read.py --setup` 才下
+#      （走 hf-mirror 镜像，因为 huggingface.co 在国内不通）；
+#   3) **默认 local → 音频一个字节都不出本机**；配成 cloud 才上传，且上传会打日志。
+# 整段删掉也行：缺的键一律退回下面写的默认值（等于「本地 + 不下模型」）。
+audio:
+  backend: local          # local（默认，音频不出本机）| cloud（上传到第三方转写）
+  model: small            # 本地模型档位：tiny / base / small / medium（越大越准越慢）
+  max_seconds: 120        # 超过这么久就拒绝转写（转写期间轮询是停着的）
+  # model_dir: ""         # 本地模型放哪；默认 data/models/faster-whisper-<model>
+  cloud:                  # 只有 backend: cloud 时才会用到
+    base_url: "https://api.siliconflow.cn/v1"   # 本机实测可达；api.openai.com 不通
+    api_key: ""
+    model: "FunAudioLLM/SenseVoiceSmall"
+
 # ============ 健康看护（health.py）============
 # 运行期健康记账 + 掉登录告警 + 日志轮转（bot.log → .1/.2/.3）+ Windows 本地通知。
 # **它自己绝不查微信库、绝不另起线程去碰 hook**：只收 bot 在收消息那条线程上

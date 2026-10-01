@@ -39,6 +39,18 @@ PyYAML>=6.0
 pypdf>=4.0
 
 # --- 可选：不随主程序安装 ----------------------------------------------------
+# ⚠️ 这一段里的包**必须写成注释**，不许写成正式需求行。原因：`envsetup.requirements_specs()`
+#    读的是**所有非注释行**，「可选」只是本文件里的约定，不是解析器认识的语法；
+#    （`required_pkgs(backend)` 只按后端排除 wcferry 一个。）
+#    一旦把可选包写成正式行，它会进 `required_import_names()` →
+#    启动助手.bat 的自检清单会要求它 → 没装的人「装完还是起不来」死循环（H1 那一类），
+#    installer 也会去装这个重包。下面 pywxdump 一直是注释，就是这个道理。
+#
+# faster-whisper：语音输入（把音频文件转成文字）用。用到时按提示单独装：
+#     .venv\Scripts\python.exe -m pip install faster-whisper
+# 装完还要下一次模型（显式执行 `python audio_read.py --setup`，绝不从聊天路径触发下载）。
+# 走云端转写（audio.backend: cloud）则完全不需要它。见 docs/voice-input-spec.md。
+#
 # pywxdump 仅 export_history.py 手动导出时才需要；它强锁 protobuf==3.10.0，
 # 与 wcferry 的 grpcio-tools 冲突会导致安装失败，故不随主程序安装。
 # 需要手动导出时再单独装：pip install pywxdump

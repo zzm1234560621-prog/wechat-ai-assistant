@@ -35,6 +35,11 @@ import image_cache
 SUPPORTED = {".pdf", ".docx", ".xlsx", ".pptx",
              ".txt", ".md", ".csv", ".json", ".log", ".xml", ".html", ".htm"}
 
+# 音频另走一条路（转写），**不进 SUPPORTED**：那是「文档解析」的白名单。
+# 一并 import 是为了分派时用；audio_read 反过来不 import 本模块的顶层符号（只在
+# 取字节上限时函数内 import），所以没有循环导入。
+import audio_read                                    # noqa: E402
+
 _MAX_BYTES = 30 * 1024 * 1024      # 超过就不读（PDF 抽出来也多半没意义，还慢）
 _MAX_ZIP_UNPACK = 200 * 1024 * 1024  # 防 zip 炸弹：**解压后**的累计上限（file.max_bytes 只管压缩包大小）
 # XML 里出现这些就是「有实体声明」，见 _xml_bytes 里为什么直接拒绝
@@ -554,12 +559,22 @@ def extract(path, cfg=None):
         return None, f"文件太大（{size/1048576:.1f}MB），我不读这么大的。"
 
     ext = os.path.splitext(path)[1].lower()
-    if ext not in SUPPORTED:
-        return None, f"我暂时只认 {', '.join(sorted(SUPPORTED))} 这几种，{ext or '这种'} 读不了。"
+    # 音频（语音输入）走 audio_read 转写：它有自己的上限、隐私（默认不出本机）
+    # 和失败语义，见 docs/voice-input-spec.md。**字节上限复用 file.max_bytes**，
+    # 所以这里把已经算好的 max_bytes 传下去，不另立一份真源。
+    from_audio = audio_read.is_audio(path)
+    if not from_audio and ext not in SUPPORTED:
+        return None, (f"我暂时只认 {', '.join(sorted(SUPPORTED))} 这几种"
+                      f"（音频 .m4a/.mp3/.wav/.amr 这类也能转文字），"
+                      f"{ext or '这种'} 读不了。")
 
     note = None
     try:
-        if ext == ".pdf":
+        if from_audio:
+            text, err = audio_read.transcribe(path, cfg, max_bytes=max_bytes)
+            if err:
+                return None, err
+        elif ext == ".pdf":
             text, err = _pdf(path)
             if err:
                 return None, err
@@ -585,7 +600,10 @@ def extract(path, cfg=None):
     text = (text or "").strip()
     if not text:
         return None, "这个文件里没有可提取的文字。"
-    if _looks_garbled(text):
+    if not from_audio and _looks_garbled(text):
+        # **音频转写不走这个判据**：`_looks_garbled` 里「短于 20 字就当可疑」是为
+        # 「字节解码错了」设计的（短文本没法判）；而 STT 输出根本不是解码产物——
+        # 一句 3 秒的「好的」只有两个字，按那条会被当成乱码拒掉，是错的。
         return None, ("抽出来的内容像是乱码（可能是特殊字体编码或扫描件），"
                       "我不拿它当内容用。")
     if len(text) > max_chars:
