@@ -80,7 +80,7 @@ def status_text(cfg):
     for r in recs:
         lines.append(f"  · {r.get('name') or r.get('wxid')}（{r.get('wxid')}）")
     lines.append("")
-    lines.append("他们发消息我会通知你，但**不会回**他们。")
+    lines.append("他们发消息我会通知你，但不会回他们。")
     return "\n".join(lines)
 
 
@@ -151,7 +151,7 @@ def handle_command(arg, cfg, resolve, name_hint=None):
         # 和自动回复名单互斥：两边都加会既通知又自动回复，看着像抽风
         import auto_reply
         if wxid in auto_reply.chats(cfg):
-            return (f"{disp} 已经在**自动回复**名单里了。盯着是「只通知不回」，"
+            return (f"{disp} 已经在「自动回复」名单里了。盯着是「只通知不回」，"
                     f"和自动回复是互斥的——想只收通知就先发 /auto del {disp}。"), False
 
         rec = _find(recs, wxid)
