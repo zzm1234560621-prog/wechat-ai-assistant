@@ -219,12 +219,21 @@ def to_pcm(data):
 
 
 if __name__ == "__main__":
-    # 现场小工具：给一个 XML 片段或一个文件，看能认出什么
+    # 现场小工具：给一个 XML（文件或原串）或一个候选文件，看能认出什么
     import sys
-    if "--xml" in sys.argv:
+    if "--xml-file" in sys.argv:
+        i = sys.argv.index("--xml-file")
+        p = sys.argv[i + 1]
+        # ⚠️ 用文件而不是内联字符串：cmd/PowerShell 会把内联 XML 里的引号吃掉，
+        #    传进来就变成属性全空——这不是解析器的问题，是 shell 的引号规则。
+        info = parse_voicemsg(open(p, encoding="utf-8", errors="replace").read())
+        print(info)
+    elif "--xml" in sys.argv:
         i = sys.argv.index("--xml")
         info = parse_voicemsg(sys.argv[i + 1] if len(sys.argv) > i + 1 else "")
         print(info)
+        if not info.get("aeskey"):
+            print("（提示：内联 XML 里的引号常被 shell 吃掉，改用 --xml-file <文件>）")
     elif "--file" in sys.argv:
         i = sys.argv.index("--file")
         p = sys.argv[i + 1]
