@@ -23,6 +23,7 @@ import auto_reply
 import image_cache
 import live_history
 import scheduler
+import watch
 
 # 允许发送的图片后缀
 _IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -177,6 +178,9 @@ TOOLS = [
             "  「每天早上8点给李四发个早安」→ action=add, when=8:00, who=李四, text=早安\n"
             "  「每周一9点给王五发周报提醒」→ action=add, when=每周一 9:00, ...\n"
             "  「每隔半小时给他发一次」→ action=add, when=每30分钟, ...\n"
+            "  「每天早8点给我整理一下谁还没回我」→ action=add, mode=ask,"
+            " when=每天8:00, text=整理一下谁还没回我、昨天有什么漏的"
+            "（mode=ask 是到点让**你**回答这段话，答案发回控制会话，不用填 who）\n"
             "  「把第2个定时删了」→ action=del, target=t2\n"
             "  「定时都先停掉」→ action=off, target=all\n"
             "  「我有哪些定时」→ action=status\n"
@@ -196,10 +200,36 @@ TOOLS = [
                 "who": {"type": "string",
                         "description": "昵称/备注/微信号/wxid"},
                 "text": {"type": "string", "description": "要发的内容（action=add 且不是通话时必填）"},
-                "mode": {"type": "string", "enum": ["text", "call"],
-                         "description": "默认 text；call=打电话（还没打通）"},
+                "mode": {"type": "string", "enum": ["text", "call", "ask"],
+                         "description": "默认 text=发固定内容；ask=到点让你回答 text 里那段话，"
+                                        "答案回控制会话（做每日摘要用）；call=打电话（还没打通）"},
                 "target": {"type": "string",
                            "description": "del/on/off 时的任务编号，如 t2；on/off 可用 all"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "watch",
+        "description": (
+            "管理「盯着」名单——名单里的人一给用户发消息，就**通知用户本人**，"
+            "但**一个字都不回复对方**。用户用大白话说这类要求时必须调用本工具：\n"
+            "  「张三发消息告诉我一声」「帮我盯着张三」→ action=add, who=张三\n"
+            "  「别盯着张三了」→ action=del, who=张三\n"
+            "  「盯着谁了」→ action=status\n"
+            "  「先别通知了」→ action=off\n"
+            "**注意和 auto_reply 的区别**：auto_reply 是「代用户回对方」，"
+            "watch 是「只告诉用户他说了啥」。用户说「帮我回」用 auto_reply，"
+            "说「告诉我」「盯着」才用这个。两者对同一会话互斥。"
+            "调用后把工具返回的内容如实复述给用户。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": ["add", "del", "on", "off", "status"]},
+                "who": {"type": "string",
+                        "description": "昵称/备注/微信号/wxid；群填 roomid"},
             },
             "required": ["action"],
         },
@@ -342,6 +372,7 @@ TOOLS = [
 
 _AUTO_ACTIONS = ("on", "off", "add", "del", "mode", "review", "ctx", "status")
 _SCHED_ACTIONS = ("add", "del", "on", "off", "status")
+_WATCH_ACTIONS = ("add", "del", "on", "off", "status")
 
 
 class _Budget:
@@ -1048,6 +1079,21 @@ class ToolBox:
         if action == "status":
             return text
         return f"{text}\n（当前{scheduler.summary_line(self.cfg_provider())}）"
+
+    def t_watch(self, args):
+        args = args or {}
+        action = str(args.get("action") or "").strip().lower()
+        if action not in _WATCH_ACTIONS:
+            return f"action 只能是 {' / '.join(_WATCH_ACTIONS)} 之一。"
+        who = str(args.get("who") or "").strip()
+        # 和 /盯着 走同一条实现（含重名不静默取第一个）
+        arg = watch.build_arg(action, who=who)
+        text, changed = watch.handle_command(arg, self.cfg_provider(), self._one)
+        if changed:
+            self.cfg_changed = True
+        if action == "status":
+            return text
+        return f"{text}\n（当前{watch.summary_line(self.cfg_provider())}）"
 
     # ---------- 分发 ----------
 

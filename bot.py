@@ -25,6 +25,7 @@ import live_history
 import settings
 import providers
 import scheduler
+import watch
 from llm import ChatLLM
 from history import HistoryStore
 from live_history import (
@@ -137,9 +138,18 @@ HELP_TEXT = (
     "也可以直接说「明天9点提醒我给张三发…」。\n"
     "/定时 —— 看列表\n"
     "/定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
+    "/定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
     "/定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
     "/定时 删|开|关 <编号|all> —— 删 / 恢复 / 暂停\n"
-    "时间写法：9:00=每天，明天9:00=只一次，每周一 9:00=每周，每30分钟=每隔一段"
+    "时间写法：9:00=每天，明天9:00=只一次，每周一 9:00=每周，每30分钟=每隔一段\n"
+    "\n"
+    "—— 盯着某人（他发消息就通知我，不回他）——\n"
+    "也可以直接说「张三发消息告诉我一声」。\n"
+    "/盯着 —— 看名单\n"
+    "/盯着 加 <昵称|wxid|roomid> —— 加进来\n"
+    "/盯着 删 <昵称|wxid> —— 移出去\n"
+    "/盯着 开|关 —— 总开关\n"
+    "（和 /auto 互斥：那个是代你回对方，这个是只告诉你不回）"
 )
 
 
@@ -296,6 +306,16 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
 
         return scheduler.handle_command(arg, fresh, resolve, can_lookup=live_ok)
 
+    if cmd in ("/盯着", "/watch", "/盯"):
+        # 同 /auto：重新读一次，避免连着发命令时丢掉上一条的改动。
+        fresh = settings.effective(load_config())
+
+        def resolve_watch(who):
+            return agent_tools.resolve_one(contacts, who,
+                                           fresh.get("self_wxid", ""), wcf)
+
+        return watch.handle_command(arg, fresh, resolve_watch)
+
     return f"未知命令 {cmd}。发 /help 查看帮助。", False
 
 
@@ -435,7 +455,62 @@ def is_cancel(text):
 # {chat: {"ts": 最后活动时间, "turns": [{"role","content"}, ...]}}
 # 只记**原始提问**和**最终答复**。绝不记 build_user_prompt 里那段检索结果——
 # 那段每轮都要重算，记下来等于每轮把整块历史重发一遍，token 直接爆。
-_DIALOG = {}
+#
+# 落盘到 data/dialog.json（data/ 在 .gitignore 里）：以前只在内存里，
+# 重启一次「刚才那个」就接不上了。延迟加载，第一次用到才读盘。
+_DIALOG = None
+DIALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dialog.json")
+# 盘上的硬上限：超过这么久没动静的会话直接扔掉。真正的过期判断用
+# agent.dialog_ttl（默认 900 秒），这里只是个防无限增长的地板。
+_DIALOG_KEEP_SECONDS = 7 * 24 * 3600
+_DIALOG_MAX_CHATS = 50
+
+
+def _dialog_load():
+    """读一次盘，之后走内存。文件坏了就当空的——记忆文件不该挡住启动。"""
+    global _DIALOG
+    if _DIALOG is not None:
+        return _DIALOG
+    _DIALOG = {}
+    try:
+        with open(DIALOG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return _DIALOG
+    if not isinstance(data, dict):
+        return _DIALOG
+    cutoff = time.time() - _DIALOG_KEEP_SECONDS
+    for k, v in data.items():
+        if not isinstance(v, dict) or not isinstance(v.get("turns"), list):
+            continue
+        try:
+            ts = float(v.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts < cutoff or not v["turns"]:
+            continue
+        _DIALOG[str(k)] = {"ts": ts, "turns": v["turns"]}
+    # 会话太多就留最近用过的那些
+    if len(_DIALOG) > _DIALOG_MAX_CHATS:
+        keep = sorted(_DIALOG.items(), key=lambda kv: -kv[1]["ts"])[:_DIALOG_MAX_CHATS]
+        _DIALOG.clear()
+        _DIALOG.update(keep)
+    return _DIALOG
+
+
+def _dialog_save():
+    """先写临时文件再替换：直接覆盖时半截崩了，整份记忆就没了。"""
+    if _DIALOG is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(DIALOG_PATH), exist_ok=True)
+        tmp = DIALOG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_DIALOG, f, ensure_ascii=False)
+        os.replace(tmp, DIALOG_PATH)
+    except OSError:
+        # 记忆写不进去不是致命问题，但得让人看得见
+        traceback.print_exc()
 
 
 def _dialog_cfg(cfg):
@@ -457,11 +532,13 @@ def dialog_history(chat, cfg):
     过期的上下文比没有更糟——模型会把几天前的话当成「刚才说的」。
     """
     turns, ttl = _dialog_cfg(cfg)
-    rec = _DIALOG.get(str(chat))
+    store = _dialog_load()
+    rec = store.get(str(chat))
     if not rec or turns <= 0:
         return []
     if ttl and (time.time() - rec["ts"]) > ttl:
-        _DIALOG.pop(str(chat), None)
+        store.pop(str(chat), None)
+        _dialog_save()
         return []
     return list(rec["turns"])
 
@@ -474,16 +551,20 @@ def dialog_append(chat, role, content, cfg):
     text = str(content or "").strip()
     if not text:
         return
-    rec = _DIALOG.setdefault(str(chat), {"ts": 0.0, "turns": []})
+    store = _dialog_load()
+    rec = store.setdefault(str(chat), {"ts": 0.0, "turns": []})
     rec["turns"].append({"role": role, "content": text})
     rec["ts"] = time.time()
     keep = turns * 2            # 一轮 = 一问一答
     if len(rec["turns"]) > keep:
         del rec["turns"][:-keep]
+    _dialog_save()
 
 
 def dialog_forget(chat):
-    _DIALOG.pop(str(chat), None)
+    store = _dialog_load()
+    if store.pop(str(chat), None) is not None:
+        _dialog_save()
 
 
 def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
@@ -805,6 +886,9 @@ def main():
     # 自动回复：代替我本人回这些会话
     auto_on = auto_reply.enabled(cfg)
     auto_recs = auto_reply.chats(cfg)
+    # 盯着：只通知我，不回对方
+    watch_on = watch.enabled(cfg)
+    watch_recs = watch.chats(cfg)
     # 审核模式把草稿往哪儿发：第一个控制会话（默认文件传输助手）
     control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
 
@@ -826,7 +910,7 @@ def main():
     else:
         print("[bot] 自动回复：未配置（在微信里发 /auto add <昵称> 添加）")
     print("[bot] 在微信里发 /help 查看可用的配置命令。Ctrl+C 退出。")
-    print(f"[bot] {scheduler.summary_line(cfg)}")
+    print(f"[bot] {scheduler.summary_line(cfg)}  |  {watch.summary_line(cfg)}")
 
     def reload_cfg():
         """配置被改后重建主循环的状态。
@@ -835,27 +919,59 @@ def main():
         它是从另一边写 settings.json 的，主循环不重建就还按旧状态跑。
         """
         nonlocal cfg, llm, targets, system, auto_on, auto_recs, control_chat
+        nonlocal watch_on, watch_recs
         cfg = settings.effective(base_cfg)
         llm = make_llm(cfg)
         targets = set(cfg.get("target_chats", []))
         system = cfg.get("system_prompt", "")
         auto_on = auto_reply.enabled(cfg)
         auto_recs = auto_reply.chats(cfg)
+        watch_on = watch.enabled(cfg)
+        watch_recs = watch.chats(cfg)
         control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
 
     def run_scheduled():
         """跑一遍到点的定时任务。
 
-        **只在收消息那条线程上调用**（见 _Ticker）：定时任务里要发消息，
-        而 hook 不支持并发——另起线程会直接把微信搞崩。
+        **只在收消息那条线程上调用**（见 _Ticker）：定时任务里要发消息、
+        还可能跑一整轮 agent，而 hook 不支持并发——另起线程会直接把微信搞崩。
         传入的是内存里的 cfg（不是重新读盘）：scheduler 会就地更新任务的
         next_ts，这样同一个任务不会在下一 tick 又触发一遍。命令改过配置后
         主循环会 reload_cfg()，新任务自然生效。
         """
+
+        def ask_task(question):
+            """定时的「提问」：把这句话当普通提问跑一遍，走的和主循环完全同一条路。
+
+            「每天早8点给我一份谁还没回我的整理」就是这么实现的——不用为摘要
+            另写一套查询，工具、历史检索、对话记忆全都自动可用。
+            """
+            if llm is None:
+                raise RuntimeError("还没设置 API Key")
+            prompt = build_user_prompt(question, wcf, contacts, cfg,
+                                       static_history, live_ok)
+            history = dialog_history(control_chat, cfg)
+            if agent_enabled(cfg):
+                answer, changed = run_agent(
+                    llm, system, prompt, wcf, contacts, cfg, control_chat, self_wxid,
+                    cfg_provider=lambda: settings.effective(base_cfg),
+                    history=history)
+            else:
+                answer = llm.chat(system, history + [{"role": "user", "content": prompt}])
+                changed = False
+            dialog_append(control_chat, "user", question, cfg)
+            dialog_append(control_chat, "assistant", answer, cfg)
+            if changed:
+                # 任务状态在 scheduler 里是**先落盘再执行**的，所以这里重建 cfg
+                # 不会把刚写进去的 next_ts 冲掉。
+                reload_cfg()
+            return answer
+
         fired = scheduler.run_due(
             cfg, datetime.now(),
             send_text=lambda to, text: send(text, to),
             notify=lambda text: send(text, control_chat),
+            ask=ask_task,
         )
         if fired:
             print(f"[bot] 定时任务已触发：{'、'.join(fired)}")
@@ -874,8 +990,9 @@ def main():
             sender = msg.roomid or msg.sender
             in_targets = sender in targets
             rec = auto_recs.get(sender) if auto_on else None
+            watched = watch_recs.get(sender) if watch_on else None
 
-            if not in_targets and rec is None and reply_only:
+            if not in_targets and rec is None and watched is None and reply_only:
                 continue
 
             query = (msg.content or "").strip()
@@ -898,6 +1015,13 @@ def main():
                     print(f"[bot] 跳过（自己发的消息，respond_to_self=false）: {query[:30]}")
                     continue
                 print(f"[bot] 自聊模式，处理自己的消息: {query[:30]}")
+
+            # 盯着：他发消息就通知我，**一个字都不回他**。
+            # 和自动回复一样，这条路不解析命令——对方随口发个「/help」不该触发命令表。
+            if watched is not None and not msg.from_self():
+                send(watch.format_hit(watched, query), control_chat)
+                print(f"[bot] 盯着命中 {watched.get('name') or sender}: {query[:40]}")
+                continue
 
             # 自动回复：代我回对方。这条路**不解析命令**——
             # 对方随口发个「/help」不该触发助手的命令表。

@@ -34,7 +34,9 @@ bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
 - `agent_tools.py` — 给大模型的工具层（8 个工具）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
 - `auto_reply.py` — 代用户本人回指定会话。
+- `watch.py` — 盯着某个会话：他发消息就**通知我**、不回他。和 `auto_reply` 互补且互斥（同一会话同时开会既通知又回复），加的时候互相拦。
 - `scheduler.py` — 定时任务（到点自动给对方发文本或打电话）。任务存在 `settings.json` 的 `schedule` 段，命令 `/定时` 维护；**必须跑在收消息那条线程上**，见下面「改代码时的约定」。
+  - `action` 有三种：`text` 发固定内容 / `ask` 到点把 `text` 当提问跑一遍 agent、答案回控制会话（「每天早8点给我整理谁还没回我」就是这么做的）/ `call` 打电话（还没打通，只报错）。
 - `llm.py` — anthropic / openai 两种协议，工具调用格式互转。
 - 入口有三条，都会起 `bot.py`：`助手.bat` 菜单、`启动助手.bat`、开机自启注册表。
 
