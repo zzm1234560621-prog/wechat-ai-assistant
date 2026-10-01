@@ -20,6 +20,7 @@ import os
 import time
 
 import auto_reply
+import file_read
 import image_cache
 import live_history
 import scheduler
@@ -265,6 +266,41 @@ TOOLS = [
             "properties": {
                 "contact": {"type": "string", "description": "昵称/备注/微信号/wxid"},
                 "local_id": {"type": "string", "description": "find_images 返回的 local_id"},
+            },
+            "required": ["contact", "local_id"],
+        },
+    },
+    {
+        "name": "find_files",
+        "description": (
+            "列出某个聊天里**收到的文件**（PDF / Word / Excel / PPT / 文本），"
+            "并标明哪些在本地、能不能读。用户问「他发的那份文件」「上次那份资料」"
+            "「那个 pdf 里写了什么」时用这个。\n"
+            "只有**收过的**文件才在本地；发出去的不在。返回里标了「本地有」的才能读。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "string", "description": "昵称/备注/微信号/wxid/roomid"},
+                "limit": {"type": "integer", "description": "默认 10"},
+            },
+            "required": ["contact"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "读一份收到的文件的**内容**（把它转成文字）。"
+            "contact + local_id 从 find_files 的结果里拿。\n"
+            "支持 pdf / docx / xlsx / pptx / txt / csv 等。"
+            "**扫描件 PDF（整页是图片）抽不出文字**，这时候要如实告诉用户"
+            "「这份读不出文字」，不要编内容。文件很长时只会给前面一部分。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "string", "description": "昵称/备注/微信号/wxid"},
+                "local_id": {"type": "string", "description": "find_files 返回的 local_id"},
             },
             "required": ["contact", "local_id"],
         },
@@ -589,6 +625,7 @@ class ToolBox:
         self._names = auto_reply.contact_names(self.contacts)
         self.sent = []          # 本轮真正发出去的 [(name, text)]
         self._img_cache = {}    # wxid -> 图片列表（本轮复用，见 _images）
+        self._file_cache = {}   # wxid -> 文件列表（同上，见 _files）
 
     def _image_path_ok(self, path):
         """校验发图路径。返回 (绝对路径, 错误文本)。
@@ -627,6 +664,7 @@ class ToolBox:
 
     # 一次取多少张图给缓存用
     _IMG_FETCH = 50
+    _FILE_FETCH = 30
 
     def _images(self, wxid, limit=None):
         """本会话的图片列表，**一轮内只查一次**。
@@ -639,6 +677,14 @@ class ToolBox:
             self._img_cache[wxid] = live_history.v4_images(
                 self.client, wxid, limit=self._IMG_FETCH)
         rows = self._img_cache[wxid]
+        return rows[-limit:] if limit else rows
+
+    def _files(self, wxid, limit=None):
+        """本会话收到的文件列表，**一轮内只查一次**（同 _images 的道理）。"""
+        if wxid not in self._file_cache:
+            self._file_cache[wxid] = live_history.v4_files(
+                self.client, wxid, limit=self._FILE_FETCH)
+        rows = self._file_cache[wxid]
         return rows[-limit:] if limit else rows
 
     # ---------- 工具实现 ----------
@@ -899,6 +945,75 @@ class ToolBox:
                     f"当前用的是系统 OCR，只能认『图里的字』；"
                     f"照片、表情包这类画面内容它看不懂。")
         return f"[{hit.get('time')} 的图片，识别出的文字]\n{text.strip()}"
+
+    def t_find_files(self, args):
+        contact = str(args.get("contact") or "").strip()
+        limit = int(args.get("limit") or 10)
+        limit = max(1, min(limit, 30))
+        cand, err = self._one(contact)
+        if err:
+            return err
+        wxid = str(cand.get("wxid"))
+        nm = cand.get("remark") or cand.get("name") or contact
+        try:
+            # 同 _images：列表一轮内只查一次，缓存命中就不扣预算
+            if wxid not in self._file_cache and not self.budget.take():
+                return "本轮查库次数已用完，请基于已有信息回答。"
+            files = self._files(wxid, limit)
+        except Exception as e:
+            return _db_fail("查文件", e)
+        if not files:
+            return (f"在「{nm}」最近的聊天里没找到文件消息。\n"
+                    f"（只扫最近几百条消息，更早的文件可能没覆盖到。）")
+
+        is_group = wxid.endswith("@chatroom")
+        lines = [f"「{nm}」最近的文件（{len(files)} 份）："]
+        viewable = 0
+        for m in files:
+            who = "我" if m.get("is_self") else ("群成员" if is_group else nm)
+            # locate 要列目录，每个文件只算一次
+            path = file_read.locate(m.get("name") or "")
+            viewable += 1 if path else 0
+            size = m.get("size") or 0
+            sz = (f"{size / 1048576:.1f}MB" if size >= 1048576
+                  else f"{max(1, size // 1024)}KB")
+            mark = "本地有、能读" if path else "本地没有、读不了"
+            lines.append(f"- [{m.get('time')}] {who}  local_id={m.get('local_id')}  "
+                         f"{m.get('name')}（{m.get('ext') or '?'}, {sz}）  {mark}")
+        lines.append(f"\n其中 {viewable} 份在本地、能读内容。要读哪份就调 read_file，"
+                     f"带上它的 local_id。只有**你收过的**文件才在本地，发出去的不在。")
+        return "\n".join(lines)
+
+    def t_read_file(self, args):
+        contact = str(args.get("contact") or "").strip()
+        lid = str(args.get("local_id") or "").strip()
+        if not contact or not lid:
+            return "参数不全：需要 contact 和 local_id。"
+        cand, err = self._one(contact)
+        if err:
+            return err
+        wxid = str(cand.get("wxid"))
+        try:
+            # 读文件是本地解析、不额外查库；列表也缓存着，所以不扣预算
+            if wxid not in self._file_cache and not self.budget.take():
+                return "本轮查库次数已用完，请基于已有信息回答。"
+            files = self._files(wxid)
+        except Exception as e:
+            return _db_fail("查文件", e)
+        hit = next((m for m in files if str(m.get("local_id")) == lid), None)
+        if hit is None:
+            return f"在「{contact}」最近的文件里没找到 local_id={lid}。先调 find_files 看列表。"
+
+        name = hit.get("name") or ""
+        path = file_read.locate(name)
+        if not path:
+            return (f"这份文件（{name}）**本地没有，读不了**。微信只把「你收过」的文件"
+                    f"存在本地。请如实告诉用户「这份我这边没有」，**不要编内容**。")
+        text, err = file_read.extract(path, self.cfg)
+        if err:
+            return f"「{name}」读不了：{err}\n请如实告诉用户，**不要编内容**。"
+        return (f"[{hit.get('time')} 收到的文件：{name}]\n{text}\n"
+                f"（文件共 {hit.get('size') or '?'} 字节，上面是提取出的文字）")
 
     def t_pending_replies(self, args):
         limit = int(args.get("limit") or 20)

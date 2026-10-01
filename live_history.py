@@ -668,6 +668,73 @@ def v4_images(client, talker, limit=30):
     return picked
 
 
+# 文件消息：appmsg 子类型 6 → local_type = (6<<32)|49（实测值，和图片的 5 同理）
+_V4_FILE_TYPE = (6 << 32) | 49
+# 只按主键倒序取最近这么多条，再在 Python 里筛出文件。
+# **不能**写 `WHERE local_type = <上面这个> ORDER BY local_id DESC LIMIT n`：
+# local_type 没索引、文件又稀疏，碰上一个文件都没有的会话会一路扫到底
+# —— 正是 CLAUDE.md 点名禁止的那种查询。
+_V4_FILE_SCAN = 400
+
+
+def v4_files(client, talker, limit=20, scan=_V4_FILE_SCAN):
+    """该会话**最近收到的文件**：文件名 / 后缀 / 大小 / 谁发的。
+
+    文件名就在 appmsg XML 的 `<title>` 里，和磁盘上 `msg/file/<月>/` 里的文件名
+    **一致**（实测逐字吻合），所以拿到名字就能去本地找原文件（见 file_read.locate）。
+
+    分两步查：先只取小列筛出文件行，再按 local_id 批量取 message_content ——
+    一次把 400 条的 message_content 全拉回来太占带宽（每条约几 KB）。
+    """
+    table = _v4_table_for(talker)
+    out = []
+    for db in _v4_msg_dbs(client):
+        self_id = _v4_self_rowid(client, db)
+        try:
+            rows = _query(client, db,
+                          f"SELECT local_id, local_type, real_sender_id, create_time "
+                          f"FROM {table} ORDER BY local_id DESC LIMIT {int(scan)}")
+        except Exception:
+            continue  # 这个分片里没有该会话的表
+
+        meta = {}
+        for r in rows:
+            if _as_int(_pick(r, "local_type", 1)) != _V4_FILE_TYPE:
+                continue
+            lid = str(_pick(r, "local_id", 0))
+            ct = _pick(r, "create_time", 3)
+            meta[lid] = {
+                "talker": talker, "local_id": lid,
+                "time": _fmt_time(ct), "_ts": _as_int(ct),
+                "is_self": 1 if (self_id is not None
+                                 and _as_int(_pick(r, "real_sender_id", 2)) == self_id) else 0,
+            }
+        if not meta:
+            break
+        ids = ",".join(sorted(meta, key=lambda x: -int(x))[:max(1, limit)])
+        try:
+            found = _query(client, db,
+                           f"SELECT local_id, message_content FROM {table} "
+                           f"WHERE local_id IN ({ids})")
+        except Exception:
+            break
+        for r in found:
+            lid = str(_pick(r, "local_id", 0))
+            if lid not in meta:
+                continue
+            xml = decode_msg_content(_pick(r, "message_content", 1))
+            name = _xml_field(xml, "title")
+            if not name:
+                continue
+            meta[lid]["name"] = name
+            meta[lid]["ext"] = _xml_field(xml, "fileext").lower()
+            meta[lid]["size"] = _as_int(_xml_field(xml, "totallen"))
+            out.append(meta[lid])
+        break
+    out.sort(key=lambda m: m["_ts"])
+    return out[-limit:]
+
+
 # ---------- 微信 4.x 全文检索（message_fts.db） ----------
 #
 # 微信自己给消息建了 fts5 全文索引，用它的自研分词器 MMFtsTokenizer：

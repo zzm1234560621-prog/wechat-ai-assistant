@@ -6,6 +6,9 @@ wcferry>=39.4.4
 anthropic>=0.40.0
 setuptools<81
 PyYAML>=6.0
+# 读微信里收到的 PDF 用（find_files / read_file）。纯 Python、无编译依赖，
+# 不和上面几家打架。docx/xlsx/pptx 不用库——都是 zip+xml，标准库就能扒。
+pypdf>=4.0
 # pywxdump 仅 export_history.py 手动导出时才需要；它强锁 protobuf==3.10.0，
 # 与 wcferry 的 grpcio-tools 冲突会导致安装失败，故不随主程序安装。
 # 需要手动导出时再单独装：pip install pywxdump
