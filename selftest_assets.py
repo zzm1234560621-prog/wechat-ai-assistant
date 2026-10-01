@@ -122,6 +122,13 @@ def _item(lid, kind="图片", xml=XML_IMG, ts=1000.0, talker=CHAT):
             "xml": xml, "image": None, "msg_time": "", "ts": ts}
 
 
+def _write(path, data=b"\x89PNG\r\n\x1a\n0123"):
+    """造一个「明文图片文件」，用来验明文那条路（只要文件真实存在就够）。"""
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 # ------------------------------------------------------- 1. media_kind
 
 def test_media_kind():
@@ -231,15 +238,37 @@ def test_store(tmp):
     check("形状不对也当空的用", assets.load(p) == [])
     with open(p, "w", encoding="utf-8") as f:
         json.dump({"items": [{"kind": "图片"}, _item(9)]}, f)
-    check("没有 xml 的条目读出来时丢掉（存了也发不出去）",
+    check("既没有 xml 也没有明文的条目读出来时丢掉（存了也发不出去）",
           [i["local_id"] for i in assets.load(p)] == ["9"])
+
+    # 明文条目（Route C）：只有 path、没有 xml，也必须能读回来、也必须发得出去
+    img = _write(os.path.join(tmp, "明文图.jpg"))
+    if os.path.exists(p):
+        os.remove(p)
+    items, added, dropped = assets.stash(
+        assets.entry_from_file(img, kind="图片", talker=CHAT, local_id=""), path=p)
+    check("没有 xml、只有明文路径的素材能存进去", added and len(items) == 1, items)
+    check("读回来时不被丢掉（明文是唯一发得出去的东西）",
+          len(assets.load(p)) == 1)
+    check("plaintext_of 认到明文文件", assets.plaintext_of(items[-1]) == img)
+    check("明文路径不存在时 plaintext_of 返回空（缓存会被清理，别让 send_image 撞空路径）",
+          assets.plaintext_of({"path": os.path.join(tmp, "没有这个.jpg")}) == "")
+    check("明文优先于缩略图",
+          assets.plaintext_of({"path": img, "image": "C:/x.jpg"}) == img)
+
+    # 没有 local_id 的两条明文素材**不许互相顶掉**（去重键要按文件名退一步）
+    img2 = _write(os.path.join(tmp, "明文图2.jpg"), b"\xff\xd8\xff\xd9")
+    items, added, dropped = assets.stash(
+        assets.entry_from_file(img2, kind="图片", talker=CHAT, local_id=""), path=p)
+    check("两条没有 local_id 的明文素材不会互相顶掉",
+          len(items) == 2 and dropped == 0, items)
 
     try:
         assets.stash({"kind": "图片", "local_id": "1"}, path=p)
         raised = False
     except ValueError:
         raised = True
-    check("没有 xml 的条目直接拒绝存", raised)
+    check("既没有 xml 也没有明文的条目直接拒绝存", raised)
 
     e = assets.entry_from_media(
         {"kind": "图片", "talker": CHAT, "local_id": "5", "local_type": 3,
@@ -257,7 +286,7 @@ def _contacts():
 
 
 def test_send_asset(tmp):
-    print("\n── send_asset：名单内直接发 / 名单外待确认 / 连发闸 / 空暂存区 ──")
+    print("\n── send_asset：明文才发得出去 / 只有消息引用必须如实拒绝 ──")
     p = os.path.join(tmp, "assets_send.json")
     real_path = assets.PATH
     assets.PATH = p
@@ -272,28 +301,42 @@ def test_send_asset(tmp):
         check("空暂存区：一条都没发", cli.calls == [])
         check("空暂存区：也没登记待确认", agent_tools.list_pending(CHAT) == [])
 
+        # 只有 xml（转发接口在真机上会把微信搞崩、已禁用）→ 如实拒绝，一条都不发
         assets.stash(_item(1, xml=XML_OLD, ts=1000.0), path=p)
-        assets.stash(_item(2, xml=XML_IMG, ts=1001.0), path=p)
+        cli = _Rec()
+        box = _box(_cfg(), _contacts(), cli)
+        out = box.run("send_asset", {"to": "张三"})
+        check("只有消息引用：如实说发不了",
+              "只有**原始消息引用**" in out and "发不了" in out, out)
+        check("只有消息引用：一条都没发", cli.calls == [])
+        check("只有消息引用：也没登记待确认", agent_tools.list_pending(CHAT) == [])
+        check("拒绝时给了能走通的办法（以「文件」方式再发一次）", "文件" in out, out)
 
-        # 名单内：直接转发，发的是**最近那条**的 XML
+        # 明文素材（两张，用来验 which / count）
+        img_old = _write(os.path.join(tmp, "发1.jpg"))
+        img_new = _write(os.path.join(tmp, "发2.jpg"), b"\xff\xd8\xff\xdb1234")
+        assets.stash(assets.entry_from_file(img_old, talker=CHAT), path=p)
+        assets.stash(assets.entry_from_file(img_new, talker=CHAT), path=p)
+
+        # 名单内：直接发明文（send_image），发的是**最近那条**
         cli = _Rec()
         box = _box(_cfg(), _contacts(), cli)
         agent_tools._SENT_IMAGE.clear()
         out = box.run("send_asset", {"to": "张三"})
-        check("名单内直接发", len(cli.calls) == 1 and cli.calls[0][0] == "xml")
-        check("发的是最近那条的原始 XML（原样，不改一个字节）",
-              cli.calls[0][2] == XML_IMG)
+        check("名单内直接发：走 send_image（不是 send_xml）",
+              len(cli.calls) == 1 and cli.calls[0][0] == "image", cli.calls)
+        check("发的是最近那条明文文件", cli.calls[0][2] == img_new)
         check("发给正确的 wxid", cli.calls[0][1] == "wxid_zhangsan")
         check("回话说人话（不出现 wxid）",
               "已把那张图发给 张三。" == out and "wxid" not in out, out)
-        check("转发也算「我刚发过图」——回显不该被当成新消息（转发给自己时尤其明显）",
+        check("发图也算「我刚发过图」——回显不该被当成新消息",
               "wxid_zhangsan" in agent_tools._SENT_IMAGE)
 
-        # 指定第 2 张
+        # 指定第 2 张（第 1 张是 img_new、第 2 张是 img_old）
         cli = _Rec()
         box = _box(_cfg(), _contacts(), cli)
         out = box.run("send_asset", {"to": "张三", "which": 2})
-        check("which=2 发的是更早那张", cli.calls[0][2] == XML_OLD)
+        check("which=2 发的是更早那张", cli.calls[0][2] == img_old)
         check("which=2 的回话带编号", "第 2 张图" in out, out)
 
         # 连发：受 max_send_count 钳制（配置 2，模型填 7）
@@ -304,7 +347,6 @@ def test_send_asset(tmp):
         check("连发回话说明发了 2 次", "连发 2 次" in out, out)
 
         # 发到一半失败：必须带上「已经发出 N 条」（发消息不可逆）
-        # boom_at=3：前两次成功，第三次抛 —— 也就是「已经发出 2 条」。
         cli = _Rec(boom_at=3)
         box = _box(_cfg(max_send_count=5), _contacts(), cli)
         out = box.run("send_asset", {"to": "张三", "count": 3})
@@ -312,31 +354,30 @@ def test_send_asset(tmp):
         check("中途失败：没有走「一条都没发」那个分支",
               "这条还没有发出去" not in out, out)
 
-        # 名单外：只登记待确认，带 label（用户才知道要发哪一条）
+        # 名单外：只登记待确认（图片按「一串路径」连发）
         cli = _Rec()
         box = _box(_cfg(max_send_count=5), _contacts(), cli)
         out = box.run("send_asset", {"to": "李四", "count": 3})
         check("名单外一条都没发", cli.calls == [])
         pend = agent_tools.list_pending(CHAT)
         check("登记了一条待确认", len(pend) == 1)
-        check("待确认带 label + xml + count（确认后要连发 3 次）",
+        check("待确认带 label + 3 份明文路径 + count（确认后连发 3 次）",
               pend and pend[0].get("label") == "那张图"
-              and pend[0].get("xml") == XML_IMG and pend[0].get("count") == 3, pend)
+              and list(pend[0].get("image") or []) == [img_new] * 3
+              and pend[0].get("count") == 3, pend)
         desc = agent_tools.describe_pending(pend[0])
         check("待确认描述说人话且不含 wxid",
               desc == "发给 李四 那张图", desc)
         check("工具回话让用户回「确认」", "确认" in out and "尚未发送" in out, out)
 
-        # 确认之后：send_pending 对转发认 count（这条是素材那条路的连发）
+        # 确认之后：send_pending 按路径串连发
         cli = _Rec()
         n, err = agent_tools.send_pending(cli, pend[0], interval=0.0)
-        check("确认后按 count 连发 3 次转发", n == 3 and len(cli.calls) == 3 and not err,
-              (n, cli.calls))
-        check("三次发的是同一条 XML", {c[2] for c in cli.calls} == {XML_IMG})
-        check("确认这条路同样记了「我刚发过图」（免得回显又被处理一轮）",
-              "wxid_lisi" in agent_tools._SENT_IMAGE)
+        check("确认后按 count 连发 3 次图片",
+              n == 3 and len(cli.calls) == 3 and not err, (n, cli.calls))
+        check("三次发的是同一个文件", {c[2] for c in cli.calls} == {img_new})
 
-        # 反向保证：forward_message 那条路仍然只发一次（不顺手给它加连发）
+        # 反向保证：forward_message 那条路仍然只发一次（send_pending 的分派没被改坏）
         agent_tools._PENDING.clear()
         agent_tools.set_pending(CHAT, "wxid_zhangsan", "张三", "转发一条消息",
                                 xml=XML_IMG)
@@ -364,50 +405,60 @@ def test_sync_latest(tmp):
     assets.PATH = os.path.join(tmp, "sync_assets.json")
     race1 = "<msg><img md5=\"race1\" /></msg>"
     race2 = "<msg><img md5=\"race2\" /></msg>"
+    thumb = _write(os.path.join(tmp, "补存的明文缩略图.jpg"))
 
-    def _media(lid, ts=2000):
+    def _media(lid, ts=2000, image=None):
         return [{"talker": CHAT, "local_id": str(lid), "local_type": 3, "kind": "图片",
-                 "is_self": 1, "image": None, "time": "", "_ts": ts}]
+                 "is_self": 1, "image": image, "time": "", "_ts": ts}]
 
     try:
-        live_history.latest_media = lambda client, talker, limit=1: _media(77)
-        live_history.message_xml = lambda client, talker, lid: race1
+        # 1) 更新的那条**有明文**（微信缓存的缩略图）-> 补存明文并直接发出去，
+        #    而且**不该去取 XML**（转发已经废了，取它没意义还多一次查库）
+        live_history.latest_media = lambda client, talker, limit=1: _media(77, image=thumb)
+        live_history.message_xml = lambda client, talker, lid: (_ for _ in ()).throw(
+            AssertionError("有明文时不该去取 XML"))
         agent_tools._SENT_IMAGE.clear()
         cli = _Rec()
         box = _box(_cfg(), _contacts(), cli)
         out = box.run("send_asset", {"to": "张三"})
-        check("暂存区空着也能发：先把控制会话里最新那张补存进来",
-              len(cli.calls) == 1 and cli.calls[0][2] == race1, (out, cli.calls))
+        check("暂存区空着也能发：把控制会话里最新那张的**明文**补存进来",
+              len(cli.calls) == 1 and cli.calls[0][0] == "image"
+              and cli.calls[0][2] == thumb, (out, cli.calls))
         check("补存的这条确实进了暂存区",
               [i["local_id"] for i in assets.load()] == ["77"])
 
-        # 暂存区里有一条旧的，控制会话里有更新的 -> 必须发**新的**那条
-        live_history.latest_media = lambda client, talker, limit=1: _media(78)
-        live_history.message_xml = lambda client, talker, lid: race2
-        cli = _Rec()
-        box = _box(_cfg(), _contacts(), cli)
-        out = box.run("send_asset", {"to": "张三"})
-        check("有更新的图时发新的，不发暂存区里那条旧的",
-              len(cli.calls) == 1 and cli.calls[0][2] == race2, (out, cli.calls))
-
-        # 更新的那张取不到原始 XML -> 一张都不发（绝不退回发旧的：那是发错东西）
+        # 2) 更新的那条**没有明文**、XML 也取不到 -> 一张都不发（绝不退回发旧的）
         live_history.latest_media = lambda client, talker, limit=1: _media(79)
         live_history.message_xml = lambda client, talker, lid: ""
         cli = _Rec()
         box = _box(_cfg(), _contacts(), cli)
         out = box.run("send_asset", {"to": "张三"})
-        check("取不到更新的那张就一张都不发（不发旧的那张）",
+        check("既没有明文也没有原文：一张都不发（不发旧的那张）",
               cli.calls == [] and "一张都没发" in out, out)
+        check("这种情况要告诉用户「以文件方式重发一次」", "文件" in out, out)
 
-        # 最新那条是**我自己刚发出去**的回显 -> 不补存，用暂存区里已有的
-        agent_tools.remember_sent_image(CHAT)
-        live_history.latest_media = lambda client, talker, limit=1: _media(80, ts=time.time())
-        live_history.message_xml = lambda client, talker, lid: "<msg>bot</msg>"
+        # 3) 更新的那条没有明文、但有 XML -> 存下引用，但**发不出去要说清楚**
+        live_history.latest_media = lambda client, talker, limit=1: _media(78)
+        live_history.message_xml = lambda client, talker, lid: race2
         cli = _Rec()
         box = _box(_cfg(), _contacts(), cli)
         out = box.run("send_asset", {"to": "张三"})
-        check("最新那条是自己刚发的回显 -> 不补存，发暂存区里已有的",
-              len(cli.calls) == 1 and cli.calls[0][2] == race2, (out, cli.calls))
+        check("只有 XML 的新图：补存引用、但如实说发不了",
+              cli.calls == [] and "只有**原始消息引用**" in out, out)
+
+        # 4) 最新那条是**我自己刚发出去**的回显 -> 不补存，发暂存区里已有的那条明文
+        #    （先把暂存区摆成「最新一条有明文」，否则撞上上一步那条只有引用的——
+        #     那种情况下**拒绝**才是对的：绝不退回发旧图）
+        assets.clear()
+        assets.stash(assets.entry_from_file(thumb, talker=CHAT, local_id="77"))
+        agent_tools.remember_sent_image(CHAT)
+        live_history.latest_media = lambda client, talker, limit=1: _media(
+            80, ts=time.time(), image=thumb)
+        cli = _Rec()
+        box = _box(_cfg(), _contacts(), cli)
+        out = box.run("send_asset", {"to": "张三"})
+        check("最新那条是自己刚发的回显 -> 不补存，发暂存区里已有的明文",
+              len(cli.calls) == 1 and cli.calls[0][2] == thumb, (out, cli.calls))
         agent_tools._SENT_IMAGE.clear()
     finally:
         assets.PATH = real_path

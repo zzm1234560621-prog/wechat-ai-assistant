@@ -126,6 +126,23 @@ namespace WeixinSendXML
     }
 
     // ===== XML字段提取 =====
+
+    // ⚠️ 缺字段一律当 0，**绝不许抛**。
+    //
+    // 以前这里全是 `std::stoi(ExtractBetween(xml, "xxx=\"", "\""))`：字段不在 XML 里时
+    // ExtractBetween 返回空串，`std::stoi("")` 抛 `std::invalid_argument`；而
+    // /ForwardXMLMsg 的路由只把 JSON 解析包在 try 里，异常一路冒到 httplib →
+    // **HTTP 500**。真机实测（2026-10-01）：普通图片消息的 XML **没有 hdlength**
+    // （自己发出去的图连 md5 / cdnbigimgurl 也没有），于是「转发图片」这条接口
+    // 100% 打不通，而且报的是没头没脑的 500。
+    // 缺一个可选字段不该让整条路废掉——转发靠的是别的字段。
+    inline int ToIntSafe(const std::string& s)
+    {
+        if (s.empty()) return 0;
+        try { return std::stoi(s); }
+        catch (...) { return 0; }   // 非数字也一样当 0，不抛
+    }
+
     XmlFields ExtractXmlFields(const std::string& xml, XmlType xmlType)
     {
         XmlFields fields;
@@ -139,31 +156,31 @@ namespace WeixinSendXML
             fields.cdnurl = ExtractBetween(xml, "cdnthumburl=\"", "\"");
             fields.aeskey = ExtractBetween(xml, "aeskey=\"", "\"");
             fields.md5 = ExtractBetween(xml, "md5=\"", "\"");
-            fields.hdlength = std::stoi(ExtractBetween(xml, "hdlength=\"", "\""));
-            fields.length = std::stoi(ExtractBetween(xml, "length=\"", "\""));
-            fields.hevc_mid_size = std::stoi(ExtractBetween(xml, "hevc_mid_size=\"", "\""));
-            fields.cdnthumblength = std::stoi(ExtractBetween(xml, "cdnthumblength=\"", "\""));
-            fields.cdnthumbwidth = std::stoi(ExtractBetween(xml, "cdnthumbwidth=\"", "\""));
-            fields.cdnthumbheight = std::stoi(ExtractBetween(xml, "cdnthumbheight=\"", "\""));
+            fields.hdlength = ToIntSafe(ExtractBetween(xml, "hdlength=\"", "\""));
+            fields.length = ToIntSafe(ExtractBetween(xml, "length=\"", "\""));
+            fields.hevc_mid_size = ToIntSafe(ExtractBetween(xml, "hevc_mid_size=\"", "\""));
+            fields.cdnthumblength = ToIntSafe(ExtractBetween(xml, "cdnthumblength=\"", "\""));
+            fields.cdnthumbwidth = ToIntSafe(ExtractBetween(xml, "cdnthumbwidth=\"", "\""));
+            fields.cdnthumbheight = ToIntSafe(ExtractBetween(xml, "cdnthumbheight=\"", "\""));
             break;
 
         case XmlType::VIDEO:
             fields.cdnurl = ExtractBetween(xml, "cdnthumburl=\"", "\"");
             fields.aeskey = ExtractBetween(xml, "aeskey=\"", "\"");
             fields.md5 = ExtractBetween(xml, "md5=\"", "\"");
-            fields.playlength = std::stoi(ExtractBetween(xml, "playlength=\"", "\""));
-            fields.length = std::stoi(ExtractBetween(xml, "length=\"", "\""));
-            fields.cdnthumblength = std::stoi(ExtractBetween(xml, "cdnthumblength=\"", "\""));
-            fields.cdnthumbwidth = std::stoi(ExtractBetween(xml, "cdnthumbwidth=\"", "\""));
-            fields.cdnthumbheight = std::stoi(ExtractBetween(xml, "cdnthumbheight=\"", "\""));
+            fields.playlength = ToIntSafe(ExtractBetween(xml, "playlength=\"", "\""));
+            fields.length = ToIntSafe(ExtractBetween(xml, "length=\"", "\""));
+            fields.cdnthumblength = ToIntSafe(ExtractBetween(xml, "cdnthumblength=\"", "\""));
+            fields.cdnthumbwidth = ToIntSafe(ExtractBetween(xml, "cdnthumbwidth=\"", "\""));
+            fields.cdnthumbheight = ToIntSafe(ExtractBetween(xml, "cdnthumbheight=\"", "\""));
             break;
 
         case XmlType::ANIMATION:
             fields.md5 = ExtractBetween(xml, "md5=\"", "\"");
-            fields.length = std::stoi(ExtractBetween(xml, "len=\"", "\""));
-            fields.type = std::stoi(ExtractBetween(xml, "type=\"", "\""));
-            fields.width = std::stoi(ExtractBetween(xml, "width=\"", "\""));
-            fields.height = std::stoi(ExtractBetween(xml, "height=\"", "\""));
+            fields.length = ToIntSafe(ExtractBetween(xml, "len=\"", "\""));
+            fields.type = ToIntSafe(ExtractBetween(xml, "type=\"", "\""));
+            fields.width = ToIntSafe(ExtractBetween(xml, "width=\"", "\""));
+            fields.height = ToIntSafe(ExtractBetween(xml, "height=\"", "\""));
             fields.productid = ExtractBetween(xml, "productid=\"", "\"");
             break;
 
@@ -534,6 +551,31 @@ namespace WeixinSendXML
             // 不支持的类型
             return false;
         }
+
+        // ⚠️⚠️ 2026-10-01 23:0x 真机实测：**这一段调用会把微信进程带崩，不要打开。**
+        //
+        // 事实经过：上面 ExtractXmlFields 的 std::stoi("") 一直抛异常（图片 XML 缺
+        // hdlength），所以「转发图片」从来只回 HTTP 500、**代码从没走到下面这段**。
+        // 把解析修成安全版之后，请求真的走到了这里 —— 结果是微信进程当场消失：
+        // /ForwardXMLMsg 请求发出后 30001 立刻断开（WinError 10054），
+        // Weixin 进程没了、连 crashinfo 的 .dmp 都没留。
+        // 也就是说：修好解析等于把「报 500」升级成「崩微信」，比原来更糟。
+        //
+        // 下面这段是「手搓 C++ 对象 + 硬编码 vtable/偏移 + 裸调
+        // g_weixinBase + Offsets::FORWARD_XML_CALL」，在这版微信上**没有被验证过**。
+        // 两个已知可疑点（谁要接手先看这两条）：
+        //   ① Memory::Allocate 用的是 VirtualAlloc，不是 CRT 堆；这些字符串对象如果
+        //      被微信析构（作者自己也发现「这里清理的话会崩溃」，所以干脆全不释放）
+        //      → 用 heap free 去释放 VirtualAlloc 内存 = 堆损坏；
+        //   ② FORWARD_XML_CALL / IMAGE_DATA_VTABLE 等偏移可能对本版微信已经过期
+        //      （同项目里 dec_pic_call 就有过一模一样的先例）。
+        //
+        // 所以现在**安全拒绝**：返回 false → 路由回 ret=1/fail → 上层（bot）
+        // 如实报「转发不了」。绝不允许再让微信消失一次。
+        // 要重新打开：先重新定位偏移（或用调试器动态确认），再**在微信窗口里盯着**
+        // 一个一个验证；每崩一次都要重新扫码登录，别盲目重试。
+        // 上面 ToIntSafe 的修复**保留**——那是真 bug，将来这条路能跑时还需要它。
+        return false;
 
         // 提取XML字段
         XmlFields fields = ExtractXmlFields(xml, xmlType);

@@ -47,15 +47,25 @@ def _warn(msg):
 
 
 def _key(item):
-    return (str((item or {}).get("talker") or ""),
-            str((item or {}).get("local_id") or ""))
+    """素材的去重键。**有 local_id 用 local_id，没有就用文件名**。
+
+    为什么不能只看 `(talker, local_id)`：明文文件那条路（Route C）的素材**可能没有
+    local_id**（用户以「文件」方式发来的图，我们按文件名定位），全都算成
+    `(talker, "")` 会互相顶掉——第二条一进来就把第一条当重复删了。
+    """
+    t = str((item or {}).get("talker") or "")
+    lid = str((item or {}).get("local_id") or "")
+    if lid:
+        return (t, "id:" + lid)
+    return (t, "path:" + os.path.basename(str((item or {}).get("path") or "")))
 
 
 def load(path=None):
     """读暂存区，返回列表（**最新的在末尾**）。文件不在/坏了 -> 空列表 + 告警。
 
-    只保留带 xml 的条目：没有 xml 就转发不了，留在列表里只会让「发给谁」
-    拿到一条发不出去的东西。
+    只留**发得出去**的条目：`xml`（原始消息引用，等 hook 的转发修好才有用）或
+    `path`（明文图片文件，Route C，用已验证的 send_image 发）。两样都没有的条目
+    留在列表里只会让「发给谁」拿到一个发不出去的东西。
     """
     p = path or PATH
     try:
@@ -70,7 +80,8 @@ def load(path=None):
     if not isinstance(items, list):
         _warn(f"{p} 里的形状不对（不是列表），这次当空的用。")
         return []
-    return [it for it in items if isinstance(it, dict) and it.get("xml")]
+    return [it for it in items
+            if isinstance(it, dict) and (it.get("xml") or it.get("path"))]
 
 
 def save(items, path=None):
@@ -93,9 +104,9 @@ def save(items, path=None):
 def entry_from_media(m, xml, now=None):
     """`live_history.latest_media()` 的一行 + 原始 XML -> 一条暂存素材。
 
-    `image`（微信的明文缩略图，可能为 None）只是**备查**，不参与发送：
-    发送永远走 xml。存下来是因为万一以后要换成「发缩略图」那条路，
-    不用让用户重新发一遍。
+    `image`（微信的明文缩略图，可能为 None）在这条路上**也是能发的**：
+    转发接口坏掉之后（见 `wx_send_xml.cpp` 里那段「安全拒绝」的注释），
+    发图只能靠明文，所以 `plaintext_of()` 会优先用它。
     """
     return {
         "kind": str((m or {}).get("kind") or ""),
@@ -104,23 +115,62 @@ def entry_from_media(m, xml, now=None):
         "local_type": (m or {}).get("local_type"),
         "xml": xml,
         "image": (m or {}).get("image"),
+        "path": "",
+        "source": "xml" if xml else "",
         "msg_time": (m or {}).get("time") or "",
         "ts": float(now if now is not None else time.time()),
     }
 
 
+def entry_from_file(path, kind="图片", talker="", local_id="", now=None):
+    """把一份**明文图片文件**收成素材（转发坏掉之后唯一真正发得出去的来源）。
+
+    `path` 必须是**微信自己落盘的明文**（`msg/file/<月>/<原名>`），由调用方用
+    `file_read.locate()` 解析出来——**不接受任何从模型/聊天内容里来的路径**。
+    """
+    p = str(path or "")
+    return {
+        "kind": str(kind or "图片"),
+        "talker": str(talker or ""),
+        "local_id": str(local_id or ""),
+        "local_type": None,
+        "xml": "",
+        "image": None,
+        "path": p,
+        "source": "file",
+        "name": os.path.basename(p),
+        "msg_time": "",
+        "ts": float(now if now is not None else time.time()),
+    }
+
+
+def plaintext_of(item):
+    """这条素材有没有**能直接发出去的明文图片**。没有返回 ""。
+
+    优先 `path`（原图），退到 `image`（微信缓存的缩略图）。
+    **只认真的还在磁盘上的文件**——微信的缓存会被清理，条目还在、文件没了的情况
+    必须让它发不出去（如实报错），而不是让 send_image 去撞一个不存在的路径。
+    """
+    for k in ("path", "image"):
+        p = str((item or {}).get(k) or "")
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
 def stash(item, cap=CAP_DEFAULT, path=None):
     """放一条素材进去并落盘。返回 (items, added, dropped)。
 
-    * `added=False`：这条已经在暂存区里（同会话同 local_id）——同一张图被重复报
-      上来（重启后游标回退、补漏路径重放）不会叠成两条，也不会白占一格。
+    * `added=False`：这条已经在暂存区里（同会话同 local_id，没有 id 时按文件名）——
+      同一张图被重复报上来（重启后游标回退、补漏路径重放）不会叠成两条。
     * `dropped`：这次顶掉了最老的几条（容量是用户定的，静默丢弃不允许——调用方
       要把这件事说出来）。
-    * 没有 xml 或 local_id 的条目**直接拒绝**（抛 ValueError）：那种条目存下去也
+    * 既没有 xml 也没有明文路径的条目**直接拒绝**（抛 ValueError）：那种条目存下去也
       转发不了，混进暂存区等于让后面「发给谁」拿到一个发不出去的东西。
     """
-    if not (item or {}).get("xml") or not str((item or {}).get("local_id") or ""):
-        raise ValueError("素材没有 xml 或 local_id，不存")
+    it = item or {}
+    if not (it.get("xml") or it.get("path")):
+        raise ValueError("素材既没有 xml 也没有明文路径，不存")
 
     items = load(path)
     dup = any(_key(it) == _key(item) for it in items)
