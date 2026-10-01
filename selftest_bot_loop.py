@@ -11,6 +11,8 @@
 
 跑法：.venv/Scripts/python.exe selftest_bot_loop.py
 """
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -24,6 +26,7 @@ if HERE not in sys.path:
 import agent_tools                      # noqa: E402
 import auto_reply                       # noqa: E402
 import bot                              # noqa: E402
+import image_cache                      # noqa: E402
 
 _OK = 0
 _FAIL = 0
@@ -276,6 +279,163 @@ def t_speaker_no_id_leak():
         "查得到就照常显示名字（没把功能改坏）")
 
 
+class _BatchMsg:
+    """够 iter_aixed_messages 用就行（它只负责把 poll 结果 yield 出去）。"""
+
+    def __init__(self, n):
+        self.n = n
+        self.talker = "wxid_t"
+        self.content = f"msg{n}"
+        self.is_self = 0
+        self.create_time = int(time.time())
+
+    @property
+    def type(self):
+        return 1
+
+    @property
+    def sender(self):
+        return self.talker
+
+
+class _OneBatchClient:
+    """第一次 poll 返回一批 N 条，之后永远返回空批。"""
+
+    def __init__(self, n=3):
+        self._batch = [_BatchMsg(i) for i in range(1, n + 1)]
+        self._first = True
+
+    def prime(self):
+        return {"t": 0}, {}
+
+    def poll_messages(self, since=None, seen=None):
+        if self._first:
+            self._first = False
+            return list(self._batch), since, seen
+        time.sleep(0.005)
+        return [], since, seen
+
+
+def t_batch_survives_consumer_error(tmp):
+    """消费者抛异常**不会**丢掉本批剩余消息。
+
+    复核者曾把这条报成「理论丢消息」：说异常会在 yield 点倒灌回生成器、把它终止。
+    实测不成立——挂起的生成器只要还被引用就活着，下一次 next() 会继续把本批发完。
+    这个性质是「一条消息处理失败不至于连累同批其它消息」的前提，值得钉住。
+    """
+    sec("收消息通道：一条消息处理失败不连累同批其它消息")
+    old_path, old_state = bot.STATE_PATH, bot._STATE
+    try:
+        bot.STATE_PATH = os.path.join(tmp, "state.json")
+        bot._STATE = None
+        src = bot.iter_aixed_messages(_OneBatchClient(3), 5, tick=None)
+        got = [next(src).n, next(src).n]          # 1, 2
+        # 模拟消费者在处理第 2 条时抛异常（会冒到主循环的外层守护）
+        try:
+            raise RuntimeError("消费者处理这一条时炸了")
+        except RuntimeError:
+            pass
+        got.append(next(src).n)                   # 第 3 条必须还在
+        chk(got == [1, 2, 3],
+            f"消费者抛异常后本批剩余消息仍在（期望 [1,2,3]，实际 {got}）")
+    finally:
+        bot.STATE_PATH, bot._STATE = old_path, old_state
+
+
+def t_poll_failure_throttled(tmp):
+    """轮询持续失败**不许刷屏**（实测过 2 分钟刷 5.4MB 的 traceback）。"""
+    sec("轮询失败节流：不静默、也不刷屏")
+
+    class _BoomThenMsg:
+        """前 fails 次 poll 抛异常，之后返回一条消息（让 next() 能返回，测试有界）。"""
+
+        def __init__(self, fails=300):
+            self.fails = fails
+            self.calls = 0
+
+        def prime(self):
+            return {"t": 0}, {}
+
+        def poll_messages(self, since=None, seen=None):
+            self.calls += 1
+            if self.calls <= self.fails:
+                raise ValueError("模拟每次查询都炸")
+            return [_BatchMsg(9)], since, seen
+
+    old_path, old_state = bot.STATE_PATH, bot._STATE
+    try:
+        bot.STATE_PATH = os.path.join(tmp, "state.json")
+        bot._STATE = None
+        c = _BoomThenMsg(fails=300)
+        src = bot.iter_aixed_messages(c, 0.001, tick=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            got = next(src).n          # 300 次失败之后才拿到这条
+        text = buf.getvalue()
+        tb = text.count("Traceback (most recent call last)")
+        warns = text.count("轮询第")
+        chk(got == 9, "失败恢复后消息照常送达")
+        chk(c.calls >= 300, f"确实连续失败了 300 轮（{c.calls} 次轮询）")
+        chk(1 <= tb <= 12,
+            f"traceback 被节流：300 轮失败只打了 {tb} 条（不节流会是 300 条）")
+        chk(1 <= warns <= 12,
+            f"失败告警被节流：{warns} 条（首次仍会如实记录，之后按 10/50/每 50 次）")
+    finally:
+        bot.STATE_PATH, bot._STATE = old_path, old_state
+
+
+def t_image_dirs_union(tmp):
+    """白名单是**并集**：用户配的目录 + 默认的图片缓存根（不是顶掉默认）。
+
+    真机自检撞出来的：用户为了自测加了 `test_images`，旧实现（配了就顶掉默认）
+    就让他**静默地**再也发不出聊天里的图。改成并集，并要求打一条告警说明「两处都能发」。
+    """
+    sec("发图白名单：用户配的目录加在默认之上（并集）")
+    user_dir = os.path.join(tmp, "user_images")
+    cache_root = os.path.join(tmp, "acct", "cache")
+    data_root = os.path.join(tmp, "xwechat_files")
+    for d in (user_dir, cache_root, data_root):
+        os.makedirs(d, exist_ok=True)
+
+    orig_cache = image_cache.image_cache_dirs
+    orig_root = image_cache.data_root
+    orig_w = agent_tools._WARNED_IMAGE_DIRS[0]
+    try:
+        image_cache.image_cache_dirs = lambda: [cache_root]
+        # 配了目录 → 两个都在（这就是「并集」）
+        dirs = agent_tools.allowed_image_dirs({"agent": {"send_image_dirs": [user_dir]}})
+        chk(user_dir in dirs, "用户配的目录在允许列表里")
+        chk(cache_root in dirs, "**默认的图片缓存根也在**（旧实现会把它顶掉）")
+        # 没配 → 只有默认
+        chk(agent_tools.allowed_image_dirs({}) == [cache_root],
+            "没配 send_image_dirs 时只放默认的缓存根")
+        # 配了目录要有一条明说「两处都能发」的告警
+        agent_tools._WARNED_IMAGE_DIRS[0] = False
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            agent_tools.allowed_image_dirs({"agent": {"send_image_dirs": [user_dir]}})
+        chk("两处都能发" in buf.getvalue(),
+            "配了目录时明确告警「白名单 = 你配的 + 默认缓存根」（边界要让人知道）")
+        # 推不出缓存根 → 退回 data_root 并告警
+        image_cache.image_cache_dirs = lambda: []
+        image_cache.data_root = lambda: data_root
+        agent_tools._WARNED_IMAGE_ROOT[0] = False
+        buf2 = io.StringIO()
+        with contextlib.redirect_stderr(buf2):
+            dirs2 = agent_tools.allowed_image_dirs({"agent": {"send_image_dirs": [user_dir]}})
+        chk(data_root in dirs2, "推不出缓存根时退回 data_root")
+        chk("放宽到整个微信数据根目录" in buf2.getvalue(), "放宽必须告警（不许静默）")
+        # 连数据根都没有 → 至少尊重用户配的目录（空列表 = 什么都不许发）
+        image_cache.data_root = lambda: None
+        chk(agent_tools.allowed_image_dirs({"agent": {"send_image_dirs": [user_dir]}}) == [user_dir],
+            "连数据根都推不出时，仍尊重用户配的目录")
+        chk(agent_tools.allowed_image_dirs({}) == [], "全推不出时返回空（调用方如实拒绝，不放行）")
+    finally:
+        image_cache.image_cache_dirs = orig_cache
+        image_cache.data_root = orig_root
+        agent_tools._WARNED_IMAGE_DIRS[0] = orig_w
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -288,6 +448,9 @@ def main():
     try:
         t_state(tmp)
         t_pending_persist(tmp)
+        t_batch_survives_consumer_error(tmp)
+        t_poll_failure_throttled(tmp)
+        t_image_dirs_union(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     t_redact_wiring()

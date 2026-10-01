@@ -540,6 +540,8 @@ _PENDING = {}
 # 发图白名单「兜底放宽」的告警只打一次：这不是会重复的噪音，
 # 而是一条**必须让用户看见**的事实（默认白名单被放宽到整个微信数据根目录）。
 _WARNED_IMAGE_ROOT = [False]
+# 用户配了 send_image_dirs 时那条「白名单 = 你配的 + 默认缓存根」的告警只打一次
+_WARNED_IMAGE_DIRS = [False]
 
 
 def _warn(msg):
@@ -554,12 +556,17 @@ def _warn(msg):
 def allowed_image_dirs(cfg):
     """解析出「发图允许的根目录」列表。**登记和发送两处都走它**，避免两套判定。
 
-    顺序：
-      1. 用户配的 `agent.send_image_dirs`（写好一个就用它，绝对路径化）；
-      2. 否则用**真正的图片缓存根目录** `image_cache.image_cache_dirs()`
-         （即 `<账号>/cache`，本模块扫缩略图的那个目录）；
-      3. 推不出来时才退回 `image_cache.data_root()`（整个微信数据目录），
-         并**向 stderr 打一条明确告警**。
+    规则（**这是安全边界，改之前先读 CLAUDE.md**）：
+      1. **默认**（用户没配）放行**真正的图片缓存根** `<账号>/cache` ——
+         也就是「聊天里已有的图」，**不是**整个微信数据目录；
+      2. 用户在 `agent.send_image_dirs` 里配的目录 **加在默认之上**：
+         CLAUDE.md 的原话是「要加目录让用户改 `agent.send_image_dirs`」——是**加**，
+         不是「换一份名单」。**以前这里是「配了就顶掉默认」**，后果是真机自检里
+         撞出来的：用户为了自测写了个 `test_images`，就**再也发不出聊天里的图**了，
+         而且它是静默的（只是发图被拒）。所以改成并集，并在配了目录时打一条明说
+         「两处都能发」的告警——边界可以宽，但**用户必须知道它宽在哪**。
+      3. 推不出图片缓存根（没找到 `<账号>/cache`）才退回 `image_cache.data_root()`
+         （整个微信数据目录），并打一条明确告警。
 
     第 3 条是兜底，不是默认姿势：宁可放宽并**说清楚**，也不许静默放宽，
     更不许因为推不出来就变成「什么都不许发」把功能弄坏（那是最坏的一种
@@ -569,14 +576,21 @@ def allowed_image_dirs(cfg):
     raw = agent_cfg.get("send_image_dirs") or []
     if isinstance(raw, str):        # 写成单个字符串的 YAML 不算错，按一个目录处理
         raw = [raw]
-    dirs = [os.path.abspath(os.path.expanduser(str(d)))
-            for d in raw if str(d).strip()]
-    if dirs:
-        return dirs
+    user_dirs = [os.path.abspath(os.path.expanduser(str(d)))
+                 for d in raw if str(d).strip()]
 
     real = [d for d in image_cache.image_cache_dirs() if d]
     if real:
-        return real
+        out = list(user_dirs)
+        for d in real:
+            if d not in out:
+                out.append(d)
+        if user_dirs and not _WARNED_IMAGE_DIRS[0]:
+            _WARNED_IMAGE_DIRS[0] = True
+            _warn("agent.send_image_dirs 已配置：发图白名单 = 你配的目录（"
+                  + "、".join(user_dirs) + "）**再加上**默认的微信图片缓存根"
+                  "（聊天里已有的图）——两处都能发。")
+        return out
 
     root = image_cache.data_root()
     if root:
@@ -585,8 +599,12 @@ def allowed_image_dirs(cfg):
             _warn("推不出微信图片缓存目录（没找到 <账号>/cache），"
                   f"发图白名单被放宽到整个微信数据根目录：{root}。"
                   "要收紧就在 config.yaml 的 agent.send_image_dirs 里写明目录。")
-        return [os.path.abspath(root)]
-    return []
+        out = list(user_dirs)
+        if os.path.abspath(root) not in out:
+            out.append(os.path.abspath(root))
+        return out
+    # 连数据根都找不到：至少尊重用户自己配的目录（空列表 = 什么都不许发，调用方如实拒绝）
+    return user_dirs
 
 
 def _is_under(path, root):

@@ -1168,6 +1168,7 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
         cursor, seen = client.prime()
     print(f"[bot] 轮询模式：游标 = {cursor}，间隔 {interval}s")
     polls = 0
+    fails = 0          # 连续轮询失败次数（成功一次就清零）
     while True:
         # 每一轮轮询之前先跑一次定时任务：空闲时这个循环每 interval 秒转一圈，
         # 所以定时精度就是 poll_interval（默认 5 秒）。
@@ -1176,10 +1177,21 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
         try:
             msgs, cursor, seen = client.poll_messages(since=cursor, seen=seen)
         except AixedError as e:
-            print(f"[bot] 轮询出错：{e}")
+            # 常见情况（hook 没起来/微信没登录）。**不许每次都刷屏**：
+            # 持续失败时它会每 poll_interval 打一行，一晚上能把日志轮转刷穿。
+            # 按 1/10/50 次打印，之后每 50 次提醒一次——和 live_history._note_poll_error 同一路子。
+            fails += 1
+            if fails in (1, 10, 50) or fails % 50 == 0:
+                print(f"[bot] ⚠️ 轮询第 {fails} 次失败：{e}")
         except Exception:
-            # 以前这里只捕 AixedError，别的异常会被静默吞掉，排查时很难受
-            traceback.print_exc()
+            # 同理：完整 traceback 更不能每轮都刷。
+            # （以前这里只捕 AixedError、别的异常被静默吞掉；现在既不静默、也不刷屏。）
+            fails += 1
+            if fails in (1, 10, 50) or fails % 50 == 0:
+                print(f"[bot] ⚠️ 轮询第 {fails} 次失败（未预期异常）：")
+                traceback.print_exc()
+        else:
+            fails = 0
         # 游标落盘（节流 10 秒一次）
         if time.time() - _LAST_CURSOR_SAVE >= 10:
             _LAST_CURSOR_SAVE = time.time()

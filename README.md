@@ -28,8 +28,14 @@
 | 微信 PC 版本 | 后端 | 状态 |
 |---|---|---|
 | **4.1.10.27** | **aixed hook（`version.dll`）+ `backend: aixed`** | ✅ **主线，推荐** |
-| 3.9.12.51 | wcferry 39.5.2（`backend: wcferry`） | 保留的另一条后端（见下） |
-| 3.9.12.17 | wcferry 39.4.4（`backend: wcferry`） | 保留的另一条后端（见下） |
+| 3.9.12.51 | wcferry **39.5.2.0**（`backend: wcferry`） | 保留的另一条后端（见下） |
+| 3.9.12.17 | wcferry **39.4.5.0**（`backend: wcferry`） | 保留的另一条后端（见下） |
+
+> ⚠️ 上面两条 wcferry 版本号写的是**四段**（PyPI 上的真实形式）。文档里常看到的
+> 三位短号（`39.5.2` / `39.4.4`）**在 PyPI 上不存在**，`pip install wcferry==39.4.4`
+> 会直接 No matching distribution——那是 WeChatFerry 的 **GitHub release** 号，不是
+> wheel 号，两者只在部分版本上重合。对应关系与依据写在 `wechat_version.WX_TO_WCFER`
+> 的注释里；**别凭猜把短号补成 `.0`**。
 | 其它 4.x | — | ❌ hook 偏移不同，会崩。只能装回 4.1.10.27 |
 
 > **「另一条后端」是什么意思**：`config.yaml` 的 `backend` 有两档。`aixed`（4.x 主线，轮询数据库）和 `wcferry`（3.9.x，事件回调，毫秒级）。

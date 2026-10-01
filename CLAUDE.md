@@ -27,6 +27,10 @@
 # 起 bot（正常入口是双击 启动助手.bat；命令行仅用于调试）
 .venv/Scripts/python.exe bot.py
 
+# 真机自检（**必须先停 bot**；只读，脚本自己会拒绝「bot 在跑」的情况）
+# 查：hook/登录态、库结构、游标、联系人、发图白名单、落盘状态与账本
+.venv/Scripts/python.exe verify_real.py
+
 # 看 bot 日志（后台无窗口运行时唯一的信息来源；会自动轮转，见下）
 tail -f bot.log
 ```
@@ -247,7 +251,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **工具返回的文本要顺手告诉模型「该怎么办」。** 查库失败时别只回一句「失败：…」——模型会原地重试，而每次重试都是一次真实的 hook 调用。统一用 `agent_tools._db_fail()`。
 - **往对话记忆里只放原始提问和最终答复**（`bot.dialog_*`），**绝不能放检索到的历史**——那段每轮都重算，记下来等于每轮重发整块历史，token 直接爆。
 - **发消息是不可逆动作**，默认不许乱发：名单外的一律走「待确认」（`agent_tools`）。别绕过这个机制。文本/图片/转发的分派在 `agent_tools.send_pending()`。
-- **`send_image` 的路径必须过 `_image_path_ok()` 白名单**。path 是**模型填的**，不校验就等于让它从你硬盘上挑任意文件发出去。默认白名单是 `image_cache.allowed_image_dirs()` 推出来的**微信图片缓存根**（`<账号>/cache`），**不是整个 `xwechat_files`**（那是 `data_root()`，里面有配置、`db_storage`、收到的文件）；推不出来才退回 `data_root()` 并告警。要加目录让**用户**改 `agent.send_image_dirs`，不要自己改配置绕。`send_images`（按目录群发）走同一个 `_in_allowed_dirs`，别另开一套。
+- **`send_image` 的路径必须过 `_image_path_ok()` 白名单**。path 是**模型填的**，不校验就等于让它从你硬盘上挑任意文件发出去。默认白名单是 `image_cache.allowed_image_dirs()` 推出来的**微信图片缓存根**（`<账号>/cache`），**不是整个 `xwechat_files`**（那是 `data_root()`，里面有配置、`db_storage`、收到的文件）；推不出来才退回 `data_root()` 并告警。用户在 `agent.send_image_dirs` 里配的目录是**加在默认之上**（并集），**不是换一份名单**——以前实现是「配了就顶掉默认」，真机自检里撞出来过：用户为了自测加了个 `test_images`，就**静默地**再也发不出聊天里的图了。改并集时**必须打一条告警**说明「两处都能发」（边界可以宽，但用户得知道宽在哪）。要加目录让**用户**改 `agent.send_image_dirs`，不要自己改配置绕。`send_images`（按目录群发）走同一个 `_in_allowed_dirs`，别另开一套。
 - **这个 hook 只能发文本和图片**（`SendTextMsg` / `SendImgMsg` / `ForwardXMLMsg`，转发也只认图片/视频/动图）。**发不了普通文件**（pdf/Word/Excel 一律不行），转发别人的文件也不行。用户提这类需求时要**如实说做不到**，别含糊、更别假装发了。想加只能改 hook 的 C++ 重编译。
 - **重名不许静默取第一个。** 解析联系人统一走 `ToolBox._one()`，重名时回一句让模型去问用户——静默取第一个会读错人、发错人。
 - **渲染「谁说的」一律用显示名。** 预取路径用 `bot._msg_speaker()`，工具路径用 `agent_tools.speaker_of()` / `format_history_lines()`。**绝不要把 talker（wxid / roomid）原样塞进给模型的文本**——模型会照抄一串 id 给你。这是 2026-10-01「看不到真正的名字」的根因。
