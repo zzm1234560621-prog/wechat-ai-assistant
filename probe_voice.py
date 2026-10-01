@@ -58,19 +58,27 @@ def _audio_accounts():
 
 
 def disk_snapshot():
-    """盘面快照：所有可能的语音文件（路径 → 大小/mtime）。"""
+    """盘面快照：`msg\` 与 `cache\` 下的**所有**文件（路径 → 大小/mtime）。
+
+    ⚠️ **不能只记「有音频后缀」的文件**：微信的媒体多数**没有后缀**
+    （`msg\attach\<md5>\<月>\Rec\<哈希>\Dat\0\<md5>` 这种），只按后缀过滤的话
+    「语音落地了」这件事根本看不见——第一版就是这么错的（只认扩展名）。
+    宁可多记几万个缩略图，也不能漏掉那个无后缀的新文件。
+    """
     out = {}
     for acct in _audio_accounts():
-        for root, _dirs, files in os.walk(acct):
-            for fn in files:
-                if not fn.lower().endswith(AUDIO_EXT):
-                    continue
-                p = os.path.join(root, fn)
-                try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                out[p] = [st.st_size, int(st.st_mtime)]
+        for sub in ("msg", "cache"):
+            base = os.path.join(acct, sub)
+            if not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    out[p] = [st.st_size, int(st.st_mtime)]
     return out
 
 
@@ -139,6 +147,21 @@ def decode_field(name, val):
     elif z:
         shown += "  ← zstd 解出来：\n" + z[:800]
     return raw, shown
+
+
+def voice_in_chat(client, talker, limit=5):
+    """某个会话里的语音（`local_type=34`）。用户场景是「我发在文件传输助手里的」。"""
+    import live_history
+    out = []
+    tbl = live_history._v4_table_for(talker)
+    for db in live_history._v4_msg_dbs(client):
+        sql = (f"SELECT local_id, local_type, create_time, real_sender_id FROM {tbl} "
+               f"WHERE local_type = 34 ORDER BY create_time DESC LIMIT {int(limit)}")
+        try:
+            out += client.query_sql(db, sql)
+        except Exception:
+            continue
+    return out
 
 
 def find_voice_in_msg_tables(client, max_chats=30):
@@ -266,7 +289,7 @@ def main(argv):
             return 2
 
     # ---- 1) 盘面 ----
-    print("\n【1】盘面快照")
+    print("\n【1】盘面快照（msg\\ + cache\\ 下**所有**文件，不限后缀）")
     now = disk_snapshot()
     recs = rec_dirs()
     print(f"  音频类文件：{len(now)} 个")
@@ -320,6 +343,14 @@ def main(argv):
     print("\n【2b】DB：`Msg_` 表里的语音（**fts 里没有语音，必须查这里**）")
     msg_hits = find_voice_in_msg_tables(c)
     print(f"  最近活跃会话里找到 {len(msg_hits)} 条语音")
+
+    # 用户的场景是「我发在文件传输助手里面的」——单独把控制会话挑出来看
+    control = "filehelper"
+    ch_hits = voice_in_chat(c, control)
+    print(f"  控制会话（{control}）里的语音：{len(ch_hits)} 条")
+    for h in ch_hits[:5]:
+        print(f"    local_id={h.get('local_id')} create_time={h.get('create_time')}")
+    msg_hits = msg_hits + [(control, "message_0.db", None, h) for h in ch_hits]
 
     if not found and not msg_hits:
         print("\n【3】结论")

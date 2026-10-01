@@ -34,6 +34,7 @@
   由调用方看魔数判定；判不出来就如实说判不出来。
 """
 import binascii
+import os
 import re
 
 # voiceformat 的取值（社区通说；**待真实文件验证**，所以只用于显示，不用于分支）
@@ -157,6 +158,56 @@ def decrypt_variants(buf, key):
             except Exception:
                 pass
     return out
+
+
+def hash_of(talker):
+    """会话名 → `Msg_<md5>` 里那个 md5（= 微信的 attach 目录名）。"""
+    import hashlib
+    return hashlib.md5(str(talker).encode("utf-8")).hexdigest()
+
+
+def candidate_dirs(talker, account_dirs):
+    """语音**可能**落在哪些目录。不知道确切位置时，就把这几个都找一遍。
+
+    已知：`msg\\attach\\<md5(会话)>\\<年-月>\\Rec\\…` 是媒体目录（图片/富文本在这），
+    但语音**不在那里**（实测那两个有语音的群，`Rec\\` 是空的）。
+    所以这里把「该会话的 attach」「msg\\file」都列上，让按大小的搜索去覆盖。
+    """
+    out = []
+    h = hash_of(talker)
+    for acct in account_dirs or []:
+        for sub in (os.path.join("msg", "attach", h), os.path.join("msg", "attach"),
+                    os.path.join("msg", "file")):
+            p = os.path.join(acct, sub)
+            if os.path.isdir(p) and p not in out:
+                out.append(p)
+    return out
+
+
+def find_payload(dirs, length, tol=64, limit=8):
+    """按 `length`（消息 XML 里的加密字节数）在目录里找候选音频文件。
+
+    为什么按大小找：语音 XML 里**没有文件名**（图片有 `packed_info_data` 可解），
+    所以「大小对得上」是唯一的关联线索。差几字节很正常（容器头 / AES 填充），
+    因此给容差；返回按差距从小到大排序，调用方逐个去 `identify()` + 解码试。
+    """
+    want = int(length or 0)
+    if want <= 0 or not dirs:
+        return []
+    hits = []
+    for d in dirs:
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                p = os.path.join(root, fn)
+                try:
+                    sz = os.path.getsize(p)
+                except OSError:
+                    continue
+                diff = abs(sz - want)
+                if diff <= int(tol):
+                    hits.append({"path": p, "size": sz, "diff": diff})
+    hits.sort(key=lambda h: h["diff"])
+    return hits[:int(limit)]
 
 
 def identify(buf, key):

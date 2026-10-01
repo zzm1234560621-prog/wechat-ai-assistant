@@ -9,7 +9,9 @@
 """
 import binascii
 import os
+import shutil
 import sys
+import tempfile
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 if BASE not in sys.path:
@@ -143,14 +145,118 @@ def t4_to_pcm_honest():
     _ = binascii
 
 
+def t5_find_payload(tmp):
+    sec("按 length 在磁盘上找音频（语音 XML 里**没有文件名**，只能按大小找）")
+    h = tmp
+    exact = os.path.join(h, "a_exact.bin")
+    plus16 = os.path.join(h, "b_plus16.bin")
+    far = os.path.join(h, "c_far.bin")
+    open(exact, "wb").write(b"\0" * 20934)
+    open(plus16, "wb").write(b"\0" * 20950)      # AES 填充多 16 字节很常见
+    open(far, "wb").write(b"\0" * 30000)
+    sub = os.path.join(h, "nested")
+    os.makedirs(sub, exist_ok=True)
+    nested = os.path.join(sub, "d_nested.bin")
+    open(nested, "wb").write(b"\0" * 20935)
+
+    hits = voice_msg.find_payload([h], 20934, tol=64)
+    paths = [x["path"] for x in hits]
+    check("找到大小对得上的候选（含子目录）", exact in paths and nested in paths, paths)
+    check("按差距排序：完全相同的排第一", paths and paths[0] == exact, paths)
+    check("差 16 字节的也算候选", plus16 in paths, paths)
+    check("差太远的不进候选", far not in paths, paths)
+    check("每个候选带 size 和 diff",
+          all("size" in x and "diff" in x for x in hits), hits)
+
+    check("length<=0 → 不找（不返回一堆无关文件）",
+          voice_msg.find_payload([h], 0) == [])
+    check("目录不存在 → 空结果不炸", voice_msg.find_payload([os.path.join(h, "nope")], 20934) == [])
+
+    # md5 是确定的：filehelper 的 attach 目录名可以直接对（不是私事，是公开字符串的哈希）
+    check("hash_of('filehelper') 与真机一致",
+          voice_msg.hash_of("filehelper") == "9e20f478899dc29eb19741386f9343c8",
+          voice_msg.hash_of("filehelper"))
+
+    acct = os.path.join(h, "acct")
+    att = os.path.join(acct, "msg", "attach", voice_msg.hash_of("filehelper"))
+    os.makedirs(att, exist_ok=True)
+    os.makedirs(os.path.join(acct, "msg", "file"), exist_ok=True)
+    dirs = voice_msg.candidate_dirs("filehelper", [acct])
+    check("candidate_dirs 给出该会话的 attach 目录", att in dirs, dirs)
+    check("只列真实存在的目录", all(os.path.isdir(d) for d in dirs), dirs)
+
+
+class _FakeClient:
+    """假客户端：`sqlite_master` 探测一律成功，`Msg_` 查询返回给定行。"""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql_log = []
+
+    def query_sql(self, db, sql):
+        self.sql_log.append((db, sql))
+        if not str(db).startswith("message_"):
+            return []
+        if "sqlite_master" in sql:
+            return [{"name": "Msg_9e20f478899dc29eb19741386f9343c8"}]
+        if "FROM Msg_" in sql:
+            return self.rows
+        return []
+
+
+def t6_voice_info():
+    sec("自动路径第一步：从 DB 取某条语音的 aeskey/时长/格式")
+    import binascii
+    import live_history
+    try:
+        import zstandard
+    except ImportError:
+        check("zstandard 可用（真机 message_content 是 zstd）", False)
+        return
+
+    xml = ('<msg><voicemsg voiceformat="4" voicelength="1470" length="2315" '
+           'aeskey="' + "ab" * 16 + '" fromusername="wxid_fake" /></msg>')
+    blob = zstandard.ZstdCompressor().compress(xml.encode("utf-8"))
+    row = {"local_type": 34, "message_content": binascii.hexlify(blob).decode()}
+
+    info = live_history.voice_info(_FakeClient([row]), "filehelper", 12345)
+    check("认得出这是语音并解析出字段", bool(info) and info.get("format_name") == "silk", info)
+    check("aeskey → 16 字节 key", len(info.get("key_bytes") or b"") == 16, info.get("key_bytes"))
+    check("length / 时长都对", info.get("length_bytes") == 2315
+          and info.get("duration_ms") == 1470, (info.get("length_bytes"), info.get("duration_ms")))
+    check("带上会话和 local_id（后面定位文件要用）",
+          info.get("talker") == "filehelper" and info.get("local_id") == "12345", info)
+
+    # 不是语音：**必须返回 {}**，不许硬当成语音
+    info = live_history.voice_info(_FakeClient([{"local_type": 1, "message_content": ""}]),
+                                   "filehelper", 1)
+    check("普通文本消息 → {}（不硬当语音）", info == {}, info)
+    check("查不到 → {}（不抛异常）",
+          live_history.voice_info(_FakeClient([]), "filehelper", 1) == {})
+    check("参数不全 → {}",
+          live_history.voice_info(_FakeClient([]), "", 0) == {})
+    check("解不出 XML（不是语音格式）→ {}（不硬当语音）",
+          live_history.voice_info(
+              _FakeClient([{"local_type": 34,
+                            "message_content": binascii.hexlify(
+                                zstandard.ZstdCompressor().compress(b"<msg><x/></msg>")).decode()}]),
+              "filehelper", 1) == {})
+
+
 def main():
     print("=" * 60)
     print("语音条逆向工具 voice_msg 回归自测（不联网、不需真实语音、不碰微信）")
     print("=" * 60)
-    t1_parse()
-    t2_magic()
-    t3_decrypt()
-    t4_to_pcm_honest()
+    tmp = tempfile.mkdtemp(prefix="selftest_voice_msg_")
+    try:
+        t1_parse()
+        t2_magic()
+        t3_decrypt()
+        t4_to_pcm_honest()
+        t5_find_payload(tmp)
+        t6_voice_info()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 60)
     print(f"全部通过 ✅ （{_PASS} 项）" if _OK else f"有失败项 ❌ （{_PASS} 项）")
     print("=" * 60)

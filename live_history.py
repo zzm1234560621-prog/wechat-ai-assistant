@@ -745,6 +745,43 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
     return rows[-limit:]
 
 
+def voice_info(client, talker, local_id):
+    """读某条**语音**消息，返回它自带的解密信息（`voice_msg.parse_voicemsg` 的结果）。
+
+    为什么必须放这里：`live_history` 是唯一允许读微信库的地方（CLAUDE.md 铁律）。
+    为什么不能靠 fts：**语音和图片一样不进 fts**（实测四个分片的 local_type 里
+    没有 34）——那条路是结构性盲的，只能按会话表点查。
+
+    返回 `{}`：不是语音 / 查不到 / XML 解不出来 —— **不抛异常**，
+    调用方据此如实回话（「收到了语音但拿不到音频」），不许假装听懂。
+
+    仅 v4（微信 4.x）。v3（wcferry 3.9.x）的语音是另一个布局，本函数不覆盖。
+    """
+    import voice_msg
+    lid = _as_int(local_id)
+    if not talker or lid <= 0:
+        return {}
+    tbl = _v4_table_for(talker)
+    for db in _v4_msg_dbs(client):
+        try:
+            rows = _query(client, db,
+                          f"SELECT local_type, message_content FROM {tbl} "
+                          f"WHERE local_id = {lid}")
+        except Exception:
+            continue
+        for r in rows:
+            if _as_int(_pick(r, "local_type", 0)) != 34:
+                return {}
+            xml = decode_msg_content(_pick(r, "message_content", 1))
+            info = voice_msg.parse_voicemsg(xml)
+            if info:
+                info["talker"] = talker
+                info["local_id"] = str(lid)
+                info["xml"] = xml[:4000]
+            return info
+    return {}
+
+
 def v4_images(client, talker, limit=30):
     """该会话的图片消息，每条尽量带上本地已解码缩略图的路径。
 
