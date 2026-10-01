@@ -1,0 +1,21 @@
+﻿=== 2026-09-27 21:45:32 ===
+[1] 放置 version.dll 到微信安装目录
+  已放置，SHA256 = 5ABB5002BCD221F70973BA3D8D2B413BB40543EF83F42CBC3D9F9905972DCF51
+[2] 禁用微信自动更新（按仓库作者的方法：ACL 拒绝写入更新目录）
+  > echo Y|cacls "C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\update.data" /T /P zzm12:N
+    Are you sure (Y/N)?
+  > rd /s /q "C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\patch"
+    
+  > md "C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\patch"
+    
+  > echo Y|cacls "C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\patch" /T /P zzm12:N
+    Are you sure (Y/N)?processed dir: C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\patch Access is denied. System.Management.Automation.RemoteException
+[3] 校验
+  Uninstall.exe
+  version.dll
+  Weixin.exe
+  微信.lnk
+  --- update 目录权限 ---
+C:\Users\zzm12\AppData\Roaming\Tencent\xwechat\update\patch A\zzm12:(OI)(CI)N 
+
+=== DONE ===

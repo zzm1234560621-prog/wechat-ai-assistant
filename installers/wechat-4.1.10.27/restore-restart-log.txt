@@ -1,0 +1,19 @@
+﻿=== 2026-09-30 22:46:59 ===
+[1] 恢复 version.dll
+  已恢复，SHA256 = 98CBF593E7D4EB8F73E2A4BEEA459C59194EE51869108095DC3A9306F2C051D1
+[2] 结束微信
+  killed WeChatAppEx 22544
+  killed WeChatAppEx 30448
+  killed WeChatAppEx 36520
+  killed WeChatAppEx 40300
+  killed WeChatAppEx 42520
+  killed WeChatAppEx 54220
+  killed WeChatAppEx 54672
+  killed Weixin 50344
+  残留 Weixin: 0
+[3] 微信目录确认
+  Uninstall.exe
+  version.dll
+  Weixin.exe
+  微信.lnk
+=== DONE ===

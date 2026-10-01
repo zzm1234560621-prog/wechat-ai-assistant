@@ -1,0 +1,13 @@
+﻿=== 2026-09-27 23:03:31 ===
+[1] 结束微信（当前是卡死状态，强制结束）
+[2] 摘掉 version.dll（改名保留，不是删除）
+  已改名为 version.dll.disabled（想恢复就把名字改回来）
+[3] 确认微信目录
+  Uninstall.exe
+  version.dll.disabled
+  Weixin.exe
+  微信.lnk
+[4] 确认没有残留微信进程
+  残留 Weixin: 0
+  端口 30001: 0 条监听记录（应为 0）
+=== DONE ===

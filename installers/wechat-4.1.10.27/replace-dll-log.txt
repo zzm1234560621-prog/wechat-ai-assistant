@@ -1,0 +1,9 @@
+﻿=== 2026-09-27 21:55:36 ===
+[1] 备份旧 DLL
+  已备份到 D:\wechat-ai-assistant\wechat-ai-assistant\installers\wechat-4.1.10.27\version_old_backup.dll
+[2] 关闭微信（先优雅、再强杀）
+  CloseMainWindow PID=17076 -> True
+  残留 Weixin: 0
+[3] 替换 version.dll
+  已替换，SHA256 = 23948E7D933FF40735DDC0CC516641FD9F935D67FFDEC476BB8DB61B79940F29
+=== DONE ===

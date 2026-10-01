@@ -1,0 +1,164 @@
+# ============ 模型与 API ============
+# provider: anthropic = Claude 官方 API；openai = OpenAI 兼容接口（DeepSeek / Ollama / 中转）
+provider: "openai"
+model: "deepseek-chat"              # DeepSeek: deepseek-chat / deepseek-reasoner
+base_url: "https://api.deepseek.com"  # 仅 openai 用；切回 anthropic 时把它注释掉
+max_tokens: 2000
+temperature: 0.7
+# API Key 别写死在文件里：在微信里发 /api <key> 设置，或设环境变量 ANTHROPIC_API_KEY。
+
+# ============ 在哪些聊天里跟助手对话 ============
+# filehelper = 文件传输助手（最推荐，天然就是"和自己说话"）
+# 你自己的 wxid 可以用 `python -c "from wcferry import Wcf; print(Wcf().get_self_wxid())"` 查
+target_chats:
+  - "filehelper"
+
+# ============ 系统提示词 ============
+system_prompt: |
+  你是一个嵌入在微信里的个人 AI 助手。
+  你和用户的对话是**连续**的：除了本次检索到的聊天记录，你还能看到自己和用户
+  最近几轮的问答。用户说「刚才」「那个」「他」「最后一句」这类指代时，通常指的是
+  你上一轮说过或查到的东西——**先去看那几轮对话**，接不上再问用户「你指的是哪句」，
+  不要一上来就说「记录里没找到」。
+  你可以看到用户的历史聊天记录作为参考，回答时优先结合这些记录。
+  请用中文、简洁、准确地回答；如果历史记录里没有相关信息，就明确说"记录里没找到"。
+  你可以调用工具：
+    find_contact（查联系人）、read_history（翻某个联系人或群的聊天记录）、
+    search_history（在所有聊天里按关键词搜）、search_in_chat（在某个人/某个群里搜关键词）、
+    recent_messages（最近哪些会话来了消息）、pending_replies（谁有未读、在等我回）、
+    group_members（群成员名单，群要用 roomid）、
+    send_text（发文本）、send_image（发本地图片）、forward_message（转发某条已有消息）、
+    auto_reply（管理自动回复——让 AI 代替用户本人回某个聊天）、
+    find_images / read_image（列出图片、读图片里的字）。
+  读聊天记录时，**每行开头的名字就是发言人**（群聊里也是具体的人，不是群名），
+  据此判断谁说了什么，不要想当然地认为整段都是同一个人说的。
+  **发消息（文本/图片/转发）都是不可逆动作**：名单外的人一律先请用户回「确认」，
+  没真发出去之前绝不许说已经发了。send_image 的 path 只能取允许目录里的图，
+  被拒绝时如实告诉用户，不要试图绕过或改配置。
+  用户让你"给某人发某内容"时，**必须调用 send_text 工具**，
+  不要只回复说"我准备发"——要不要你确认由工具判断，不由你判断。
+  工具返回"尚未发送、需要确认"时，把要发的内容复述给用户，请他回复「确认」。
+  消息没有真正发出去之前，绝对不许说已经发了。
+  用户用大白话让你代他回复某人（"以后张三的消息你帮我回"、"别自动回李四了"、
+  "发之前先给我看一眼"）时，**必须调用 auto_reply 工具**，别只口头答应。
+  用户问"某人发的那张图是什么""最近发图了吗"时，用 find_images 列出来、
+  再用 read_image 读某一张。**注意图片能读的只是一部分**：微信只把用户
+  滚动看过的图片缓存在本地，没缓存的读不了——这种情况要如实说"这张图我
+  看不到"，**绝对不要编造图片内容**。read_image 返回"没识别到文字"时，
+  就照实说图里没识别出文字（当前用的是系统 OCR，只认图里的字）。
+
+# ============ 历史检索 ============
+history_file: "./data/history.jsonl"   # export_history.py 导出的统一格式
+recent_messages: 30                     # 始终带上最近 N 条做上下文
+search_topk: 8                          # 关键词检索最多返回条数
+
+# ============ 后端选择 ============
+# wcferry : 注入微信 3.9.x（原有方案，事件回调，毫秒级）
+# aixed   : aixed/WeChat-Hook 的本地 HTTP 服务，支持微信 4.1.10.27（轮询数据库，秒级）
+backend: "aixed"
+# aixed 后端专用：version.dll 加载后监听的地址（默认 30001，可用 wx.ini 的 StartPort 改）
+aixed_base_url: "http://127.0.0.1:30001"
+# 轮询新消息的间隔（秒）。**别调太小**：
+# hook 每收到一个查询都要遍历校验所有数据库句柄，句柄失效时还会触发一次全内存扫描，
+# 查得越勤越容易把它拖死（实测 2 秒间隔会把微信卡到 CPU 999 秒）。
+poll_interval: 5
+
+# 你自己的 wxid。微信 4.x 判断「哪条消息是我发的」需要它。
+# 拿不到时 bot 会尝试自动获取；自动获取失败就必须在这里填。
+self_wxid: ""
+
+# 是否响应「自己发的」消息。
+# 文件传输助手里的消息都是你自己发的，要让它在里面回你，必须开 true。
+# 开着也安全：bot 会记住自己刚发出的回复并跳过，不会自己回自己。
+respond_to_self: true
+
+# ============ Agent（工具调用）============
+# 让助手能真的动手：查联系人、翻历史、给别人发消息。
+agent:
+  enabled: true
+  max_rounds: 3            # 一次对话最多几轮工具调用，防止模型绕圈
+  max_queries: 6           # 一次对话最多发几次查库请求（hook 不能并发，别放开）
+  confirm_ttl: 300         # 回复「确认」的有效期（秒）
+  # 允许**直接发送**的对象（昵称/备注/微信号/wxid 都行）。
+  # 不在这里面的，工具只登记待确认动作，要你回「确认」才真发出去。
+  auto_send_whitelist:
+    - "某个常联系的人"          # 昵称/备注
+    # - "wxid_xxxxxxxxxxxx"    # 同一个人的 wxid：改了备注也不会失效
+  # 连发的两条闸（防止一口气刷屏把 hook 打崩）：
+  max_send_count: 20       # 单次请求最多连发几条，模型填再多也按这个截断
+  send_interval: 1.5       # 连发时每条之间的间隔（秒）。连发是**同步**做的：
+                           # 期间轮询会暂停，20 条 × 1.5 秒 ≈ 暂停 30 秒。
+  # fts 分片表探测为空时，自动让 hook 重扫库句柄的最小间隔（秒）。
+  # 0 = 关闭自动重扫（关掉也安全——session.db 兜底仍在，只是不主动去修 fts）。
+  # 别调小：重扫是 700MB 进程里的全内存扫描，调勤了会把微信拖死。
+  fts_rescan_interval: 300
+  # 历史行截断长度。以前写死 200，长消息被截得看不懂、模型答非所问。
+  line_chars: 400
+  # 短期对话记忆：同一个控制会话里记住最近几轮（0 = 关闭）。
+  # 「刚才那个」「再帮我问他一句」靠它才接得上。只记原始提问和最终答复，
+  # 不记检索到的那段历史，所以 token 开销很小。
+  dialog_turns: 6
+  # 超过这么久没说话就清空记忆（秒）。过期的上下文比没有更糟——
+  # 模型会把几天前的话当成「刚才说的」。
+  dialog_ttl: 900
+  # send_image 允许发出去的目录。**这是安全边界**：path 是模型自己填的，
+  # 不限制就等于让它从你硬盘上挑任意文件发出去。
+  # 留空 = 只放行微信自己的图片缓存目录（也就是「聊天里已有的图」）。
+  # 要发别处的图就把目录加进来——**别把整块盘加进去**。
+  send_image_dirs: []
+
+# ============ 自动回复（AI 代替我本人回消息）============
+# 和上面的 target_chats 是**两条相反的通路**：
+#   target_chats = 你跟助手说话的地方（你提问它答、你发 / 命令）
+#   auto_reply.chats = 助手**代你回复对方**的会话（好友单聊 / 群）
+# 两者不能重叠，重叠会被 bot 拒绝（别人发来的消息会被当成命令解析）。
+#
+# 在 target_chats 里用命令维护即可，一般不用手写：
+#   /auto                    看开关、审核状态和名单
+#   /auto on  /auto off      开 / 关（关掉就你自己回）
+#   /auto add 张三 self      加入名单；self=假装我本人，assistant=明说是助手
+#   /auto del 张三           移出名单
+#   /auto mode 张三 assistant  改人设
+#   /auto review on [张三]   开审核（草稿先发给你，你回「确认」才真发）
+#   /auto ctx 20             上下文条数
+# 注意：**群必须用 roomid 添加**（xxx@chatroom），昵称查找只覆盖好友。
+auto_reply:
+  enabled: false            # 总开关
+  review: false             # true = 草稿先发到控制会话，你回「确认」才真发出去
+  context_messages: 20      # 每次带多少条历史当上下文（1~30）
+  max_reply_chars: 200      # 单条回复长度上限，超出截断
+  min_gap: 6                # 同一会话两次自动回复的最小间隔（秒）。
+                            # 对方连发几句时只回一次；**别设 0**，会和自己刚发出的回复成环。
+  persona_self: |           # mode=self 的人设（可被 chats 里单条的 persona 覆盖）
+    你正在代替我本人回复微信消息。用我的口吻、第一人称、简短自然，
+    就像平时打微信那样。不要暴露你是 AI，不要用书面语、列表或 markdown。
+    不确定的事别编，就说「我回头确认下」。不要复述对方刚说过的话。
+  persona_assistant: |      # mode=assistant 的人设
+    你是我的微信 AI 助手，现在代我回复消息。礼貌、简洁，
+    必要时说明自己是助手。不要用 markdown。
+  chats: []                 # 命令维护，也可手写。条目形如：
+  #   - wxid: "wxid_xxxxxxxx"    # 单聊填对方 wxid；群填 xxxx@chatroom
+  #     name: "张三"             # 缓存昵称，只用于显示
+  #     mode: self               # self | assistant
+  #     review: null             # 覆盖上面的全局 review（true/false）
+  #     persona: ""              # 覆盖对应 mode 的人设（可选）
+
+# ============ 图片 ============
+# 聊天里的图片在磁盘上是**加密的** .dat（前 1024 字节需要一把没拿到的
+# AES 固定密钥，详见 docs/wechat4-dat-image-notes.md），解不开。
+# 但微信会把**你滚动看过的**图片缩略图以明文缓存在本地，所以能"看到"一部分。
+# 覆盖率天然有限：没滚动过的图就是读不了，助手会如实说看不到，不会编。
+image:
+  mode: ocr            # off=不解读 | ocr=系统自带OCR认图里的字（免费离线）
+                       # | vision=调视觉模型描述画面（要自己配 key，按次收费）
+  max_bytes: 5242880   # 超过 5MB 的图跳过
+  # mode=vision 时才需要下面这段（走 OpenAI 兼容接口）：
+  vision:
+    base_url: ""       # 例：https://open.bigmodel.cn/api/paas/v4
+    model: ""          # 例：glm-4v-flash
+    api_key: ""        # 也可以设环境变量 VISION_API_KEY
+    prompt: "用一两句中文描述这张图的内容。"
+
+# ============ 安全 ============
+# 强烈建议保持 true：只回复 target_chats 里的消息，绝不自动回复其他人/群
+reply_only_targets: true

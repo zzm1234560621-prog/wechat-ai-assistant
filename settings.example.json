@@ -1,0 +1,8 @@
+{
+  "api_key": "",
+  "auto_reply": {
+    "chats": [],
+    "enabled": false,
+    "review": false
+  }
+}

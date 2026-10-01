@@ -1,0 +1,20 @@
+# ---- 虚拟环境与缓存 ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 本地敏感配置：含真实 API key / wxid，勿提交 ----
+config.yaml
+settings.json
+.claude/settings.local.json
+
+# ---- 运行期数据 ----
+data/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
