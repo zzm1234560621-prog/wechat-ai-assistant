@@ -388,6 +388,28 @@ TOOLS = [
         },
     },
     {
+        "name": "send_images",
+        "description": (
+            "把**一个目录里的图片批量发给某人**。用户说「把 XX 文件夹里的照片发给他」"
+            "「把这个文件夹的图都发过去」时用这个。\n"
+            "只发目录**第一层**的图片（不递归子目录），按修改时间从早到晚发——"
+            "照片天然就是拍摄顺序。单次最多 agent.max_send_count 张，"
+            "目录里更多的话会截断，你**要把截断情况告诉用户**。\n"
+            "目录必须在 agent.send_image_dirs 允许的范围内，否则会被拒绝——"
+            "这时让用户自己去 config 加目录，**不要绕过**。\n"
+            "和 send_image 一样，名单外的人不会直接发，会登记待确认。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "收件人的昵称/备注/微信号/wxid"},
+                "dir": {"type": "string", "description": "本地目录路径（只扫这一层）"},
+                "limit": {"type": "integer", "description": "最多发几张，默认按配置上限"},
+            },
+            "required": ["to", "dir"],
+        },
+    },
+    {
         "name": "forward_message",
         "description": (
             "把**某一条已有的消息转发**给别人（含图片、链接、文件、名片这些非文本消息）。\n"
@@ -510,15 +532,24 @@ def send_repeated(client, wxid, text, count=1, interval=0.0):
 def send_pending(client, item, interval=0.0):
     """执行一条待确认动作，返回 (真正发出的条数, 错误)。**同步、串行。**
 
-    文本可以连发；图片和转发都只发一次——count 对它们没意义。
+    文本可以连发；转发只发一次。图片可以是一个路径或**一串路径**（群发照片），
+    多个之间按 interval 停顿——连发期间轮询会暂停，这是有意为之（hook 不支持并发）。
     """
     wxid = item.get("to_wxid")
     if item.get("image"):
-        try:
-            client.send_image(item["image"], wxid)
-        except Exception as e:
-            return 0, e
-        return 1, None
+        imgs = item["image"]
+        if isinstance(imgs, str):
+            imgs = [imgs]
+        sent = 0
+        for i, p in enumerate(imgs):
+            if i and interval:
+                time.sleep(interval)
+            try:
+                client.send_image(p, wxid)
+            except Exception as e:
+                return sent, e
+            sent += 1
+        return sent, None
     if item.get("xml"):
         try:
             client.send_xml(item["xml"], wxid)
@@ -643,23 +674,42 @@ class ToolBox:
         if ext not in _IMG_EXT:
             return "", (f"「{os.path.basename(p)}」不是图片"
                         f"（只支持 {'/'.join(sorted(_IMG_EXT))}）。")
-        dirs = list(self.send_image_dirs)
+        p, derr = self._in_allowed_dirs(p)
+        if derr:
+            return "", derr
+        return p, None
+
+    def _allowed_dirs(self):
+        """允许发送的根目录。
+
+        **默认只放行微信自己的图片缓存目录**（也就是「聊天里已有的图」）。
+        要发别处的文件，必须由**用户**去 config.yaml 的 `agent.send_image_dirs`
+        加目录——助手不许自己改配置绕过这条。
+        """
+        dirs = [os.path.abspath(os.path.expanduser(str(d)))
+                for d in self.send_image_dirs if str(d).strip()]
         if not dirs:
             root = image_cache.data_root()
-            dirs = [root] if root else []
+            if root:
+                dirs = [os.path.abspath(root)]
+        return dirs
+
+    def _in_allowed_dirs(self, p):
+        """绝对路径 p 在不在允许目录里。返回 (p, 错误文本)。"""
+        dirs = self._allowed_dirs()
         if not dirs:
-            return "", ("没配可发图的目录（agent.send_image_dirs），"
+            return "", ("没配可发文件的目录（agent.send_image_dirs），"
                         "也找不到微信图片缓存目录，所以不让发。")
         target = os.path.normcase(p)
         for d in dirs:
-            dd = os.path.normcase(os.path.abspath(os.path.expanduser(str(d))))
+            dd = os.path.normcase(d)
             try:
                 if os.path.commonpath([target, dd]) == dd:
                     return p, None
             except ValueError:
                 continue        # 不同盘符时 commonpath 会抛，跳过
-        return "", (f"这个文件不在允许发送的目录里。允许：{'；'.join(dirs)}。\n"
-                    f"（要发别处的图，得**用户自己**去 config.yaml 的 "
+        return "", (f"这个位置不在允许发送的目录里。允许：{'；'.join(dirs)}。\n"
+                    f"（要发别处的，得**用户自己**去 config.yaml 的 "
                     f"agent.send_image_dirs 加目录——你不要改配置绕过。）")
 
     # 一次取多少张图给缓存用
@@ -1097,6 +1147,75 @@ class ToolBox:
         set_pending(self.chat, wxid, nm, desc, image=path)
         return (f"「{nm}」不在自动发送名单里，图片**尚未发送**。"
                 f"请告诉用户：准备把 {base} 发给 {nm}，让他回复「确认」后再发。")
+
+    def t_send_images(self, args):
+        to = str(args.get("to") or "").strip()
+        raw = str(args.get("dir") or "").strip()
+        if not to or not raw:
+            return "参数不全：需要 to 和 dir。"
+        d = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(d):
+            return f"没找到目录：{d}"
+        d, derr = self._in_allowed_dirs(d)
+        if derr:
+            return derr
+
+        # 只扫第一层（不递归），按修改时间从早到晚——照片天然就是拍摄顺序
+        try:
+            entries = []
+            for fn in os.listdir(d):
+                p = os.path.join(d, fn)
+                if not os.path.isfile(p):
+                    continue
+                if os.path.splitext(fn)[1].lower() not in _IMG_EXT:
+                    continue
+                try:
+                    entries.append((os.path.getmtime(p), p))
+                except OSError:
+                    continue
+            entries.sort()
+        except OSError as e:
+            return f"读不了这个目录：{e}"
+
+        folder = os.path.basename(d.rstrip("\\/")) or d
+        if not entries:
+            return (f"「{folder}」里第一层没有图片。"
+                    f"（只扫一层，子目录不算；支持的格式：{'/'.join(sorted(_IMG_EXT))}）")
+
+        agent_cfg = self.cfg.get("agent") or {}
+        cap = max(1, int(agent_cfg.get("max_send_count", 20)))
+        want = int(args.get("limit") or cap)
+        want = max(1, min(want, cap))
+        picked = [p for _t, p in entries[:want]]
+        trunc = ""
+        if len(entries) > len(picked):
+            trunc = (f"\n（「{folder}」里共 {len(entries)} 张，本次只发最前面的 {len(picked)} 张。"
+                     f"要发更多就分几次说，或让用户调大 agent.max_send_count）")
+
+        cand, err = self._one(to)
+        if err:
+            return err
+        wxid = str(cand.get("wxid"))
+        nm = cand.get("remark") or cand.get("name") or to
+        desc = f"{len(picked)} 张图片（来自「{folder}」）"
+
+        if self._in_whitelist(wxid, nm) or self._in_whitelist(wxid, to):
+            interval = max(0.0, float(agent_cfg.get("send_interval", 1.5)))
+            for i, p in enumerate(picked):
+                if i and interval:
+                    # 连发期间轮询会暂停，这是**有意**的：hook 不支持并发
+                    time.sleep(interval)
+                try:
+                    self.client.send_image(p, wxid)
+                except Exception as e:
+                    return f"发到第 {i + 1} 张失败（前面 {i} 张已发出）：{e}"
+            self.sent.append((nm, desc))
+            return f"已把 {len(picked)} 张图片发给 {nm}。{trunc}"
+
+        set_pending(self.chat, wxid, nm, "", image=picked)
+        return (f"「{nm}」不在自动发送名单里，**一张都还没发**。"
+                f"请告诉用户：准备把「{folder}」里的 {len(picked)} 张图发给 {nm}，"
+                f"让他回复「确认」后我再发。{trunc}")
 
     def t_forward_message(self, args):
         to = str(args.get("to") or "").strip()

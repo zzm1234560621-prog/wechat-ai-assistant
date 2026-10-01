@@ -1085,8 +1085,9 @@ def main():
                         send(f"已发送给 {item['to_name']}。" if n == 1
                              else f"已给 {item['to_name']} 连发 {n} 条。", sender)
                     else:
-                        print(f"[bot] 确认发送 -> {item['to_name']}: {what}")
-                        send(f"已把{what}发给 {item['to_name']}。", sender)
+                        print(f"[bot] 确认发送 -> {item['to_name']}: {what} ×{n}")
+                        send(f"已把 {n} 张{what}发给 {item['to_name']}。" if n > 1
+                             else f"已把{what}发给 {item['to_name']}。", sender)
                     continue
 
             # 2) 否则走 AI 问答（开了 agent 就带工具）
