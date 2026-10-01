@@ -6,9 +6,12 @@
 
     <msg><voicemsg endflag="1" cancelflag="0" forwardflag="0" voiceformat="4"
       voicelength="10880" length="20934" bufid="0"
-      aeskey="f06f8bda79a5a5f15535ae5b89834069"
-      voiceurl="7f0c0006..." voicemd5="" clientmsgid="..."
-      fromusername="wxid_xxx" silklength="0" /></msg>
+      aeskey="0123456789abcdef0123456789abcdef"
+      voiceurl="7f0c0006..." voicemd5="" clientmsgid="...newSendVoice_amr_..."
+      fromusername="wxid_xxxxxxxxxxxx" silklength="0" /></msg>
+
+    （上面是**形状**示例，aeskey/wxid **不是**真机值——真机的那些属于聊天内容，
+    不许进仓库，测试里也一律用假值。）
 
 两条关键：
   * **`aeskey` 就在 XML 里**（32 个 hex = 16 字节）——和图片一个套路。
