@@ -42,7 +42,22 @@ bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
 
 ## ⚠️ hook 使用铁律
 
-**这个 hook 前后把微信搞崩过 4 次**（最后一次 2026-10-01 00:08，`0xC0000005` 读 NULL，出错指令在 `Weixin.dll+0x32BB80D`）。崩溃的直接诱因是**两个 bot 同时在轮询**——已加了单实例锁（`bot.py:acquire_single_instance`，回环端口 39001），但这只是兜底，真正的死因是下面两条：
+**这个 hook 前后把微信搞崩过 6 次**（转储里能数出 6 份，见下面的对照）。崩溃的直接诱因是**两个 bot（或两路查询）同时在轮询**——已加了单实例锁（`bot.py:acquire_single_instance`，回环端口 39001），但这只是兜底，真正的死因是下面三条：
+
+**崩溃取证怎么做**：微信自己的转储在
+`%APPDATA%\Tencent\xwechat\crashinfo\reports\Weixin_*.dmp`（不是 WER 那份）。
+`%TEMP%\dump_parse.py <dmp>` 能直接解出异常码 / 出错地址 / 归属模块偏移（纯 struct，不要 windbg）。
+
+| 转储 | 出错位置 | 类型 |
+|---|---|---|
+| 9a6d8521 / 236cbbac(00:08) / 0a06ee65 | Weixin.dll **+0x32BB4xx ~ +0x32BB80x** | 写 NULL |
+| 0d35e9b6 (09:28) | Weixin.dll +0xE23753 | 写 NULL |
+| 488215b7 (13:17) | Weixin.dll +0x505AFBD | **读 NULL** |
+| c4ce3551 (09-30 22:51) | ntdll.dll | **0xC0000374 堆损坏** |
+
+**注意：转储的模块表里看不到这个 hook**（六份都没有）。钩子会把自己从 PEB 模块链里摘掉
+（见 `installers/.../src*/` 的 `inline_weixin_dll_load.cpp` 和 `docs/hook-anti-tamper-notes.md`），
+所以**别用「模块在不在」判断钩子有没有涉案**——要看 30001 端口是不是还被那个 PID 占着。
 
 1. **绝不裸调 `GetAllDBName`。** 每调一次都在 700MB 进程里做一次全内存扫描（`getDatabaseInfo()` 先 `m_dbs.clear()` 再 `searchDatabases()`）。唯一允许的调用点是 `live_history.force_rescan()`（自带限流，只为拿「句柄表被重建」这个副作用）。想判断某个库在不在，探 `sqlite_master`。
 2. **绝不做不带选择性过滤的排序查询。** 典型反例 `WHERE local_type=1 ORDER BY create_time DESC`（先匹配全部消息再排序），实测 0.3 秒起、劣化时到 6 秒。
@@ -52,6 +67,18 @@ bot.py 主循环 ── 轮询 live_history.new_messages() ──> 收到消息
 **另一个判据**：`SELECT 1 FROM xxx LIMIT 1` 这种空探测如果超过 1 秒，说明卡的是**微信进程本身**（不是 SQL），必须立刻停手。
 
 **`live_history.py` 是唯一应该读微信库的地方。** 新增查询请加在那里并复用它的缓存（`_cached` / `_cached_positive`），别自己拼 SQL。
+
+3. **别在 bot 轮询的同时手工发查询。** 2026-10-01 13:17 那次崩溃（微信 `Weixin.dll+0x505AFBD` 读 NULL）就是这么来的：
+   bot 每 5 秒轮询 4 个 fts 分片，我又从外部连着发了十几次 `/QueryDB/execute`（fts `MATCH`、
+   再加一条没带选择条件的 `WHERE local_type IN (...)` 全表扫描），**两路查询同时压在 hook 上**
+   —— 和「两个 bot 同时轮询」是同一个死法。现场日志：
+   ```
+   ⚠️ 慢查询 3.50s  db=message_fts.db   ← bot 自己的轮询被挤慢
+   /QueryDB/execute 返回 HTTP 500       ← hook 内部出错
+   连不上 30001（WinError 10061）        ← 微信进程没了
+   ⚠️ 慢查询 1.05s SELECT 1 ... LIMIT 1 ← 空探测都 1 秒 = 卡的是微信本身
+   ```
+   **要手工查库就先停 bot**，查完再起。
 
 ## 微信 4.x 库结构（和 3.9.x 完全不同）
 
