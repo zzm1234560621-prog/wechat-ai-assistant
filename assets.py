@@ -22,6 +22,7 @@
 规矩变糊。文件坏了/读不出来只告警、当空——状态文件不该挡住启动（和 state.json
 同一姿势）。
 """
+import hashlib
 import json
 import os
 import sys
@@ -29,6 +30,10 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join(HERE, "data", "assets.json")
+
+# 明文图片副本的落地目录。**只放本助手自己复制进来的文件**（用户亲手发过的那几张），
+# 它会被 `agent_tools.allowed_image_dirs()` 单独放行——不是把用户硬盘放宽。
+STASH_DIR = os.path.join(HERE, "data", "stash")
 
 # 默认容量：够用，又不至于让「发给谁」变成要先挑半天（用户定的 5 条）。
 CAP_DEFAULT = 5
@@ -158,6 +163,79 @@ def plaintext_of(item):
     return ""
 
 
+def keep_file(src, name=None):
+    """把一份明文图片**复制**进素材暂存目录（`data/stash/`），返回副本路径。
+
+    为什么必须复制：微信的 `temp\\RWTemp` 是**临时**目录（实测里面只剩最新那一张，
+    老的会被清理），而素材要活到用户下次说「发给谁」的时候。
+    副本目录会被 `agent_tools.allowed_image_dirs()` 单独放行——里面只会有本助手
+    自己复制进来的文件，不是「把用户硬盘放宽」。
+
+    文件名默认按**内容 md5**：同一张图重复发也只存一份（顺手去重）。
+    失败只告警并返回 ""（调用方退回「只有消息引用」那条路，并如实告诉用户）。
+    """
+    p = str(src or "")
+    if not p or not os.path.isfile(p):
+        return ""
+    try:
+        with open(p, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        _warn(f"读不了要暂存的明文图 {p}（{e}）")
+        return ""
+    ext = os.path.splitext(p)[1].lower() or ".jpg"
+    dst = os.path.join(STASH_DIR, name or (hashlib.md5(blob).hexdigest() + ext))
+    try:
+        os.makedirs(STASH_DIR, exist_ok=True)
+        if not os.path.isfile(dst):
+            tmp = dst + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, dst)
+    except OSError as e:
+        _warn(f"复制明文图失败（{e}），这张只能靠消息引用了。")
+        return ""
+    return dst
+
+
+def _sweep_stash(items, keep_dir=None):
+    """把暂存目录里**已经没有任何素材条目引用**的副本删掉，返回删了几个。
+
+    为什么必须清：素材清单只留 `cap` 条（新的顶掉最老的），但副本文件不会自己消失
+    —— 不清就是「用户每发一张图，硬盘上永久留一份原图」，攒久了能吃掉几个 G。
+
+    **只在暂存目录里删文件，而且只删第一层**：条目里的 `path` 也可能指向别处
+    （微信缓存、用户自己的目录），那些**一根手指都不许碰**。
+    """
+    root = os.path.abspath(keep_dir or STASH_DIR)
+    keep = set()
+    # 「有人引用」= 这批条目 **+ 真源那份**（data/assets.json）。
+    # 为什么要连真源一起看：调用方可能拿的是另一份 store（自测、将来的多份），
+    # 只看这批就会把真源正在用的副本删掉——**实测踩过**（自测把真机上刚收的那张删了）。
+    for src in (items or [], load()):
+        for it in src or []:
+            p = str((it or {}).get("path") or "")
+            if p:
+                keep.add(os.path.normcase(os.path.abspath(p)))
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    n = 0
+    for fn in names:
+        p = os.path.abspath(os.path.join(root, fn))
+        if os.path.dirname(p) != root:          # 只处理第一层，别递归删子目录
+            continue
+        if os.path.normcase(p) in keep:
+            continue
+        try:
+            os.remove(p)                        # 顺手清掉复制中途留下的 .tmp
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
 def stash(item, cap=CAP_DEFAULT, path=None):
     """放一条素材进去并落盘。返回 (items, added, dropped)。
 
@@ -182,6 +260,8 @@ def stash(item, cap=CAP_DEFAULT, path=None):
     dropped = max(0, len(items) - cap)
     if dropped:
         items = items[-cap:]
+        # 被顶掉的那几条如果用的是暂存目录里的副本，副本也该跟着走（别让硬盘越攒越满）
+        _sweep_stash(items)
     save(items, path)
     return items, (not dup), dropped
 
@@ -264,8 +344,9 @@ def list_lines(items):
 
 
 def clear(path=None):
-    """清空暂存区，返回清掉几条。"""
+    """清空暂存区，返回清掉几条。顺手把副本文件也删掉（`/素材 清空` 就该是清干净）。"""
     n = len(load(path))
+    _sweep_stash([])
     save([], path)
     return n
 

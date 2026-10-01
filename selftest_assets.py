@@ -270,6 +270,15 @@ def test_store(tmp):
         raised = True
     check("既没有 xml 也没有明文的条目直接拒绝存", raised)
 
+    # 副本清理：顶掉最老的素材时，它在暂存目录里的副本也要删；
+    # **但暂存目录之外的路径一概不碰**（条目里的 path 也可能指向微信缓存/用户目录）。
+    keep = assets.keep_file(img)
+    outside = _write(os.path.join(tmp, "别处的图.jpg"), b"\xff\xd8\xff\xd9zzz")
+    assets.stash(assets.entry_from_file(keep, talker=CHAT, local_id="s1"), cap=1, path=p)
+    assets.stash(assets.entry_from_file(outside, talker=CHAT, local_id="s2"), cap=1, path=p)
+    check("被顶掉那条的明文副本被清掉（不然硬盘会越攒越满）", not os.path.exists(keep), keep)
+    check("暂存目录**之外**的路径一概不碰", os.path.exists(outside), outside)
+
     e = assets.entry_from_media(
         {"kind": "图片", "talker": CHAT, "local_id": "5", "local_type": 3,
          "image": "C:/x.jpg", "time": "12:00", "_ts": 123}, XML_IMG, now=999.0)
@@ -377,6 +386,26 @@ def test_send_asset(tmp):
               n == 3 and len(cli.calls) == 3 and not err, (n, cli.calls))
         check("三次发的是同一个文件", {c[2] for c in cli.calls} == {img_new})
 
+        # 素材暂存目录里的明文：不受用户那份发图白名单约束（路径是 bot 复制时记下的，
+        # **不是模型填的**）；而**别的路径照旧要过白名单**——这条差别必须钉住。
+        stash_img = assets.keep_file(img_new)
+        agent_tools._PENDING.clear()
+        agent_tools.set_pending(CHAT, "wxid_zhangsan", "张三", "那张图",
+                                image=[stash_img], label="那张图")
+        cli = _Rec()
+        n, err = agent_tools.send_pending(cli, agent_tools.pop_pending(CHAT), 0.0,
+                                          allowed_dirs=[])
+        check("暂存目录里的明文：白名单为空也放行（路径由 bot 记录）",
+              n == 1 and not err, (n, err))
+        agent_tools._PENDING.clear()
+        agent_tools.set_pending(CHAT, "wxid_zhangsan", "张三", "那张图",
+                                image=[img_new], label="那张图")
+        cli = _Rec()
+        n, err = agent_tools.send_pending(cli, agent_tools.pop_pending(CHAT), 0.0,
+                                          allowed_dirs=[])
+        check("非暂存目录的路径：白名单为空时仍然**整批拒发**",
+              n == 0 and bool(err) and cli.calls == [], (n, err))
+
         # 反向保证：forward_message 那条路仍然只发一次（send_pending 的分派没被改坏）
         agent_tools._PENDING.clear()
         agent_tools.set_pending(CHAT, "wxid_zhangsan", "张三", "转发一条消息",
@@ -466,6 +495,70 @@ def test_sync_latest(tmp):
         live_history.message_xml = old_xml
 
 
+def test_plaintext_capture(tmp):
+    """自己发的图：微信在 `temp\\RWTemp` 留的**明文原图**必须能收到、且不能挑错。
+
+    2026-10-01 真机实测：那份明文比消息行早约 2 秒，而且是「自己在微信里发的图」
+    唯一能拿到的明文（正式落盘只有加密 .dat）。用户完全可能刚给张三也发了一张
+    ——那张在消息**之后**，按「最新」挑就会发错图。
+    """
+    import image_cache
+    print("\n── 明文原图：RWTemp 里那一份要收下、且不能挑错（发错图不可逆）──")
+    real_accounts = image_cache.account_dirs
+    real_stash = assets.STASH_DIR
+    acct = os.path.join(tmp, "acct_plain")
+    assets.STASH_DIR = os.path.join(tmp, "stash_plain")
+    rw = os.path.join(acct, "temp", "RWTemp", "2026-10", "aaa")
+    os.makedirs(rw, exist_ok=True)
+    real_jpg = _write(os.path.join(rw, "aaaabbbbccccdddd.jpg"),
+                      b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"x" * 64)
+    _write(os.path.join(rw, "notanimage.jpg"), b"this is not an image at all")
+    _write(os.path.join(rw, "readme.txt"), b"\xff\xd8\xff\xe0jpeg-bytes-but-txt-ext")
+    image_cache.account_dirs = lambda: [acct]
+    try:
+        now = time.time()
+        got = image_cache.sent_plaintext_candidates(now, accounts=[acct])
+        check("RWTemp 里的明文原图能被找到（魔数确认是真图）",
+              [p for _t, p in got] == [real_jpg], got)
+        check("非图片内容（.jpg 但是文本）不收", all(p == real_jpg for _t, p in got), got)
+        check("扩展名不是图片的不收",
+              all(not p.endswith(".txt") for _t, p in got), got)
+        check("窗口外的候选不收（消息时间差 100 秒 > 90 秒窗口）",
+              image_cache.sent_plaintext_candidates(now - 100, accounts=[acct]) == [])
+        check("没有 msg_ts 时返回空（不瞎猜）",
+              image_cache.sent_plaintext_candidates(0, accounts=[acct]) == [])
+
+        # 选择规则（纯函数）：消息前 2 秒那份是对的，消息后 5 秒那份是「发给别人」的
+        cands = [(now - 2, "RIGHT.jpg"), (now - 300, "OLD.jpg"), (now + 5, "OTHER.jpg")]
+        check("选「不晚于消息+2 秒」里最新的那份", agent_tools.pick_plaintext(cands, now)
+              == "RIGHT.jpg")
+        check("窗口里全都晚于消息时退而取最早的那个（离消息最近）",
+              agent_tools.pick_plaintext([(now + 5, "A.jpg"), (now + 9, "B.jpg")], now)
+              == "A.jpg")
+        check("没有候选时返回空串", agent_tools.pick_plaintext([], now) == "")
+
+        # 复制进素材目录（微信那个临时目录会被清理，必须复制走）
+        dst = assets.keep_file(real_jpg)
+        check("复制进 data/stash 并且内容一致",
+              dst and dst.startswith(assets.STASH_DIR)
+              and open(dst, "rb").read() == open(real_jpg, "rb").read(), dst)
+        check("同一张图重复复制只存一份（按内容 md5 命名）",
+              assets.keep_file(real_jpg) == dst)
+        check("源文件不存在时返回空串（不抛）",
+              assets.keep_file(os.path.join(tmp, "没有这个.jpg")) == "")
+
+        # 端到端：capture_sent_plaintext -> 素材条目（拿得到明文才算「发得出去」）
+        entry, note = agent_tools.capture_sent_plaintext(
+            now, kind="图片", talker=CHAT, local_id="900")
+        check("capture_sent_plaintext 收到的条目指向明文副本",
+              entry is not None and assets.plaintext_of(entry) == dst, (entry, note))
+        check("条目标明来源是文件（不是消息引用）", entry.get("source") == "file"
+              and entry.get("xml") == "", entry)
+    finally:
+        image_cache.account_dirs = real_accounts
+        assets.STASH_DIR = real_stash
+
+
 def test_describe_old_kinds():
     print("\n── describe_pending：老的五类不被新加的分支带偏 ──")
     cases = [
@@ -491,9 +584,17 @@ def main():
     test_media_kind()
     test_latest_media()
     with tempfile.TemporaryDirectory() as tmp:
-        test_store(tmp)
-        test_send_asset(tmp)
-        test_sync_latest(tmp)
+        # ⚠️ **必须**把副本目录也指到临时目录：自测里会触发「顶掉最老的素材 -> 清副本」，
+        # 指向真目录的话会把你真机上刚收下来的那张明文图删掉。
+        real_stash = assets.STASH_DIR
+        assets.STASH_DIR = os.path.join(tmp, "stash")
+        try:
+            test_store(tmp)
+            test_send_asset(tmp)
+            test_sync_latest(tmp)
+            test_plaintext_capture(tmp)
+        finally:
+            assets.STASH_DIR = real_stash
     test_describe_old_kinds()
     print("\n" + "=" * 60)
     print("全部通过 ✅" if _ok else "有失败项 ❌")
