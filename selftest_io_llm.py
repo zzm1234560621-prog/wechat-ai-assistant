@@ -33,6 +33,21 @@ import settings           # noqa: E402
 TMP = tempfile.mkdtemp(prefix="selftest_io_llm_")
 _ok = True
 
+# ⚠️ 本文件会构造**真的** llm 实现并调 `chat_with_tools`（只是把 `_post` /
+# `messages.create` 换成桩），而 llm 里的记账会写 `usage.USAGE_PATH`
+# ——默认就是仓库里的 `data/usage.jsonl`。**自测绝不许污染用户的真实账本**
+# （会把 `/用量` 报成「有 N 次调用」，而那 N 次全是假的 0-token 行）。
+# 所以这里一次性把它重定向到临时目录，退出时还原。
+# 回归：连跑两次 `selftest_io_llm.py`，`data/usage.jsonl` 的行数不许变。
+import atexit                                                          # noqa: E402
+import usage                                                           # noqa: E402
+
+_usage_tmp = tempfile.mkdtemp(prefix="selftest_io_llm_usage_")
+_old_usage_path = usage.USAGE_PATH
+usage.USAGE_PATH = os.path.join(_usage_tmp, "usage.jsonl")
+atexit.register(setattr, usage, "USAGE_PATH", _old_usage_path)
+atexit.register(shutil.rmtree, _usage_tmp, ignore_errors=True)
+
 
 def check(label, cond, extra=""):
     global _ok
