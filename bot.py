@@ -410,7 +410,7 @@ def _msg_speaker(m, names):
     """一条消息的说话人**显示名**。
 
     以前这里直接用 talker，也就是 wxid / roomid 原样塞给模型——模型看到的
-    是 `wxid_h8i9j0k1l2m3n4: 到小区了`，答出来自然也是一串 id。
+    是 `wxid_xxxxxxxxxxxx: 到小区了`，答出来自然也是一串 id。
     群聊标成「群名/发言人」，单聊就是对方的名字。
     """
     talker = str(m.get("talker") or "")
