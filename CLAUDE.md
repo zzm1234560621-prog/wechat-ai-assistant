@@ -62,6 +62,17 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
 - `agent_tools.py` — 给大模型的工具层（**19 个工具**：find_contact / send_text / read_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / run_command）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
 - `auto_reply.py` — 代用户本人回指定会话。
+  - **审核是「每个会话一份」，全局那份只是默认值**（`review_on(rec, cfg)`：`rec["review"]` 优先，`None` 才继承全局）。
+    所以「只让某个人免确认」是 `/auto review off 张三`，不该动全局。
+  - **模型那条路必须显式说明范围**：`agent_tools.t_auto_reply` 里 `review` **不带 `who` 直接拦住**，
+    要改全局得写 `who=全局`；`on/off` 是**全局总开关、不认 `who`**（以前传了被静默丢掉）。
+    真机踩过（2026-10-01）：用户说「给李同学加上自动回复，不用我同意内容」，模型调
+    `review`+`review=false` 没带 who → **所有人**的审核都被关了（它回复里补了一句
+    「注意：审核是全局开关」，但用户仍然被搞混）。根因**不是模型撒谎**，而是
+    **工具说明只教了 `action=review, review=false` 这种写法、压根没提 who**，
+    加上工具层允许漏参数静默改全局——**静默扩大影响面**才是要堵的那一头。
+    人手打 `/auto review on`（不带对象）改全局仍然照旧：人的明确意图，模型漏参数不算。
+    回归用例：`selftest_sched_auto.t9_review_scope_is_explicit`。
 - `watch.py` — 盯着某个会话：他发消息就**通知我**、不回他。和 `auto_reply` 互补且互斥（同一会话同时开会既通知又回复），加的时候互相拦。
 - `executor.py` — **本地执行**：subprocess 跑一条命令行命令（同步、带超时/输出上限/工作目录）。
   **它只管"怎么跑"，不管"该不该跑"**——要不要跑由上层把关，见下面「本地执行」。

@@ -206,13 +206,20 @@ TOOLS = [
             "  「以后张三的消息你帮我回」→ action=add, who=张三（然后 action=on）\n"
             "  「群里的消息也帮我回」→ action=add, who=群的 roomid\n"
             "  「别自动回李四了」「李四的我自己回」→ action=del, who=李四\n"
-            "  「发之前先给我看一眼」→ action=review, review=true\n"
-            "  「直接发就行不用问我」→ action=review, review=false\n"
-            "  「关掉自动回复」→ action=off\n"
+            "  「发之前先给我看一眼」（针对某人）→ action=review, review=true, who=张三\n"
+            "  「直接发就行不用问我」（针对某人）→ action=review, review=false, who=张三\n"
+            "  「以后所有自动回复都要我确认」→ action=review, review=true, who=全局\n"
+            "  「关掉自动回复」→ action=off（**全局总开关**）\n"
             "  「自动回复都配了谁」→ action=status\n"
             "mode：self = 假装用户本人（默认，除非用户说要表明是 AI）；"
-            "assistant = 说明自己是助手。"
-            "调用后把工具返回的内容**如实复述**给用户，别自己另编一套说法。"
+            "assistant = 说明自己是助手。\n"
+            "⚠️ **范围别搞错（真机踩过）**：审核是**每个会话各自一份**、全局只是默认值。"
+            "review **必须带 who**——只改某个人就写 who=昵称；"
+            "要改全局默认（会同时影响**所有**自动回复会话）必须**显式**写 who=全局，"
+            "而且只有用户明确说了「所有/默认/全局」才允许这么做。"
+            "on/off 是全局总开关、**不认 who**；要让某个人单独参与自动回复用 action=add。"
+            "调用后把工具返回的内容**如实复述**给用户，别自己另编一套说法、"
+            "更别把「改了全局」说成「只改了某个人」。"
         ),
         "parameters": {
             "type": "object",
@@ -1729,6 +1736,11 @@ class ToolBox:
         if isinstance(review, str):
             review = review.strip().lower() in ("true", "1", "yes", "on", "是")
 
+        # 「全局」是**范围词**，不是联系人昵称：先摘出来，别拿去联系人表里查。
+        global_scope = who in ("全局", "所有", "全部", "默认", "all", "*")
+        if global_scope:
+            who = ""
+
         # 昵称换成 wxid 再用（群里让模型直接给 roomid）
         if who and action in ("add", "del", "mode", "review"):
             if not looks_like_id(who):
@@ -1742,6 +1754,17 @@ class ToolBox:
                     return f"「{who}」匹配到多个人：{names}。请问用户要哪一个。"
                 who = str(cands[0].get("wxid"))
 
+        # ⚠️ 审核的范围必须**显式**。`_apply` 里 review 不带对象 = 改全局默认
+        # （影响**所有**自动回复会话）。模型漏参数**不等于**用户想改全局——
+        # 2026-10-01 真机踩过：用户说「给李同学加上自动回复，不用我同意内容」，
+        # 模型调 review+review=false 没带 who → **所有人**的审核都被关了，
+        # 而它回用户说的是「李同学 的审核关」。所以这里拦住，逼它问清范围。
+        if action == "review" and review is not None and not who and not global_scope:
+            return ("改审核**必须说明范围**，我不能替你决定："
+                    "只改某个人就带 who（例 who=张三）；"
+                    "要改全局默认（会同时影响**所有**自动回复会话）就写 who=全局。"
+                    "请先按用户的原话判断，拿不准就问一句。")
+
         arg = auto_reply.build_arg(action, who=who, mode=mode, review=review,
                                    context=args.get("context_messages"))
         # 上面把昵称换成了 wxid，得把原名带进去，否则名单里记的是 wxid_xxx
@@ -1751,6 +1774,12 @@ class ToolBox:
                                                   name_hint=hint)
         if changed:
             self.cfg_changed = True
+        # on/off 是**全局总开关**：`_apply` 里根本不看 who，传了也当没有。
+        # 与其静默丢掉，不如把范围说清楚——否则模型会以为「只给某人开了」。
+        if action in ("on", "off") and given:
+            text = (f"{text}\n⚠️ on/off 是**全局总开关**（所有会话一起开关），"
+                    f"不是只对「{given}」。要让某人单独参与，用 action=add, who={given}。"
+                    f"回复用户时必须说清这一点。")
         if action == "status":
             return text          # 状态本身就把名单列全了，不用再补一行摘要
         return f"{text}\n（当前自动回复：{auto_reply.summary_line(self.cfg_provider())}）"

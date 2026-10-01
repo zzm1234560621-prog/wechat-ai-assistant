@@ -20,6 +20,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import auto_reply          # noqa: E402
+import agent_tools         # noqa: E402
 import scheduler           # noqa: E402
 import settings            # noqa: E402
 import watch               # noqa: E402
@@ -438,6 +439,80 @@ def t8_usage_matches_impl():
         chk(not ch_del and "没有编号" in out_del, "/定时 删 <编号> 有实现")
 
 
+def _auto_tool_stub():
+    """只借 `ToolBox.t_auto_reply` 这一个方法，把它的依赖喂进来。
+
+    这样测的是**真的工具层代码**（含范围校验），而不是另写一份等价逻辑。
+    """
+
+    class _Stub:
+        t_auto_reply = agent_tools.ToolBox.t_auto_reply
+
+        def __init__(self):
+            self.cfg = {}
+            self.cfg_changed = False
+            self.client = None
+            # 每次实时读临时 settings，改动立刻可见（和生产里 cfg_provider 一致）
+            self.cfg_provider = lambda: settings.effective({})
+
+        def _resolve(self, who):
+            return [{"wxid": "wxid_z", "name": "张三", "remark": ""}]
+
+    return _Stub()
+
+
+def t9_review_scope_is_explicit():
+    """审核的范围必须**显式**：每会话一份，全局只是默认值。
+
+    真机踩过（2026-10-01）：用户说「给李同学加上自动回复，不用我同意内容」，
+    模型调 `review` + `review=false` **没带 who** → 按 `/auto review` 的定义改了
+    **全局默认**，于是**所有**自动回复会话的审核都被关了。
+    根因不是模型撒谎（它其实补了一句「注意：审核是全局开关」），而是
+    **工具说明只教了 `action=review, review=false` 这种写法、压根没提 who**，
+    加上工具层允许漏参数静默改全局 —— 要堵的是**静默扩大影响面**那一头。
+    """
+    print("T9. 审核范围：只改某人 vs 改全局（模型漏参数不许静默改全局）")
+    init = {"auto_reply": {"enabled": True, "review": False,
+                           "chats": [{"wxid": "wxid_z", "name": "张三"}]}}
+    with TempSettings(init) as tmp:
+        tb = _auto_tool_stub()
+
+        # 1) 模型没带 who：**必须拦住**，不许落到全局
+        out = tb.t_auto_reply({"action": "review", "review": True})
+        chk(auto_reply.section(settings.effective({})).get("review") is False,
+            "review 不带 who → 全局默认**没被动**（拦住，而不是静默改全局）")
+        chk("范围" in out, f"返回里明确要求先说明范围（实际 {out[:50]!r}）")
+
+        # 2) 带 who：只改那一个人，全局默认原封不动
+        out = tb.t_auto_reply({"action": "review", "review": True, "who": "wxid_z"})
+        sec = auto_reply.section(settings.effective({}))
+        chk(sec.get("review") is False, "只改某人时全局默认**不变**")
+        chk((sec.get("chats") or [{}])[0].get("review") is True,
+            "那个人的 review 被单独设为 True")
+        chk("张三" in out, "返回里点名了这个人（模型能如实复述）")
+
+        # 3) 只有显式 who=全局 才允许改全局
+        out = tb.t_auto_reply({"action": "review", "review": True, "who": "全局"})
+        sec = auto_reply.section(settings.effective({}))
+        chk(sec.get("review") is True, "显式 who=全局 → 全局默认被改")
+        chk("全局" in out, "返回里说清这是全局（不是某个人）")
+
+        # 4) 单独设过的人**覆盖**全局默认 —— 每个对象各管各的
+        tb.t_auto_reply({"action": "review", "review": False, "who": "wxid_z"})
+        cfg = settings.effective({})
+        rec = auto_reply.chats(cfg)["wxid_z"]
+        chk(auto_reply.review_on(rec, cfg) is False and
+            auto_reply.section(cfg).get("review") is True,
+            "单人设置覆盖全局默认（全局 True、他 False → 单独设的赢）")
+
+        # 5) on/off 传 who：不静默丢掉，必须说明它是全局总开关
+        out = tb.t_auto_reply({"action": "on", "who": "张三"})
+        chk(auto_reply.enabled(settings.effective({})) is True, "on 真的开了总开关")
+        chk("全局总开关" in out,
+            f"返回里说清 on 是全局总开关（实际 {out[-90:]!r}）")
+        _ = tmp
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -448,7 +523,8 @@ def main():
     for fn in (t1_add_keeps_master_switch, t2_merge_save_keeps_action_changes,
                t3_bad_at_only_skips_itself, t4_mutual_exclusion,
                t5_group_reply_parsing, t6_transcript_speakers,
-               t7_id_not_reused, t8_usage_matches_impl):
+               t7_id_not_reused, t8_usage_matches_impl,
+               t9_review_scope_is_explicit):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

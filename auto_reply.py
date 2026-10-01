@@ -537,9 +537,10 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
         who = " ".join(bits[1:]).strip()
         if not who:
             _save(review=on)
-            return (f"全局审核已{'开启' if on else '关闭'}。"
-                    + ("自动回复的草稿会先发给你，你回「确认」才发出去。"
-                       if on else "自动回复直接发给对方。")), True
+            return (f"全局审核已{'开启' if on else '关闭'}——⚠️ 这是**所有**自动回复会话的"
+                    f"默认值（不只某一个），单独设过的会话不受影响。"
+                    + ("草稿会先发给你，你回「确认」才发出去。" if on
+                       else "自动回复直接发给对方。")), True
         rec = _find(recs, who)
         if rec is None:
             return f"名单里没有「{who}」。", False
