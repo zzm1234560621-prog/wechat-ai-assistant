@@ -709,13 +709,22 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
                 # 非文本不再丢弃，渲染成标签；图片顺带把本地已解码缩略图路径带上
                 content = _render_nontext(lt)
                 if lt == 3:
+                    # **带上 local_id**：模型据此能直接调 read_image(contact, local_id)
+                    # 去看图；不带的话它只知道「有张图」，得先 find_images 再 read_image，
+                    # 白多一次查库（每次查库都是压在 hook 上的真实开销）。
+                    content += f"（local_id={lid}"
                     try:
                         import image_cache
                         p = image_cache.find(table[4:], lid, ct)
                         if p:
-                            content += f"（本地已解码缩略图：{p}）"
+                            content += f"；本地已解码缩略图：{p}）"
+                        else:
+                            # **自己发出去的图**微信只留加密原图（`Bubble/<md5>_b.dat`），
+                            # 没有可解码的 Thumb（实测 filehelper 会话连 Thumb 目录都没有）。
+                            # 如实说明，别让模型以为「有图但它不去看」。
+                            content += "；微信没留可解码缩略图，看不了内容）"
                     except Exception:
-                        pass
+                        content += "）"
             d = {
                 "talker": talker,
                 "local_id": str(lid) if lid is not None else "",

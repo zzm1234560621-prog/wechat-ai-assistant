@@ -640,6 +640,13 @@ def _t_nonttext_pickup():
     out3 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
     ok &= check("同一张图不会每轮重复报（水位线生效）", out3 == [], out3)
 
+    # 图片消息要自己说清「能不能看」+ 带上 local_id（模型据此直接调 read_image）
+    body = str(out1[0].get("content") or "")
+    ok &= check("图片内容带 local_id（模型能直接调 read_image，不用先 find_images）",
+                "local_id=7" in body, body)
+    ok &= check("没有可解码缩略图时如实说明，不假装能看",
+                "看不了内容" in body, body)
+
     # 已经在 fts 结果里的那条不许重复报（去重）
     c.last_ts = _IMG_TS + 9
     dup = [{"talker": "filehelper", "content": out2[0]["content"], "_ts": _IMG_TS + 9}]

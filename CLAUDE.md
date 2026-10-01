@@ -71,6 +71,8 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - `file_read.py` — 读**别人发来的文件**（pdf/docx/xlsx/pptx/文本）。微信把收到的文件明文放在 `<数据目录>/<账号>/msg/file/<年-月>/`，不用解密；文件名从消息的 appmsg XML 里拿。**只允许读那个目录**，按文件名匹配，不接任意路径。PDF 走 `pypdf`（在 `requirements.txt` 里）。
 - `image_read.py` / `file_read.py` 都是「把本地文件变成文字喂给模型」，区别是图片要 OCR、文件要解析。
 - `image_cache.py` — 找微信 4.x 的**明文缩略图缓存**（`<账号>/cache/<月>/Message/<md5>/Thumb/`）。`send_image` 的默认白名单就是这里的 `image_cache_dirs()`（即 `<账号>/cache`），**不再是整个 `xwechat_files`**。
+  - **只有「别人发来的图」才有 `Thumb/<local_id>_<create_time>_thumb.jpg`。自己发出去的图，微信只留加密原图（`Bubble/<md5>_b.dat`，实测 filehelper 那条会话连 `Thumb/` 目录都没有）** → `read_image` 对这类图**读不了内容**，只能在消息里如实说「看不了」。这是微信的存储事实，不是本项目的 bug；**别顺手去解密 `.dat`**（那是另一件事，见 `docs/wechat4-dat-image-notes.md`）。
+  - 渲染图片消息时**带上 `local_id`**（`live_history` 里做），模型据此能直接 `read_image(contact, local_id)`；不带的话它得先 `find_images` 再 `read_image`，白多一次查库。
 - `llm.py` — anthropic / openai 两种协议，工具调用格式互转。
 - `providers.py` — 服务商预设表（`/provider` 与 `setup_llm.py` 共用同一份，别各写一份）。
 - `setup_llm.py` — 命令行模型配置向导（`配置模型.bat`）。
