@@ -165,6 +165,7 @@ HELP_TEXT = (
     "/addchat <wxid> 添加要响应的聊天\n"
     "/delchat <wxid> 移除聊天\n"
     "/status         查看当前配置 + 运行健康（轮询 / 分片错误 / 登录态）\n"
+    "/自检           诊断一遍（轮询/登录/分片/hook/发送）+ 告诉你该做什么\n"
     "/用量 [天数]     看 token 用量和估算费用（默认最近 7 天）\n"
     "/预算            看消费闸状态（最近 24 小时花了多少 / 上限多少）\n"
     "/预算 <金额>     设上限：超了就**拒绝调用模型**并说明原因，不偷偷降级\n"
@@ -381,6 +382,17 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
             names = "、".join(f"{k}({v[1]}次)" for k, v in errs.items())
             lines.append(f"⚠️ 分片查询失败: {names}")
         return "\n".join(lines), False
+
+    if cmd in ("/自检", "/体检", "/selfcheck"):
+        # 和 /status 的分工：/status 报**配置 + 一眼健康**，/自检报**诊断 + 该做什么**。
+        # 它只读 bot 自己记到的事实，不新查库、不起线程（见 selfcheck_text 的说明）。
+        fresh = settings.effective(load_config())
+        try:
+            return selfcheck_text(fresh), False
+        except Exception as e:
+            # 自检自己坏了也要如实说——不许回一句「一切正常」糊过去
+            traceback.print_exc()
+            return f"自检本身出错了（这也要如实说）：{type(e).__name__}: {e}", False
 
     if cmd in ("/用量", "/usage", "/花费"):
         if usage is None:
@@ -1033,6 +1045,126 @@ def _as_float(v, default=0.0):
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def _err_count(v):
+    """把 poll_errors 的条目（形状是 `[文本, 次数]`，也可能是别的）取出次数。"""
+    if isinstance(v, (list, tuple)) and len(v) >= 2:
+        return v[1]
+    if isinstance(v, dict):
+        return v.get("count") or "?"
+    return "?"
+
+
+def selfcheck_text(cfg=None):
+    """`/自检`：把 bot **已经记到的事实**拼成一段人话诊断 + 该做什么。
+
+    ⚠️ **刻意不接受 client / wcf 参数** —— 这样它在结构上就不可能发查询。
+    hook 不支持并发（已经崩过微信 6 次），而 `/自检` 跑在轮询线程上；
+    「真机体检」那件事归 `verify_real.py`（它要求先停 bot）。两者分工不重叠：
+      * `/自检` = **bot 跑着**时，看它自己记到的东西；
+      * `verify_real.py` = **bot 停着**时，从外面独立验一遍。
+
+    所以这里只做两件事：读内存快照（`health.Health.snapshot()` + `live_history.poll_errors()`），
+    以及把「该做什么」按顺序列出来。**不新查一次库**、不起线程。
+    """
+    cfg = cfg or {}
+    lines = ["🩺 自检", "（下面全是 bot 运行时**已经记到**的事实，不是刚刚新查的："
+                      "hook 不支持并发，我不会为了自检再去查一次）", ""]
+    todo = []
+    h = _h()
+    snap = None
+    if h is None:
+        lines.append("❌ health.py 不在：运行看护整体不可用（安装不完整）")
+        todo.append("先补全安装（health.py 缺了），别的都不用看。")
+    else:
+        try:
+            snap = h.snapshot()
+        except Exception as e:
+            lines.append(f"❌ 健康快照取不出来：{e}")
+            todo.append("看 bot.log 里 snap 相关的报错。")
+
+    if snap:
+        lines.append(f"运行时长：{snap.get('uptime_human') or '—'}")
+
+        # ── 轮询（判断「它还收不收得到消息」最直接的指标）──────────────
+        pc = snap.get("poll_count") or 0
+        age = snap.get("last_poll_age_seconds")
+        try:
+            interval = max(1, int(cfg.get("poll_interval", 5)))
+        except (TypeError, ValueError):
+            interval = 5
+        if not pc or age is None:
+            lines.append("❌ 还**一次都没轮询过** —— 收消息那条路没起来。")
+            todo.append("看 bot.log 里有没有「连不上微信 / 连不上 30001」这类报错。")
+        else:
+            lines.append(f"轮询：第 {pc} 次，最近一次在 {_fmt_ago(age)} 前（间隔 {interval}s）")
+            if age > interval * 3 + 1:
+                lines.append(f"⚠️ 轮询**明显偏慢**（{_fmt_ago(age)} > 3×{interval}s）"
+                             f"——要么正在跑长任务（读大文件 / 跑本地命令），要么卡住了。")
+                todo.append("一直偏慢的话：看 bot.log 有没有「⚠️ 慢查询」，"
+                            "或者是不是有个 run_command 正在跑（跑命令期间轮询会停）。")
+
+        # ── 登录态（只能人工扫码恢复，所以优先级最高）──────────────────
+        login = snap.get("login_ok")
+        lage = snap.get("last_login_check_age_seconds")
+        if login is False:
+            lines.append("❌ **登录态掉了** —— 微信退回登录界面了。")
+            todo.append("去微信里**扫码登录**。这个只能你手动做：bot 自己恢复不了，"
+                        "而且它看起来和「库句柄掉了」很像（都是没反应）。")
+        elif login is None:
+            lines.append("❓ 登录态还没探过（bot 每 30 轮心跳探一次），再等等。")
+        else:
+            lines.append("登录态：正常"
+                         + (f"（最后一次探在 {_fmt_ago(lage)} 前）" if lage is not None else ""))
+
+        cur = snap.get("last_cursor")
+        lines.append(f"游标：{cur if cur else '（还没有）'}")
+
+        # ── 分片查询失败（「静默失效」的主要表现）─────────────────────
+        perr = dict(snap.get("poll_errors") or {})
+        try:
+            for k, v in (live_history.poll_errors() or {}).items():
+                perr.setdefault(str(k), v)
+        except Exception:
+            pass
+        if perr:
+            names = "、".join(f"{k}({_err_count(v)} 次)" for k, v in sorted(perr.items()))
+            lines.append(f"⚠️ 分片查询失败：{names}")
+            todo.append("分片失败基本就是**库句柄掉了**（不报错、只返回 0 行）。"
+                        "bot 每轮会自己试 `force_rescan`；还不行就重启 bot。")
+
+        # ── hook 报错 ────────────────────────────────────────────────
+        he = snap.get("hook_errors") or 0
+        if he:
+            extra = ""
+            if snap.get("last_hook_error"):
+                extra = f"，最近一次：{str(snap.get('last_hook_error'))[:60]}"
+            lines.append(f"⚠️ hook 报错累计 {he} 次{extra}")
+            todo.append("hook 报错先看 bot.log 有没有「⚠️ 慢查询」："
+                        "慢查询说明卡的是**微信进程本身**，那就别再往上加查询。")
+
+        # ── 发送 ────────────────────────────────────────────────────
+        sf = snap.get("send_fail_count") or 0
+        so = snap.get("send_ok_count") or 0
+        if sf:
+            extra = ""
+            if snap.get("last_send_detail"):
+                extra = f"，最近一次：{str(snap.get('last_send_detail'))[:60]}"
+            lines.append(f"⚠️ 发送失败累计 {sf} 次（成功 {so} 次）{extra}")
+            todo.append("发送失败**不会自动重试**（发消息不可逆、重试可能让对方收到两条）。"
+                        "确认对方没收到再自己重发。")
+        else:
+            lines.append(f"发送：成功 {so} 次，失败 0 次")
+
+    lines.append("")
+    if not todo:
+        lines.append("✅ 没发现异常：收消息、登录、发送这三条路看起来都正常。")
+    else:
+        lines.append("👉 按这个顺序做：")
+        for i, item in enumerate(todo, 1):
+            lines.append(f"  {i}. {item}")
+    return "\n".join(lines)
 
 
 def executed_ttl(cfg=None):

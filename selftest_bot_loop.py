@@ -889,6 +889,115 @@ def t_executed_once(tmp):
         bot.STATE_PATH, bot._STATE = old_path, old_state
 
 
+class _FakeHealth:
+    """只回一个假快照，别的什么都不做（够测 /自检 了）。"""
+
+    def __init__(self, snap):
+        self._snap = snap
+
+    def snapshot(self):
+        return dict(self._snap)
+
+
+def t_selfcheck():
+    sec("/自检：只读已记录的事实 + 把「该做什么」说清楚")
+    old_health = bot._HEALTH
+    old_poll_errors = bot.live_history.poll_errors
+
+    # ★ 结构性保证：它**收不到 client**，所以不可能在自检里发查询。
+    #   hook 不支持并发（崩过微信 6 次），而 /自检 跑在轮询线程上。
+    try:
+        import inspect
+        params = list(inspect.signature(bot.selfcheck_text).parameters)
+        chk(params == ["cfg"],
+            f"selfcheck_text 只收 cfg（结构上就查不了库）：{params}")
+    except Exception as e:
+        chk(False, f"签名检查失败：{e!r}")
+
+    base = {
+        "uptime_human": "1 小时 2 分", "poll_count": 120,
+        "last_poll_age_seconds": 3.0, "last_cursor": {"t": 42},
+        "login_ok": True, "last_login_check_age_seconds": 10.0,
+        "poll_errors": {}, "hook_errors": 0,
+        "send_ok_count": 7, "send_fail_count": 0,
+    }
+
+    def with_(**kw):
+        bot._HEALTH = _FakeHealth(dict(base, **kw))
+
+    try:
+        # ① 全正常
+        bot.live_history.poll_errors = lambda: {}
+        with_()
+        txt = bot.selfcheck_text({"poll_interval": 5})
+        chk("没发现异常" in txt, "全正常时明说「没发现异常」")
+        chk("轮询：第 120 次" in txt, "报出轮询次数与最近一次的新鲜度")
+        chk("不是刚刚新查的" in txt,
+            "开头就声明这些是**已记录**的事实（不许让用户以为刚查过）")
+
+        # ② 掉登录：必须排在最前面，并给出唯一可做的动作
+        with_(login_ok=False, last_cursor=None)
+        txt = bot.selfcheck_text({})
+        chk("登录态掉了" in txt, "掉登录要明说")
+        chk("扫码" in txt, "给出唯一能做的动作：扫码")
+        tail = txt.split("👉")[-1]
+        chk("扫码" in tail.split("\n")[1] if len(tail.split("\n")) > 1 else False,
+            f"「扫码」要排在第一条（其它都好也白搭）：{tail.strip()[:60]!r}")
+
+        # ③ 分片查询失败（静默失效的主要表现）→ 指向 force_rescan / 重启
+        bot.live_history.poll_errors = lambda: {"message_fts_v4_1": ["boom", 3]}
+        with_(poll_errors={"message_fts_v4_0": ["boom", 2]})
+        txt = bot.selfcheck_text({})
+        chk("分片查询失败" in txt, "报出分片失败")
+        chk("message_fts_v4_0" in txt and "message_fts_v4_1" in txt,
+            "内存快照与 live_history 两处的失败都要带上（不丢一边）")
+        chk("force_rescan" in txt, "告诉用户 bot 会自愈，以及还不行怎么办")
+
+        # ④ 一次都没轮询过 → 这条路根本没起来
+        bot.live_history.poll_errors = lambda: {}
+        with_(poll_count=0, last_poll_age_seconds=None)
+        txt = bot.selfcheck_text({})
+        chk("一次都没轮询过" in txt, "从没轮询过要明说")
+        chk("bot.log" in txt, "指向 bot.log")
+
+        # ⑤ 轮询偏慢 → 提示可能在跑长任务（别误判成挂了）
+        with_(last_poll_age_seconds=40.0)
+        txt = bot.selfcheck_text({"poll_interval": 5})
+        chk("偏慢" in txt and "长任务" in txt, "偏慢要提示「可能在跑长任务」")
+
+        # ⑥ 发送失败 → 明说不自动重试
+        with_(send_fail_count=2, last_send_detail="timeout")
+        txt = bot.selfcheck_text({})
+        chk("发送失败累计 2 次" in txt, "报出发送失败次数")
+        chk("不会自动重试" in txt, "并且说清不会自动重试（发消息不可逆）")
+
+        # ⑦ hook 报错 → 指向慢查询判据
+        with_(hook_errors=5, last_hook_error="HTTP 500")
+        txt = bot.selfcheck_text({})
+        chk("hook 报错累计 5 次" in txt, "报出 hook 报错")
+        chk("慢查询" in txt, "指向「慢查询」这个判据（卡的是微信本身）")
+
+        # ⑧ health.py 不在：要说「安装不完整」，不是「一切正常」
+        bot._HEALTH = None
+        txt = bot.selfcheck_text({})
+        chk("health.py 不在" in txt, "health 缺失要明说")
+        chk("没发现异常" not in txt, "**绝不能**在缺件时说「没发现异常」")
+
+        # ⑨ 快照抛异常也不许崩
+        class _Boom:
+            def snapshot(self):
+                raise RuntimeError("炸了")
+        bot._HEALTH = _Boom()
+        try:
+            txt = bot.selfcheck_text({})
+            chk("取不出来" in txt, "快照抛异常时如实说，不崩")
+        except Exception as e:
+            chk(False, f"快照抛异常时 selfcheck_text 不该往外抛：{e!r}")
+    finally:
+        bot._HEALTH = old_health
+        bot.live_history.poll_errors = old_poll_errors
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -912,6 +1021,7 @@ def main():
     t_redact_wiring()
     t_history_window_label()
     t_usage_cmd()
+    t_selfcheck()
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()
