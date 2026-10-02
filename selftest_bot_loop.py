@@ -998,6 +998,55 @@ def t_selfcheck():
         bot.live_history.poll_errors = old_poll_errors
 
 
+def t_stall_selfheal():
+    sec("游标停滞：自愈汇报只说自己真做过的事（不许吹「已修好」）")
+
+    chk(bot._stall_threshold({}) == 6, "默认阈值 6 轮（5s 间隔 → 约 30 秒）")
+    chk(bot._stall_threshold({"health": {"cursor_stall_polls": 3}}) == 3, "可以配")
+    chk(bot._stall_threshold({"health": {"cursor_stall_polls": 1}}) == 2,
+        "下限 2（「1 轮不动」不算停滞，别一惊一乍）")
+    chk(bot._stall_threshold({"health": {"cursor_stall_polls": "六"}}) == 6,
+        "写歪了回默认（不静默当成某个数）")
+
+    # 汇报队列：主循环取走才发，且不重复发
+    bot.drain_notices()
+    bot.push_notice("甲")
+    bot.push_notice("")
+    bot.push_notice(None)
+    bot.push_notice("乙")
+    got = bot.drain_notices()
+    chk(got == ["甲", "乙"], f"按顺序取出、丢掉空值：{got}")
+    chk(bot.drain_notices() == [], "取完即空（同一句不会重复发）")
+
+    class _Cli:
+        pass
+
+    old = bot.live_history.force_rescan
+    try:
+        # ① 真的触发了重扫
+        bot.live_history.force_rescan = lambda c, min_interval=None: True
+        msg = bot._try_selfheal(_Cli())
+        chk("触发了一次重扫" in msg, f"说清自己做了什么：{msg[:46]!r}")
+        chk("修好" not in msg and "已恢复" not in msg,
+            "**绝不能**说「已修好」——force_rescan 返回的是「有没有触发」，不是结果")
+
+        # ② 被限流（45 秒内别人扫过）
+        bot.live_history.force_rescan = lambda c, min_interval=None: False
+        msg = bot._try_selfheal(_Cli())
+        chk("限流" in msg, f"被限流就如实说「没有重复扫」：{msg[:46]!r}")
+        chk("修好" not in msg, "限流时同样不许说修好了")
+
+        # ③ 重扫自己抛异常
+        def _boom(c, min_interval=None):
+            raise RuntimeError("炸了")
+        bot.live_history.force_rescan = _boom
+        msg = bot._try_selfheal(_Cli())
+        chk("抛了异常" in msg and "RuntimeError" in msg,
+            f"重扫抛异常要如实带上类型：{msg[:60]!r}")
+    finally:
+        bot.live_history.force_rescan = old
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1022,6 +1071,7 @@ def main():
     t_history_window_label()
     t_usage_cmd()
     t_selfcheck()
+    t_stall_selfheal()
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()

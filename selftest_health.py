@@ -516,6 +516,62 @@ def test_status_page():
     return ok
 
 
+def test_cursor_stall():
+    print("\n── 游标停滞：「静默失效」的确定性判据 ──")
+    ok = True
+
+    # cursor_key：只比「进度」，且与 dict 键顺序无关（顺序敏感会让判据时灵时不灵）
+    ok &= check("None → None", health.cursor_key(None) is None)
+    a = health.cursor_key({"fts_0": 1, "__time__": 100})
+    b = health.cursor_key({"__time__": 100, "fts_0": 1})
+    ok &= check("与 dict 键顺序无关", a == b, f"{a} vs {b}")
+    ok &= check("分片 rowid 变了就不同", a != health.cursor_key({"fts_0": 2, "__time__": 100}))
+    ok &= check("__time__ 前进也算变（它是消息时间水位线，只在真有新消息时前进）",
+                a != health.cursor_key({"fts_0": 1, "__time__": 101}))
+    n1 = health.cursor_key({"__nonttext__": {"a": 1, "b": 2}})
+    n2 = health.cursor_key({"__nonttext__": {"b": 2, "a": 1}})
+    n3 = health.cursor_key({"__nonttext__": {"a": 1, "b": 3}})
+    ok &= check("嵌套水位线（__nonttext__）与键顺序无关", n1 == n2, f"{n1} vs {n2}")
+    ok &= check("嵌套水位线内容变了就不同", n1 != n3)
+
+    h = health.Health({"health": {"status_file": os.path.join(_tmpdir(), "stall1.json")}},
+                      notify_fn=FakeNotifier())
+    cur = {"fts_0": 10, "__time__": 1000}
+    h.note_poll(cursor=cur)
+    ok &= check("第一轮没有前值可比较 → 不算停滞",
+                h.snapshot()["cursor_stalls"] == 0, h.snapshot()["cursor_stalls"])
+    for _ in range(3):
+        h.note_poll(cursor=dict(cur))
+    ok &= check("游标不动 → 逐轮累计", h.snapshot()["cursor_stalls"] == 3,
+                h.snapshot()["cursor_stalls"])
+    ok &= check("最长停滞也记下来（诊断用）", h.snapshot()["max_cursor_stalls"] == 3,
+                h.snapshot()["max_cursor_stalls"])
+    ok &= check("快照里带了这两个字段", "cursor_stalls" in h.snapshot()
+                and "max_cursor_stalls" in h.snapshot())
+
+    h.stall_reported = True                  # 假装已经汇报过
+    h.note_poll(cursor={"fts_0": 11, "__time__": 1000})
+    ok &= check("游标一动 → 停滞清零", h.snapshot()["cursor_stalls"] == 0)
+    ok &= check("汇报过之后又动了 → 给出一次性「已恢复」信号",
+                h.recovered_from_stall is True)
+    ok &= check("汇报标记同时清掉（下次停滞还能再报一次）", h.stall_reported is False)
+
+    h2 = health.Health({"health": {"status_file": os.path.join(_tmpdir(), "stall2.json")}},
+                       notify_fn=FakeNotifier())
+    h2.note_poll(cursor={"fts_0": 1})
+    h2.note_poll(cursor={"fts_0": 2})
+    ok &= check("没汇报过就不该冒「已恢复」（否则用户莫名其妙）",
+                h2.recovered_from_stall is False)
+
+    h3 = health.Health({"health": {"status_file": os.path.join(_tmpdir(), "stall3.json")}},
+                       notify_fn=FakeNotifier())
+    for _ in range(5):
+        h3.note_poll(cursor=None)
+    ok &= check("游标还是 None（还没拿到游标）时不许乱判停滞",
+                h3.snapshot()["cursor_stalls"] == 0, h3.snapshot()["cursor_stalls"])
+    return ok
+
+
 def main():
     ok = True
     print("=" * 50)
@@ -525,6 +581,7 @@ def main():
     ok &= test_health_login_alerts()
     ok &= test_snapshot_minimal()
     ok &= test_note_poll_shape()
+    ok &= test_cursor_stall()
     ok &= test_notes_and_status_file()
     ok &= test_status_page()
     print("\n" + "=" * 50)

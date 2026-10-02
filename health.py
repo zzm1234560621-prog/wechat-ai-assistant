@@ -188,6 +188,33 @@ def _kill_quietly(p):
         pass
 
 
+def cursor_key(cursor):
+    """把游标压成「只表示进度」的可比较值，用来判定**游标停滞**。
+
+    为什么这就是「静默失效」的判据：fts 句柄掉了之后查询**不报错、只返回 0 行**，
+    于是游标再也不动，而用户看到的是「它没反应」——和「一切正常」一模一样。
+    游标一动就说明确实收到东西了，所以「连续 N 轮不动」是一个**确定性**的信号，
+    比猜「它是不是卡了」可靠。
+
+    ⚠️ 这里**不能**把时间戳之类的每轮都变的字段算进来：那会让「停滞」永远判不出来，
+    而且失效得非常安静。本项目游标的形状是
+    `{fts分片表名: rowid}` + `__time__`（**消息时间水位线，只在真有新消息时前进**）
+    + `__nonttext__`（非文本补捞水位线），三个都是进度，所以整份 dict 都能比。
+    真出现每轮都变的键时，要在这里把它剔掉，而不是放宽判据。
+    """
+    if cursor is None:
+        return None
+    if isinstance(cursor, dict):
+        parts = []
+        for k in sorted(cursor, key=str):
+            v = cursor[k]
+            if isinstance(v, dict):
+                v = tuple(sorted((str(a), str(b)) for a, b in v.items()))
+            parts.append((str(k), str(v)))
+        return tuple(parts)
+    return str(cursor)
+
+
 class Health:
     """运行期健康记账本。所有 note_* 方法都只改内存，绝不做 IO/查库。
 
@@ -230,6 +257,12 @@ class Health:
         self.last_cursor = None
         self.poll_errors = {}
         self.poll_count = 0
+        # —— 游标停滞：「静默失效」的可观察判据（见 cursor_key 的说明）——
+        self.cursor_stalls = 0          # 当前连续多少轮游标没动
+        self.max_cursor_stalls = 0      # 本次运行以来的最长停滞（诊断用）
+        self.stall_reported = False     # 这一轮停滞是否已经汇报过（防每轮刷屏）
+        self.recovered_from_stall = False   # 一次性：停滞汇报过之后游标又动了
+        self._last_cursor_key = None
 
         # —— 发送事实 ——
         self.last_send_ok = None
@@ -282,6 +315,21 @@ class Health:
                     self.poll_errors = {"?": (f"形状异常：{errors!r}", 1)}
             else:
                 self.poll_errors = {}
+            # 游标停滞判定：只比「进度」，不做 IO
+            key = cursor_key(self.last_cursor)
+            if key is not None:
+                if self._last_cursor_key is not None and key == self._last_cursor_key:
+                    self.cursor_stalls += 1
+                    if self.cursor_stalls > self.max_cursor_stalls:
+                        self.max_cursor_stalls = self.cursor_stalls
+                else:
+                    if self.stall_reported:
+                        # 停滞汇报过、现在又动了 = 恢复了。给 bot 一次性信号去说一声，
+                        # 免得用户一直惦记「到底好没好」。
+                        self.recovered_from_stall = True
+                    self.cursor_stalls = 0
+                    self.stall_reported = False      # 动了 -> 下次停滞可以再报一次
+                self._last_cursor_key = key
         except Exception as e:
             _warn(f"note_poll 记账失败：{e}")
 
@@ -428,6 +476,8 @@ class Health:
             "last_poll_at": _iso(self.last_poll_at),
             "last_poll_age_seconds": _age(self.last_poll_at, now),
             "last_cursor": self.last_cursor,
+            "cursor_stalls": self.cursor_stalls,
+            "max_cursor_stalls": self.max_cursor_stalls,
             "poll_errors": {str(k): [str(v[0]), v[1]] if _is_pair(v) else v
                             for k, v in (self.poll_errors or {}).items()},
             # 发送

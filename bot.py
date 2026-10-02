@@ -76,6 +76,51 @@ def _h():
     return _HEALTH
 
 
+# ── 看护攒给主循环的「主动汇报」─────────────────────────────────────────
+# 收消息通道（iter_aixed_messages）能查库、但**不能发消息**：发消息要走主循环那条线
+# （hook 不支持并发）。所以那边把要说的话塞进这个队列，主循环每轮开头取走发出去。
+# 这是「静默失效」这条主线上的一环：出问题时**它主动说**，而不是等用户发现「没反应」。
+_NOTICES = []
+
+
+def push_notice(text):
+    if text:
+        _NOTICES.append(str(text))
+
+
+def drain_notices():
+    out = list(_NOTICES)
+    del _NOTICES[:]
+    return out
+
+
+def _try_selfheal(client):
+    """库句柄疑似掉了 → 触发一次重扫。返回一句**如实**的话。
+
+    ⚠️ `live_history.force_rescan` 返回的是「**这次有没有真的触发重扫**」
+    （它自带 45s 限流，别人刚扫过就返回 False），**不是「修好了没」**。
+    所以这里绝不说「已修好」——到底修好没有，由**接下来的轮询**告诉我们
+    （游标动了就是好了，`Health.recovered_from_stall` 会给一次性信号）。
+    这也是「没跑就是没跑」的同一条规矩：只报自己真做过的事。
+    """
+    try:
+        triggered = live_history.force_rescan(client)
+    except Exception as e:
+        return f"试着重扫时抛了异常：{type(e).__name__}: {e}"
+    if triggered:
+        return ("我已经自己触发了一次重扫（force_rescan）。接下来几轮游标要是动了，"
+                "就说明**数据又能读到了**；要是一直不动，再按下面做。")
+    return ("刚才 45 秒内已经重扫过（限流中），这次没有重复扫。")
+
+
+def _stall_threshold(cfg):
+    """连续多少轮游标不动才算「停滞」。默认 6 轮（轮询间隔 5 秒 → 约 30 秒）。"""
+    try:
+        return max(2, int(((cfg or {}).get("health") or {}).get("cursor_stall_polls", 6)))
+    except (TypeError, ValueError):
+        return 6
+
+
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 
@@ -1824,6 +1869,31 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
                 h.note_poll(cursor=cursor)
             except Exception:
                 traceback.print_exc()
+
+        # ── 游标停滞：把「静默失效」从「用户自己发现没反应」变成「它主动说」──
+        # 判据是**确定性**的：连续 N 轮游标一个字都没动（见 health.cursor_key）。
+        # 最可能的原因是库句柄掉了（不报错、只返回 0 行）。先自己试着重扫，
+        # **只汇报一次**（stall_reported），绝不每轮刷屏。
+        if h is not None:
+            try:
+                if h.cursor_stalls >= _stall_threshold(cfg) and not h.stall_reported:
+                    h.stall_reported = True
+                    heal = _try_selfheal(client)
+                    push_notice(
+                        f"⚠️ 已经连续 {h.cursor_stalls} 轮**没收到任何新消息**，"
+                        f"我怀疑数据库句柄掉了（这种情况查询不报错、只是查不出东西）。\n"
+                        f"{heal}\n"
+                        f"该你做的（按顺序）：\n"
+                        f"  1. 先在微信里确认**没掉登录**（设置→没退回登录界面）；"
+                        f"掉登录只能你扫码，bot 自己恢复不了。\n"
+                        f"  2. 还不行就**重启 bot**。\n"
+                        f"  3. 想看清楚一点，发 `/自检`。")
+                if getattr(h, "recovered_from_stall", False):
+                    h.recovered_from_stall = False
+                    push_notice(f"✅ 刚才那段「收不到新消息」已经过去了："
+                                f"游标又开始动了（最长停滞 {h.max_cursor_stalls} 轮）。")
+            except Exception:
+                traceback.print_exc()
         if polls % 30 == 0:
             errs = live_history.poll_errors()
             extra = ""
@@ -2209,6 +2279,15 @@ def main():
                     time.sleep(5)
                     source = make_source()
                     continue
+
+                # 看护攒下的主动汇报（游标停滞 / 自愈 / 恢复）——在这里发出去。
+                # 必须放在「非文本就 continue」**之前**：否则一条图片/表情消息
+                # 就会把汇报卡在队列里，用户还是看不到「它没反应」的原因。
+                for _notice in drain_notices():
+                    try:
+                        send(_notice, control_chat)
+                    except Exception:
+                        traceback.print_exc()
 
                 if getattr(msg, "type", 0) != 1:  # 1 = 文本
                     continue
