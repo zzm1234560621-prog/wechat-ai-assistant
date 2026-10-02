@@ -236,126 +236,177 @@ def _verify_real_flow():
         print(("[√] " if ok else "[!] ") + msg)
 
 
+def _submenu(title, entries):
+    """单键子菜单。`entries` = [(键, 标签, 回调)]；回调返回字符串就打印出来。
+
+    ⚠️ **为什么一律单键**：这个菜单一度平铺到 20 项，于是 [10]~[20] 需要**敲两个数字**——
+    用户当场就说「我键盘怎么有 10？」。手放在数字键上的人期待的是**一个键一个动作**，
+    所以顶层只留最常用的 8 个，其余按主题收进子菜单；**[0] 恒为返回**（在顶层就是退出）。
+    """
+    while True:
+        print()
+        print("=" * 46)
+        print(f"  {title}")
+        print("=" * 46)
+        for k, label, _fn in entries:
+            print(f"   [{k}] {label}")
+        print("   [0] 返回主菜单")
+        print("=" * 46)
+        c = _clean(input("请输入数字选择："))
+        if c == "0":
+            return None
+        hit = None
+        for k, _label, fn in entries:
+            if c == k:
+                hit = fn
+                break
+        if hit is None:
+            top = max((k for k, _l, _f in entries), key=lambda s: int(s))
+            print(f"无效选择，请输入 0~{top}。")
+        else:
+            msg = hit()
+            if msg:
+                print(msg)
+        input("\n按回车返回 ... ")
+
+
+# ── 各个动作（菜单和子菜单共用同一批函数，别写两份）──────────────────────
+
+def act_downgrade():
+    run("downgrade.py", admin=True)
+    print("已在独立窗口启动降级程序（需管理员权限），请在那边操作。")
+    return None
+
+
+def act_start():
+    ok, msg = botctl.start()
+    return ("[√] " if ok else "[!] ") + msg
+
+
+def act_stop():
+    print(botctl.stop(dry_run=True)[1])
+    if not _confirm("确认停止？(y/N) "):
+        return "已取消。"
+    ok, msg = botctl.stop()
+    return ("[√] " if ok else "[!] ") + msg
+
+
+def act_restart():
+    if not _confirm("确认重启助手？(y/N) "):
+        return "已取消。"
+    ok, msg = botctl.restart()
+    return ("[√] " if ok else "[!] ") + msg
+
+
+def act_foreground():
+    if not env.venv_ready():
+        return "虚拟环境未就绪（不存在、已失效或依赖缺失），请先「安装依赖」。"
+    print("[自动] 前台启动（Ctrl+C 停止）...")
+    subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
+    return None
+
+
+def act_log_tail():
+    print()
+    print(botctl.tail(40))
+    return None
+
+
+def act_hook(script, what):
+    if not _confirm(f"确认「{what}」？可能要管理员权限。(y/N) "):
+        return "已取消。"
+    ok, msg = run_ps1(script)
+    return ("[√] " if ok else "[!] ") + msg
+
+
+def act_status_page():
+    enabled, host, port, err = _status_page()
+    if err:
+        return f"读不到 config.yaml 的 status 段：{err}"
+    if not enabled:
+        return ("状态页是**关着的**（config.yaml 里 `status.enabled: false`）。\n"
+                "要开：把那一项改成 true，然后重启助手。\n"
+                "（它只绑回环地址，页面上有 wxid/群名，别往局域网上开。）")
+    if not botctl.is_running():
+        return (f"配置里是开着的（{host}:{port}），但**助手没在跑**，页面不会有人响应。"
+                f"先启动助手。")
+    url = f"http://{host}:{port}"
+    print(f"打开 {url} …")
+    try:
+        os.startfile(url)          # 只有 Windows 有；这是 Windows 项目
+    except (AttributeError, OSError) as e:
+        return f"打不开浏览器（{e}），自己访问：{url}"
+    return None
+
+
 def menu():
     while True:
         print()
         print("=" * 46)
         print("           微信 AI 助手 · 控制台")
         print("=" * 46)
-        print("  安装 / 首次配置")
         print("   [1] 降级微信 4.x -> 3.9.x")
         print("   [2] 安装依赖（自动识别版本）")
-        print("   [3] 配置模型（选服务商 + 填 key）")
-        print("   [4] 自动（一键：检测→装依赖→启动）")
-        print("  运行控制")
-        print("   [5] 启动助手（后台，无窗口）")
-        print("   [6] 停止助手")
-        print("   [7] 重启助手")
-        print("   [8] 启动助手（前台，看日志）")
-        print("   [9] 实时看日志（Ctrl+C 返回）")
-        print("  诊断 / 排查")
-        print("  [10] 看状态（进程 + 健康快照）")
-        print("  [11] 看最近日志（40 行）")
-        print("  [12] 真机自检（只读；**需先停 bot**，会问你）")
-        print("  [13] 跑全部自测（24 份，不用真微信）")
-        print("  Hook / 微信")
-        print("  [14] 装 hook（放 version.dll + 禁用微信自动更新）")
-        print("  [15] 摘 hook（改名 .disabled，会强杀卡死的微信）")
-        print("  [16] 装回 hook（并重启微信）")
-        print("  [17] 查看微信版本 / 开机自启状态")
-        print("  其它")
-        print("  [18] 开机自启：开启")
-        print("  [19] 开机自启：关闭")
-        print("  [20] 打开状态页（本地只读网页）")
+        print("   [3] 启动助手（后台，无窗口）")
+        print("   [4] 停止 / 重启助手")
+        print("   [5] 看状态（进程 + 健康快照）")
+        print("   [6] 看日志")
+        print("   [7] 一键开始（检测 -> 装依赖 -> 启动）")
+        print("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）")
         print("   [0] 退出")
         print("=" * 46)
 
         c = _clean(input("请输入数字选择："))
 
         if c == "1":
-            run("downgrade.py", admin=True)
-            print("已在独立窗口启动降级程序（需管理员权限），请在那边操作。")
+            act_downgrade()
         elif c == "2":
             run("installer.py")
         elif c == "3":
-            run("setup_llm.py")
+            print(act_start())
         elif c == "4":
-            auto()
+            _submenu("停止 / 重启助手", [
+                ("1", "停止助手", act_stop),
+                ("2", "重启助手", act_restart),
+            ])
         elif c == "5":
-            ok, msg = botctl.start()
-            print(("[√] " if ok else "[!] ") + msg)
-        elif c == "6":
-            print(botctl.stop(dry_run=True)[1])
-            if _confirm("确认停止？(y/N) "):
-                ok, msg = botctl.stop()
-                print(("[√] " if ok else "[!] ") + msg)
-            else:
-                print("已取消。")
-        elif c == "7":
-            if _confirm("确认重启助手？(y/N) "):
-                ok, msg = botctl.restart()
-                print(("[√] " if ok else "[!] ") + msg)
-            else:
-                print("已取消。")
-        elif c == "8":
-            if not env.venv_ready():
-                print("虚拟环境未就绪（不存在、已失效或依赖缺失），请先选 [2] 安装依赖。")
-            else:
-                subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
-        elif c == "9":
-            botctl.follow()
-        elif c == "10":
             health_screen()
-        elif c == "11":
-            print()
-            print(botctl.tail(40))
-        elif c == "12":
-            _verify_real_flow()
-        elif c == "13":
-            run("selftest_all.py")
-        elif c in ("14", "15", "16"):
-            which = {"14": ("do_hook_install.ps1", "装 hook"),
-                     "15": ("do_remove_hook.ps1", "摘 hook（会强杀微信）"),
-                     "16": ("do_restore_hook.ps1", "装回 hook（会重启微信）")}[c]
-            if _confirm(f"确认「{which[1]}」？可能要管理员权限。(y/N) "):
-                ok, msg = run_ps1(which[0])
-                print(("[√] " if ok else "[!] ") + msg)
-            else:
-                print("已取消。")
-        elif c == "17":
-            print("\n--- 微信版本 ---")
-            run("wechat_version.py")
-            print("--- 开机自启 ---")
-            run("autostart.py", ["status"])
-        elif c == "18":
-            run("autostart.py", ["on"])
-        elif c == "19":
-            run("autostart.py", ["off"])
-        elif c == "20":
-            enabled, host, port, err = _status_page()
-            if err:
-                print(f"读不到 config.yaml 的 status 段：{err}")
-            elif not enabled:
-                print("状态页是**关着的**（config.yaml 里 `status.enabled: false`）。")
-                print("要开：把那一项改成 true，然后 [7] 重启助手。")
-                print("（它只绑回环地址，页面上有 wxid/群名，别往局域网上开。）")
-            elif not botctl.is_running():
-                print(f"配置里是开着的（{host}:{port}），但**助手没在跑**，页面不会有人响应。")
-                print("先 [5] 启动助手。")
-            else:
-                url = f"http://{host}:{port}"
-                print(f"打开 {url} …")
-                try:
-                    os.startfile(url)          # 只有 Windows 有；这是 Windows 项目
-                except (AttributeError, OSError) as e:
-                    print(f"打不开浏览器（{e}），自己访问：{url}")
+        elif c == "6":
+            _submenu("看日志", [
+                ("1", "最近 40 行", act_log_tail),
+                ("2", "实时跟随（Ctrl+C 返回）", lambda: botctl.follow()),
+            ])
+        elif c == "7":
+            auto()
+        elif c == "8":
+            _submenu("更多", [
+                ("1", "配置模型（选服务商 + 填 key）", lambda: run("setup_llm.py")),
+                ("2", "真机自检（只读；需先停 bot，会问你）", _verify_real_flow),
+                ("3", "跑全部自测（不用真微信）", lambda: run("selftest_all.py")),
+                ("4", "启动助手（前台，看日志）", act_foreground),
+                ("5", "查看微信版本", lambda: run("wechat_version.py")),
+                ("6", "开机自启（开 / 关 / 看）", lambda: _submenu("开机自启", [
+                    ("1", "开启", lambda: run("autostart.py", ["on"])),
+                    ("2", "关闭", lambda: run("autostart.py", ["off"])),
+                    ("3", "查看状态", lambda: run("autostart.py", ["status"])),
+                ])),
+                ("7", "Hook（装 / 摘 / 装回）", lambda: _submenu("Hook 与微信", [
+                    ("1", "装 hook（放 version.dll + 禁用微信自动更新）",
+                     lambda: act_hook("do_hook_install.ps1", "装 hook")),
+                    ("2", "摘 hook（改名 .disabled，会强杀卡死的微信）",
+                     lambda: act_hook("do_remove_hook.ps1", "摘 hook")),
+                    ("3", "装回 hook（并重启微信）",
+                     lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
+                ])),
+                ("8", "打开状态页（本地只读网页）", act_status_page),
+            ])
         elif c == "0":
             print("再见！")
             break
         else:
-            print("无效选择，请输入 0~20。")
+            print("无效选择，请输入 0~8。")
 
-        input("\n按回车返回菜单 ...")
+        input("\n按回车返回菜单 ... ")
 
 
 if __name__ == "__main__":
