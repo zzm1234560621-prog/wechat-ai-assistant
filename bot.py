@@ -9,6 +9,7 @@
 依赖 wcferry（必须匹配微信版本）。用法：python bot.py，Ctrl+C 退出。
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -975,6 +976,150 @@ def is_own_reply(text):
     """这条是不是我们自己刚发出去的回复。"""
     t = _SENT_RECENT.get(str(text).strip())
     return t is not None and (time.time() - t) < _SENT_TTL
+
+
+# ── 已执行指纹：同一条待确认项绝不执行两次（落盘，扛得住重启） ──────────────
+#
+# 为什么需要它：待确认队列是**落盘**的（`data/state.json` 的 `pending`），崩溃重启
+# 之后会被恢复出来。`save_pending()` 已经在「用户确认后」立刻落盘，把窗口压到最小，
+# 但仍有缝：**发送成功** 与 **落盘移除这条** 之间进程死掉，重启后那条会被恢复出来，
+# 而它其实已经发出去了——再执行一次就是**给别人重复发消息**（不可逆）。
+#
+# 所以执行过的待确认项要留一个指纹。关键设计：**指纹里包含这条自己的 `ts`**
+# （见 `set_pending`，每条登记时带一个创建时间）。
+#   * 同一个 `ts` = **同一条**待确认项（就是崩溃恢复出来的那一份）→ 拦住；
+#   * 用户重新说一遍「再给张三发一次」会生成**新的 ts** → 指纹不同 → 照常放行。
+# 这样它只拦「同一条执行两次」，**不拦「同样内容的第二条」**——后者是用户的正当需求，
+# 拦下来就是坏功能。
+_EXECUTED_KEY = "executed"
+_EXECUTED_TTL_DEFAULT = 1800.0
+
+
+def _as_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def executed_ttl(cfg=None):
+    """指纹保留多久。默认 1800 秒——和 `state.resume_window` 同量级：
+    比这更久的恢复项本来也不会被当成「本次重启要补的」。"""
+    try:
+        v = ((cfg or {}).get("state") or {}).get("executed_ttl", _EXECUTED_TTL_DEFAULT)
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return _EXECUTED_TTL_DEFAULT
+
+
+def item_fingerprint(item):
+    """给一条待确认项算稳定指纹。**`ts` 一定要算进去**（理由见上面那段注释）。"""
+    if not isinstance(item, dict):
+        return ""
+    try:
+        items = json.dumps(item.get("items"), ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        items = ""
+    parts = [str(item.get("kind") or ""),
+             str(item.get("to_wxid") or ""),
+             str(item.get("to_name") or ""),
+             str(item.get("cmd") or ""),
+             str(item.get("text") or ""),
+             str(item.get("xml") or ""),
+             str(item.get("image") or ""),
+             str(item.get("count") or 1),
+             repr(item.get("ts")),
+             items]
+    return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def describe_executed(item):
+    """给用户看的一句话「这条是什么」。别把 wxid 摆出来。"""
+    if not isinstance(item, dict):
+        return "这一条"
+    kind = item.get("kind")
+    who = item.get("to_name") or item.get("to_wxid") or ""
+    if kind == "shell":
+        cmd = str(item.get("cmd") or "")
+        return f"本地命令「{cmd[:40]}{'…' if len(cmd) > 40 else ''}」"
+    if kind == "broadcast_scope":
+        return f"群发（{len(item.get('items') or [])} 人）的范围确认"
+    if kind == "broadcast":
+        return f"群发给 {len(item.get('items') or [])} 人的那一批"
+    if kind == "auto":
+        return f"给 {who} 的自动回复草稿"
+    if item.get("xml"):
+        return f"转发给 {who} 的那条消息"
+    if item.get("image"):
+        return f"发给 {who} 的那张图"
+    return f"发给 {who} 的那条消息"
+
+
+def _fmt_ago(seconds):
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分钟"
+    return f"{s // 3600} 小时 {(s % 3600) // 60} 分"
+
+
+def already_executed(item, cfg=None):
+    """这条待确认项是不是**已经执行过**了。返回 `(bool, 距上次多少秒)`。
+
+    两头都有代价：**漏拦** = 给别人重复发消息（不可逆）；**误拦** = 用户被要求
+    重说一遍。所以判据取严：只要**指纹认得出来**且没过期，就按「已执行」拦住；
+    只有在指纹根本算不出（item 结构坏掉）或账面数据读不出来时才放行。
+    """
+    fp = item_fingerprint(item)
+    if not fp:
+        return False, None
+    book = state_get(_EXECUTED_KEY) or {}
+    if not isinstance(book, dict):
+        return False, None
+    rec = book.get(fp)
+    if not isinstance(rec, dict):
+        return False, None
+    try:
+        ago = time.time() - float(rec.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False, None
+    if ago > executed_ttl(cfg):
+        return False, None
+    return True, ago
+
+
+def remember_executed(item, cfg=None):
+    """记下「这条待确认项真的执行过了」。
+
+    调用点必须在**真正尝试执行之后**：早于执行就落指纹的话，一次「还没来得及发
+    就崩了」会让恢复出来的那条被拦住，用户以为发了其实没发（比重复发更糟——
+    这正是项目一贯的「没跑就是没跑」）。
+    """
+    fp = item_fingerprint(item)
+    if not fp:
+        return
+    try:
+        ttl = executed_ttl(cfg)
+        now = time.time()
+        book = state_get(_EXECUTED_KEY) or {}
+        if not isinstance(book, dict):
+            book = {}
+        book[fp] = {"ts": now, "what": describe_executed(item)}
+        # 顺手清过期的，免得 state.json 无限长
+        book = {k: v for k, v in book.items()
+                if isinstance(v, dict) and (now - _as_float(v.get("ts"), now)) <= ttl}
+        state_set(_EXECUTED_KEY, book)
+    except Exception:
+        # 记账失败只告警，绝不影响这次执行本身
+        traceback.print_exc()
+
+
+def _as_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def shell_command_text(item, cfg):
@@ -2085,6 +2230,21 @@ def main():
                             # 队列已经变了就**立刻**落盘：否则「这条已经执行了」
                             # 和「盘上还记着它」之间有窗口，崩溃重启会把它恢复出来。
                             save_pending(pending_chats, cfg)
+                    if item:
+                        # ⚠️ 同一条待确认项绝不执行两次（已执行指纹落盘，扛得住重启）。
+                        # 典型场景：发送成功后、`save_pending` 落盘之前进程死掉，
+                        # 重启后这条被恢复出来——它其实已经发出去了，再执行一次就是
+                        # **给别人重复发消息**。指纹里带这条自己的 `ts`，所以只拦
+                        # 「同一条」，用户重说一遍生成的新条目照常放行。
+                        dup, ago = already_executed(item, cfg)
+                        if dup:
+                            print(f"[bot] 拒绝重复执行（{_fmt_ago(ago)} 前执行过）: "
+                                  f"{describe_executed(item)}")
+                            send(f"这一条**没有重复执行**：{describe_executed(item)}"
+                                 f"在 {_fmt_ago(ago)} 前已经执行过了。\n"
+                                 f"（同一条待确认项只执行一次。你要是确实想再来一次，"
+                                 f"重新说一遍就行——那会是一条新的。）", sender)
+                            continue
                     if item and item.get("kind") == "broadcast_scope":
                         # 第一道确认（范围）已过 -> 现在才**生成内容**并分流。
                         # 这一段不过模型：范围是用户亲自确认的，剩下只是照做。
@@ -2095,6 +2255,7 @@ def main():
                             continue
                         send(report, sender)
                         print(f"[bot] 群发范围已确认 -> {len(item.get('items') or [])} 人")
+                        remember_executed(item, cfg)     # 范围这步也算「执行过」了
                         continue
                     if item and item.get("kind") == "broadcast":
                         # 第二道确认（内容）已过 -> 逐条发出。**逐字发预览里那一条**。
@@ -2111,6 +2272,8 @@ def main():
                         else:
                             print(f"[bot] 群发完成 {n} 条")
                             send(f"群发 {n} 条已发出（逐条按上面那段原文发的）。", sender)
+                        # 失败也记：已经发出去的那 n 条收不回来，重来一遍会重复发
+                        remember_executed(item, cfg)
                         continue
                     if item and item.get("kind") == "shell":
                         # 本地执行：用户回「确认」才真跑。shell 没有收件人——绝不走
@@ -2125,6 +2288,7 @@ def main():
                         send(f"好的，开始执行（超过 {secs} 秒就算超时）：\n"
                              f"{item.get('cmd') or ''}", sender)
                         send(shell_command_text(item, cfg), sender)
+                        remember_executed(item, cfg)     # 真跑过了才记
                         continue
                     if item:
                         agent_cfg = cfg.get("agent") or {}
@@ -2167,6 +2331,8 @@ def main():
                             print(f"[bot] 确认发送 -> {item['to_name']}: {what} ×{n}")
                             send(f"已把 {n} 张{what}发给 {item['to_name']}。" if n > 1
                                  else f"已把{what}发给 {item['to_name']}。", sender)
+                        # 同上：部分失败也记，避免恢复出来的同一条把已发出的再发一遍
+                        remember_executed(item, cfg)
                         continue
 
                 # 2) 否则走 AI 问答（开了 agent 就带工具）

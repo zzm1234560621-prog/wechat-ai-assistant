@@ -827,6 +827,68 @@ def t_inline_image_round(tmp):
     chk(bot.with_image_notes("答复正文", []) == "答复正文", "没有说明时原样返回")
 
 
+def t_executed_once(tmp):
+    sec("已执行指纹：同一条不执行两次（落盘、扛重启），但同样内容的第二条要放行")
+    old_path, old_state = bot.STATE_PATH, bot._STATE
+    try:
+        bot.STATE_PATH = os.path.join(tmp, "state_exec.json")
+        bot._STATE = None
+
+        def item(text="好的", ts=1790000000.0):
+            return {"kind": "agent", "to_wxid": "wxid_a", "to_name": "张三",
+                    "text": text, "count": 1, "ts": ts}
+
+        it = item()
+        dup, _ = bot.already_executed(it)
+        chk(not dup, "没执行过 → 放行")
+
+        bot.remember_executed(it, {})
+        dup, ago = bot.already_executed(it)
+        chk(dup and ago is not None and ago < 5, "执行过 → 拦住，并给出「多久以前」")
+
+        # ★ 关键：模拟崩溃重启（清内存、从盘重新读）
+        bot._STATE = None
+        dup, _ = bot.already_executed(it)
+        chk(dup, "**重启后仍然拦得住**（这正是加它的理由：恢复出来的那条已经发过了）")
+
+        # ★ 反向关键：用户重说一遍会生成**新的 ts**，那是新的一条，必须放行
+        dup, _ = bot.already_executed(item(ts=1790000001.0))
+        chk(not dup, "同样内容但新的 ts → **放行**（不拦用户的正当重发）")
+
+        # 内容变了也要放行
+        dup, _ = bot.already_executed(item(text="另一句"))
+        chk(not dup, "内容不同 → 放行")
+
+        # 指纹要跟字段顺序无关（否则同一件事换个构造顺序就绕过了闸门）
+        a = {"kind": "agent", "text": "x", "ts": 1.0}
+        b = {"ts": 1.0, "text": "x", "kind": "agent"}
+        chk(bot.item_fingerprint(a) == bot.item_fingerprint(b),
+            "指纹与 dict 字段顺序无关")
+
+        # 过期就不认了
+        bot._STATE = None
+        dup, _ = bot.already_executed(it, {"state": {"executed_ttl": 0}})
+        chk(not dup, "超过 executed_ttl → 不再拦（否则 state.json 会无限长）")
+
+        # 记新条目时顺手清过期的（种子一条很老的，再记一条新的）
+        bot._STATE = None
+        bot.state_set("executed", {"old_fp": {"ts": time.time() - 99999, "what": "老的"}})
+        bot.remember_executed(item(text="新的", ts=3.0), {})
+        book = bot.state_get("executed") or {}
+        chk("old_fp" not in book and len(book) == 1,
+            "记新条目时清掉过期项（账本不会越积越多）")
+
+        # 坏账面数据不许抛
+        bot.state_set("executed", "这不是字典")
+        try:
+            dup, _ = bot.already_executed(it)
+            chk(not dup, "账面结构坏掉 → 当没执行过，不抛异常")
+        except Exception as e:
+            chk(False, f"账面坏掉时不该抛：{e!r}")
+    finally:
+        bot.STATE_PATH, bot._STATE = old_path, old_state
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -839,6 +901,7 @@ def main():
     try:
         t_state(tmp)
         t_pending_persist(tmp)
+        t_executed_once(tmp)
         t_batch_survives_consumer_error(tmp)
         t_poll_failure_throttled(tmp)
         t_image_dirs_union(tmp)
