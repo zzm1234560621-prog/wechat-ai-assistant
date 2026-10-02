@@ -1311,6 +1311,66 @@ def export_conversation(wcf, cfg, contacts, who_raw):
             f"（用记事本/编辑器打开就行；这个目录会自动清理旧的导出。）")
 
 
+def handle_cursor_stall(h, client, cfg):
+    """游标停滞时的处置。返回**要发给用户的话**（`None` = 一个字都不说）。
+
+    ⚠️⚠️ **游标不动 ≠ 故障**：没人发消息的时候游标本来就不动。
+    所以这里只把「停滞」当触发条件，到阈值去问**权威探针**
+    （`live_history.fts_alive`：fts 分片还读得到吗）：
+      * 探针说好 → **空闲**，返回 None（什么都不说，只记 `stall_probed` 免得每轮白探）；
+      * 探针说坏 → 那才是真失效，返回要汇报的话，并记 `stall_reported`（只报一次）。
+
+    **为什么抽成独立函数**：这段判断原来埋在 `iter_aixed_messages` 里，自测只能覆盖到
+    它的零件（阈值、通知队列、`_try_selfheal`），**覆盖不到这个判断本身**——
+    于是「空闲被误报成「数据库句柄掉了」」这个 bug 一路跑到了真机上
+    （2026-10-02 真机误报，用户没说话却收到两条假警报）。抽出来才测得到。
+    """
+    if h is None or getattr(h, "stall_probed", False):
+        return None
+    if h.cursor_stalls < _stall_threshold(cfg):
+        return None
+    h.stall_probed = True
+    try:
+        alive, detail = live_history.fts_alive(client)
+    except Exception as e:
+        # 探针自己炸了也不能当成「故障」来吓用户——如实说探不动，但不报警
+        print(f"[bot] 探针 fts_alive 出错（不当成故障）：{type(e).__name__}: {e}")
+        return None
+    if alive:
+        return None            # ← 空闲，不是故障。**这里绝不许报任何东西。**
+    h.stall_reported = True
+    return (f"⚠️ **收不到新消息了**：连续 {h.cursor_stalls} 轮轮询都没有新消息，"
+            f"而且探针确认读不到 fts 分片——\n"
+            f"  {detail}\n"
+            f"（这就是「静默失效」：查询不报错、只是查不出东西，"
+            f"看起来和一切正常一模一样。）\n"
+            f"{_try_selfheal(client)}\n"
+            f"该你做的（按顺序）：\n"
+            f"  1. 先在微信里确认**没掉登录**（设置→没退回登录界面）；"
+            f"掉登录只能你扫码，bot 自己恢复不了。\n"
+            f"  2. 还不行就**重启 bot**。\n"
+            f"  3. 想看清楚一点，发 `/自检`。")
+
+
+def handle_stall_recovery(h):
+    """真汇报过之后恢复了 → 给一句「过去了」；否则 `None`。
+
+    ⚠️ **判据是 `recovered_from_stall` 本身，这里绝不能再要求 `stall_reported`。**
+    原因（差点写错、自测当场抓出来）：`Health.note_poll` 在游标动的那一刻
+    **同时**做三件事——置 `recovered_from_stall=True`、清 `stall_reported`、清 `stall_probed`。
+    所以等这个函数跑的时候 `stall_reported` **早就是 False 了**；
+    再加一句 `and h.stall_reported`，这个提示就**永远不会出现**（功能静默失效）。
+    可 `recovered_from_stall` 只在「当时确实 `stall_reported` 为真」时才被置上
+    （见 `Health.note_poll`），所以它自己就够可靠——**空闲时探过但没报的那种，
+    这里绝不会冒出一句莫名其妙的「刚才的问题过去了」**。
+    """
+    if h is None or not getattr(h, "recovered_from_stall", False):
+        return None
+    h.recovered_from_stall = False
+    return ("✅ 刚才那次「读不到 fts 分片」已经过去了：数据又能读到了"
+            f"（当时连续 {h.max_cursor_stalls} 轮没动静）。")
+
+
 def executed_ttl(cfg=None):
     """指纹保留多久。默认 1800 秒——和 `state.resume_window` 同量级：
     比这更久的恢复项本来也不会被当成「本次重启要补的」。"""
@@ -1969,28 +2029,14 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
             except Exception:
                 traceback.print_exc()
 
-        # ── 游标停滞：把「静默失效」从「用户自己发现没反应」变成「它主动说」──
-        # 判据是**确定性**的：连续 N 轮游标一个字都没动（见 health.cursor_key）。
-        # 最可能的原因是库句柄掉了（不报错、只返回 0 行）。先自己试着重扫，
-        # **只汇报一次**（stall_reported），绝不每轮刷屏。
+        # ── 游标停滞 → 主动汇报（判断本身在 handle_cursor_stall 里，那份带注释更全）──
+        # 一句话：停滞只是**触发条件**，报不报由权威探针说了算——空闲时一个字都不说。
         if h is not None:
             try:
-                if h.cursor_stalls >= _stall_threshold(cfg) and not h.stall_reported:
-                    h.stall_reported = True
-                    heal = _try_selfheal(client)
-                    push_notice(
-                        f"⚠️ 已经连续 {h.cursor_stalls} 轮**没收到任何新消息**，"
-                        f"我怀疑数据库句柄掉了（这种情况查询不报错、只是查不出东西）。\n"
-                        f"{heal}\n"
-                        f"该你做的（按顺序）：\n"
-                        f"  1. 先在微信里确认**没掉登录**（设置→没退回登录界面）；"
-                        f"掉登录只能你扫码，bot 自己恢复不了。\n"
-                        f"  2. 还不行就**重启 bot**。\n"
-                        f"  3. 想看清楚一点，发 `/自检`。")
-                if getattr(h, "recovered_from_stall", False):
-                    h.recovered_from_stall = False
-                    push_notice(f"✅ 刚才那段「收不到新消息」已经过去了："
-                                f"游标又开始动了（最长停滞 {h.max_cursor_stalls} 轮）。")
+                for _notice in (handle_cursor_stall(h, client, cfg),
+                                handle_stall_recovery(h)):
+                    if _notice:
+                        push_notice(_notice)
             except Exception:
                 traceback.print_exc()
         if polls % 30 == 0:

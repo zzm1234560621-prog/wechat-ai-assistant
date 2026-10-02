@@ -261,6 +261,10 @@ class Health:
         self.cursor_stalls = 0          # 当前连续多少轮游标没动
         self.max_cursor_stalls = 0      # 本次运行以来的最长停滞（诊断用）
         self.stall_reported = False     # 这一轮停滞是否已经汇报过（防每轮刷屏）
+        self.stall_probed = False       # 这一轮停滞是否已经**问过权威探针**
+                                        # ⚠️ 它和 stall_reported 必须分开：空闲时我们
+                                        # 探了但不报，绝不能因此把「已恢复」也报出去
+                                        # （用户会莫名其妙：我什么时候出过问题？）
         self.recovered_from_stall = False   # 一次性：停滞汇报过之后游标又动了
         self._last_cursor_key = None
 
@@ -329,6 +333,7 @@ class Health:
                         self.recovered_from_stall = True
                     self.cursor_stalls = 0
                     self.stall_reported = False      # 动了 -> 下次停滞可以再报一次
+                    self.stall_probed = False        # 也可以再探一次
                 self._last_cursor_key = key
         except Exception as e:
             _warn(f"note_poll 记账失败：{e}")

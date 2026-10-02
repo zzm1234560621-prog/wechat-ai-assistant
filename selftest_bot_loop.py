@@ -1022,6 +1022,7 @@ def t_stall_selfheal():
         pass
 
     old = bot.live_history.force_rescan
+    old_alive = bot.live_history.fts_alive
     try:
         # ① 真的触发了重扫
         bot.live_history.force_rescan = lambda c, min_interval=None: True
@@ -1043,8 +1044,90 @@ def t_stall_selfheal():
         msg = bot._try_selfheal(_Cli())
         chk("抛了异常" in msg and "RuntimeError" in msg,
             f"重扫抛异常要如实带上类型：{msg[:60]!r}")
+
+        # ── ④ 判断本身：这才是漏掉的那一段 ─────────────────────────────
+        # 真机踩过（2026-10-02）：bot 刚起来、用户没说话，游标不动 → 它报「数据库句柄
+        # 掉了」，连着两条假警报。根因是**拿「游标不动」当故障判据**——而空闲时游标
+        # 本来就不动。当时自测只覆盖了阈值/队列/_try_selfheal 这些**零件**，
+        # **没覆盖这个判断**，所以没拦住。现在把判断抽成 handle_cursor_stall 才测得到。
+        bot.live_history.force_rescan = lambda c, min_interval=None: True
+        probed = []
+
+        def _alive(c):
+            probed.append(1)
+            return True, "fts 分片可读（4 个）"
+
+        def _dead(c):
+            probed.append(1)
+            return False, "读**不到** fts 分片表（查询不报错、只是 0 行）"
+
+        h = bot.health.Health({"health": {}}, notify_fn=lambda *a, **k: None)
+
+        # 没到阈值 → 不探也不说
+        bot.live_history.fts_alive = _alive
+        probed.clear()
+        h.cursor_stalls = 5
+        chk(bot.handle_cursor_stall(h, _Cli(), {}) is None and probed == [],
+            f"没到阈值：不探也不说（探针调用 {len(probed)} 次）")
+
+        # 到阈值 + 探针说好（= 就是空闲）→ **一个字都不许说**（真机误报就是这条没守住）
+        probed.clear()
+        h.cursor_stalls = 6
+        out = bot.handle_cursor_stall(h, _Cli(), {})
+        chk(out is None, f"**空闲不是故障：不许报任何东西**（实际报了：{out!r}）")
+        chk(len(probed) == 1, f"但确实去问了探针（{len(probed)} 次）")
+        chk(h.stall_reported is False,
+            "空闲**不算「报过故障」**（否则会冒出一句莫名其妙的「已恢复」）")
+        # 同一段停滞里不重复探
+        probed.clear()
+        chk(bot.handle_cursor_stall(h, _Cli(), {}) is None and probed == [],
+            "同一段停滞里只探一次（不每轮白探）")
+
+        # 游标动了 → 可以重新探
+        h.stall_probed = False
+        h.cursor_stalls = 0
+
+        # 到阈值 + 探针说坏 → 这次才报，并且说实话
+        bot.live_history.fts_alive = _dead
+        h.cursor_stalls = 7
+        out = bot.handle_cursor_stall(h, _Cli(), {})
+        chk(out is not None and "收不到新消息了" in out, f"真失效才报：{str(out)[:50]!r}")
+        chk("读不到 fts 分片" in str(out), "报的时候要说清**探针看到了什么**")
+        chk("静默失效" in str(out) and "查询不报错" in str(out),
+            "并解释这是什么形态（不报错、只是查不出东西）")
+        chk(h.stall_reported is True, "记下「真报过」（恢复提示要用它）")
+        chk(bot.handle_cursor_stall(h, _Cli(), {}) is None, "只报一次，不刷屏")
+
+        # 恢复提示：只有**真报过**才给。
+        # ⚠️ 这里**不能**用「手工把 recovered_from_stall 置真、同时把 stall_reported
+        #    置假」来测——那不是 `Health` 能产生的状态（见下），断言它等于断言一个
+        #    不存在的场景。（我第一版就是这么写的，自测当场指出「代码没照文档查
+        #    stall_reported」，而照文档加上去反而会让功能永远不触发——是**文档写错了**，
+        #    不是代码错了。改的是文档 + 这条测试。）
+        h.recovered_from_stall = True
+        rec = bot.handle_stall_recovery(h)
+        chk(rec is not None and "已经过去了" in rec and "读不到 fts 分片" in rec,
+            f"真报过 → 给一句「过去了」：{str(rec)[:44]!r}")
+        chk(h.recovered_from_stall is False, "一次性，给过就清")
+
+        # 真实不变量：**从没报过故障**的 Health，游标动来动去也绝不会冒出「已恢复」。
+        h2 = bot.health.Health({"health": {}}, notify_fn=lambda *a, **k: None)
+        h2.note_poll(cursor={"fts_0": 1, "__time__": 1000})
+        h2.note_poll(cursor={"fts_0": 2, "__time__": 1001})     # 动了，但没报过
+        chk(bot.handle_stall_recovery(h2) is None,
+            "**没报过故障就不可能说「已恢复」**（Health 根本不会置那个标志）")
+
+        # 探针自己炸了 → 不许当成故障吓用户
+        def _probe_boom(c):
+            raise RuntimeError("探针炸了")
+        bot.live_history.fts_alive = _probe_boom
+        h3 = bot.health.Health({"health": {}}, notify_fn=lambda *a, **k: None)
+        h3.cursor_stalls = 9
+        chk(bot.handle_cursor_stall(h3, _Cli(), {}) is None and h3.stall_reported is False,
+            "探针自己抛异常 → 不报警（不能因为探不动就说库坏了）")
     finally:
         bot.live_history.force_rescan = old
+        bot.live_history.fts_alive = old_alive
 
 
 def t_export(tmp):

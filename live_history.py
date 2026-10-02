@@ -1119,6 +1119,29 @@ def _v4_fts_tables(client):
     return _cached_filled(client, "_lh_fts_tables", build, ttl=3600)
 
 
+def fts_alive(client):
+    """fts 分片**现在读得到吗**——判断「静默失效」的**权威探针**。
+
+    返回 `(是否健康, 一句人话)`。内部就是 `_v4_fts_tables()`：健康时命中缓存（几乎零成本），
+    真读不到时它**自己会触发一次重扫再重试**（限流 45s）——所以「返回空」意味着
+    **重扫也没救回来**，是真的坏了。
+
+    ⚠️ **这个函数存在的理由，是「游标不动」不能当判据**：
+    没人发消息的时候游标本来就不动。拿游标当判据会把「用户安静了 30 秒」报成
+    「数据库句柄掉了」——**真机误报过**（2026-10-02，bot 刚起来用户没说话，
+    它连发两条假警报）。正确姿势是：游标停滞只当**触发条件**，到阈值来问这里，
+    这里说好就是空闲（什么都别说），说坏才是真失效。
+    """
+    try:
+        tabs = _v4_fts_tables(client)
+    except Exception as e:
+        return False, f"探 fts 分片时抛异常：{type(e).__name__}: {str(e)[:120]}"
+    if tabs:
+        return True, f"fts 分片可读（{len(tabs)} 个）"
+    return False, ("读**不到** fts 分片表（查询不报错、只是 0 行）——"
+                   "这正是「静默失效」的典型形态")
+
+
 def _v4_fts_session_map(client):
     """fts 库的 Name2Id：rowid -> 会话名。（缓存 10 分钟，空结果不缓存）"""
     def build():
