@@ -243,6 +243,76 @@ def t6_voice_info():
               "filehelper", 1) == {})
 
 
+def t7_probe(tmp):
+    """--probe：先拍基线 → 播放 → 看新增。**判不出来就如实说判不出来。**
+
+    这一条守的是「不猜」：工具的最后一步必须是「要么给出**完整解码**过的方案，
+    要么明说没试出来」，绝不能给出一个「大概是这个」的结论。
+    """
+    sec("T7 · --probe 两阶段探测（基线 → 新增 → 试解密/如实说判不出）")
+    acct = os.path.join(tmp, "acct")
+    sub = os.path.join(acct, "msg", "file", "2026-10")
+    os.makedirs(sub, exist_ok=True)
+    with open(os.path.join(sub, "旧文件.bin"), "wb") as f:
+        f.write(b"old")
+    state = os.path.join(tmp, "probe_state.json")
+
+    # ① 第一次：只拍基线，并告诉用户下一步做什么
+    text1, res1 = voice_msg.probe([acct], state_path=state)
+    check("第一次跑 → phase=baseline", res1.get("phase") == "baseline", res1)
+    check("第一次跑 → 报告里说清基线记了多少个文件",
+          "已记录基线" in text1 and res1.get("files") == 1, text1[:80])
+    check("第一次跑 → 明确告诉你「先播放一条、再跑一遍」",
+          "播放" in text1 and "再跑一遍" in text1, text1[-160:])
+    check("第一次跑 → 基线真的落盘了", os.path.isfile(state))
+
+    # ② 什么都没变 → 必须得出「没落盘」这个**结论**，而不是含糊
+    text2, res2 = voice_msg.probe([acct], state_path=state)
+    check("没有新文件 → changed=0", res2.get("changed") == 0, res2)
+    check("没有新文件 → 明说「没有任何新文件落盘」",
+          "没有任何新文件落盘" in text2, text2[:80])
+    check("没有新文件 → 给出可执行的结论（别往这条路投入 / 如实说做不到）",
+          "如实告诉用户做不到" in text2, text2[-160:])
+
+    # ③ 播放之后新落盘一个文件（大小刚好对得上 length）
+    payload = os.path.join(sub, "新落盘的语音.bin")
+    body = b"\x00" * 64
+    with open(payload, "wb") as f:
+        f.write(body)
+    text3, res3 = voice_msg.probe([acct], length=len(body), state_path=state)
+    check("检测到新增", res3.get("changed") == 1 and res3.get("candidates") == 1, res3)
+    check("报告里列出了那个新文件", "新落盘的语音.bin" in text3, text3[:200])
+    check("没给 aeskey 时明说「只能看它是不是明文」",
+          "没给" in text3 and "明文" in text3, text3)
+
+    # ④ 给了 aeskey、但解不出来 → **必须如实说判不出来**（不许给「大概」）
+    text4, res4 = voice_msg.probe([acct], length=len(body),
+                                  aeskey="00" * 16, state_path=state)
+    honest = ("没试出能用的方案" in text4 or "一个都没对上魔数" in text4
+              or "pycryptodome" in text4)
+    check("解不出来时给出**诚实**的结论（不是「大概就是这个」）", honest, text4[-220:])
+    check("解不出来 → decoded 记 0", res4.get("decoded") == 0, res4)
+    check("解不出来 → 明确说「不要编一个结论」",
+          "不要编" in text4 or "pycryptodome" in text4, text4[-160:])
+
+    # ⑤ length 对不上时，过滤要说清「剩几个」，而不是硬凑一个候选
+    text5, res5 = voice_msg.probe([acct], length=len(body) + 99999, tol=8,
+                                  state_path=state)
+    check("length 差太多 → 候选被过滤掉、并说清过滤后剩几个",
+          res5.get("candidates") == 0 and "剩 **0**" in text5, text5[:200])
+
+    # ⑥ 基线的读写坏掉不许炸（这是诊断工具，不能因为一个坏文件就崩）
+    with open(state, "w", encoding="utf-8") as f:
+        f.write("{ 这不是 json")
+    text6, res6 = voice_msg.probe([acct], state_path=state)
+    check("基线文件坏了 → 当作没有基线、重新拍（不抛异常）",
+          res6.get("phase") == "baseline", res6)
+
+    # ⑦ 目录不存在 → 不炸，报 0 个文件
+    text7, res7 = voice_msg.probe([os.path.join(tmp, "根本没有")], state_path=state)
+    check("目录不存在 → 不炸", isinstance(text7, str) and bool(text7), res7)
+
+
 def main():
     print("=" * 60)
     print("语音条逆向工具 voice_msg 回归自测（不联网、不需真实语音、不碰微信）")
@@ -255,6 +325,7 @@ def main():
         t4_to_pcm_honest()
         t5_find_payload(tmp)
         t6_voice_info()
+        t7_probe(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 60)

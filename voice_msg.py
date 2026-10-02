@@ -34,6 +34,7 @@
   由调用方看魔数判定；判不出来就如实说判不出来。
 """
 import binascii
+import json
 import os
 import re
 
@@ -269,6 +270,159 @@ def to_pcm(data):
         return b"", f"解码失败（{mg}）：{type(e).__name__}: {str(e)[:120]}"
 
 
+# ── --probe：先拍基线 → 你播放一条语音 → 再看新增（**用证据说话，不猜**）──────
+#
+# 为什么必须先拍基线：`msg\attach\<md5(会话)>\<月>\Rec\` 实测是**空的**，
+# 最合理的解释是**微信按需下载**——你不点开播放，它就不落盘。
+# 所以「直接全盘搜一个大小接近的音频」会捞到一堆无关命中（上一次实验就是这样，
+# 结论也因此被推翻过一次）。而「播放这条语音之后**新出现/变化**的文件」才是真候选。
+#
+# 判据仍然是**魔数 + 完整解码**：魔数只能证明第一块解对了（CBC 零 IV 与 ECB 首块相同，
+# 见 identify 的说明），所以最终要看 to_pcm 能不能出东西。**判不出来就如实说判不出来。**
+
+def _snapshot(dirs):
+    """目录树 → `{路径: [大小, mtime]}`。读不到的文件跳过（不炸）。"""
+    out = {}
+    for d in dirs or []:
+        for root, _sub, files in os.walk(d):
+            for fn in files:
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                out[p] = [st.st_size, int(st.st_mtime)]
+    return out
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_json(path, data):
+    """返回 `(是否成功, 错误文本)`。失败**不抛**——这只是个诊断工具。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def probe(dirs, length=0, aeskey="", state_path=None, tol=256, limit=20):
+    """两次调用完成一次探测。
+
+    第一次（没有基线）→ 拍基线并告诉你下一步做什么。
+    第二次 → 列出相对基线的**新增/变化**文件，按 `length` 过滤（给了的话），
+    再逐个试解密，**报出所有能完整解码的方案**（不替调用方挑一个）。
+
+    返回 `(给用户看的报告文本, 结构化结果)`。**任何一步失败都如实写在文本里。**
+    """
+    state_path = state_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "voice_probe.json")
+    cur = _snapshot(dirs)
+    before = _load_json(state_path)
+
+    if before is None:
+        ok, err = _save_json(state_path, cur)
+        lines = [f"📸 已记录基线：{len(cur)} 个文件"
+                 + (f"（存在 {state_path}）" if ok else f"，但**没能存下来**：{err}"),
+                 "",
+                 "接下来（顺序别反）：",
+                 "  1. 在微信里**把那条语音条点开播放一次**——目的是让它落盘；",
+                 "  2. 再跑一遍**同样的命令**。",
+                 "",
+                 "为什么要先拍基线：这个数据目录里 `Rec/` 是空的，微信大概率"
+                 "**按需下载**；直接全盘搜「大小接近的音频」会捞到一堆无关命中。"]
+        if not ok:
+            lines.append("⚠️ 基线存不下来，第二次跑仍会被当成「第一次」——"
+                         "先确认 data/ 可写。")
+        return "\n".join(lines), {"phase": "baseline", "files": len(cur), "saved": ok}
+
+    changed = sorted(p for p, meta in cur.items() if before.get(p) != meta)
+    lines = [f"🔍 与基线相比：**新增/变化 {len(changed)} 个文件**"
+             f"（基线 {len(before)} → 现在 {len(cur)}）"]
+    if not changed:
+        lines += ["",
+                  "**没有任何新文件落盘。**",
+                  "这说明微信确实**没有**把语音条的音频写到磁盘上——哪怕你播放过。",
+                  "那就别再往这条路投入了：按 docs/voice-msg-feasibility.md 的结论，"
+                  "**语音条读不了，应当如实告诉用户做不到**。",
+                  "",
+                  "（想再确认一次的话，跑 `--probe-reset` 清掉基线重新走一遍。）"]
+        return "\n".join(lines), {"phase": "changes", "changed": 0}
+
+    cands = [{"path": p, "size": cur[p][0]} for p in changed]
+    if length:
+        want = int(length)
+        cands = [c for c in cands if abs(c["size"] - want) <= int(tol)]
+        lines.append(f"按 `length={want}`（±{tol} 字节）过滤后剩 **{len(cands)}** 个")
+        if not cands:
+            lines += ["", "除了数量对不上，没有别的线索了。把 `--tol` 放宽一点再试，"
+                          "或者先看看 `--probe` 列出来的全部新增文件。"]
+    cands.sort(key=lambda c: abs(c["size"] - (int(length) if length else 0)))
+    cands = cands[:int(limit)]
+
+    decoded = []
+    for c in cands:
+        try:
+            with open(c["path"], "rb") as f:
+                data = f.read()
+        except OSError as e:
+            lines.append(f"  · {os.path.basename(c['path'])}（{c['size']}B）读不动：{e}")
+            continue
+        raw_mg = magic_of(data)
+        head = (f"  · {os.path.basename(c['path'])}（{c['size']}B）"
+                f"原样魔数={raw_mg or '不认得'}")
+        if not aeskey:
+            lines.append(head + "   ← 没给 `--aeskey`，只能看它是不是明文")
+            if raw_mg:
+                decoded.append((c["path"], "（未解密）", raw_mg, 0))
+            continue
+        try:
+            cands_scheme = identify(data, key_of(aeskey))
+        except Exception as e:
+            lines.append(head + f"   ← 试解密时出错：{type(e).__name__}: {e}")
+            continue
+        if not cands_scheme:
+            lines.append(head + "   ← 试过的那几种方案**一个都没对上魔数**")
+            continue
+        lines.append(head)
+        for name, plain, mg in cands_scheme:
+            if name == "__NEED_PYCRYPTODOME__":
+                lines.append("      ⚠️ 需要 pycryptodome 才能试 AES（pip install pycryptodome）")
+                break
+            pcm, perr = to_pcm(plain)
+            if pcm:
+                lines.append(f"      ✅ {name}：魔数={mg}，**完整解码出 {len(pcm)} 字节 PCM**")
+                decoded.append((c["path"], name, mg, len(pcm)))
+            else:
+                lines.append(f"      ❌ {name}：魔数={mg}，解码失败：{perr[:70]}")
+
+    lines.append("")
+    if decoded:
+        lines.append("👉 结论（**按完整解码判定**，不是只看魔数）：")
+        for p, name, mg, n in decoded:
+            lines.append(f"   · {os.path.basename(p)}：方案 **{name}**，魔数 {mg}"
+                         + (f"，PCM {n} 字节" if n else "（未解密，只是明文）"))
+        lines.append("   把命中的那个方案记进 docs/voice-msg-feasibility.md，"
+                     "再决定要不要接进聊天通路。**别只看魔数就下结论**"
+                     "（CBC 零 IV 与 ECB 的首块相同，会同时命中）。")
+    else:
+        lines.append("👉 **没试出能用的方案。** 如实说：这一轮没能确定语音条的字节在哪 / "
+                     "怎么解，不要编一个「大概就是这个」的结论。")
+        lines.append("   可以把 `--tol` 放宽、或去掉 `--length` 先看全部新增文件，"
+                     "再拿候选去 `--file <路径> <aeskey>` 单独试。")
+    return "\n".join(lines), {"phase": "changes", "changed": len(changed),
+                              "candidates": len(cands), "decoded": len(decoded)}
+
+
 if __name__ == "__main__":
     # 现场小工具：给一个 XML（文件或原串）或一个候选文件，看能认出什么
     import sys
@@ -300,8 +454,64 @@ if __name__ == "__main__":
                 print(f"    {name:22s} 魔数={mg:12s} {verdict}")
             if not cands:
                 print("    一个都没对上 → 字节可能还没下载，或加密方案不在试过的那几种里。")
+    elif "--probe-reset" in sys.argv:
+        sp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "data", "voice_probe.json")
+        if "--state" in sys.argv:
+            sp = sys.argv[sys.argv.index("--state") + 1]
+        try:
+            os.remove(sp)
+            print(f"已清掉基线：{sp}（下次 --probe 会重新拍一次）")
+        except FileNotFoundError:
+            print(f"本来就没有基线：{sp}")
+        except OSError as e:
+            print(f"删不掉基线（{e}）——先确认文件没被占用。")
+    elif "--probe" in sys.argv:
+        def _opt(name, default=""):
+            if name in sys.argv and len(sys.argv) > sys.argv.index(name) + 1:
+                return sys.argv[sys.argv.index(name) + 1]
+            return default
+
+        i = sys.argv.index("--probe")
+        acct = ""
+        if len(sys.argv) > i + 1 and not sys.argv[i + 1].startswith("--"):
+            acct = sys.argv[i + 1]
+        if not acct:
+            print("用法：python voice_msg.py --probe <微信账号数据目录> "
+                  "[--talker <会话>] [--length <字节数>] [--aeskey <32位hex>] "
+                  "[--tol 256] [--state <基线文件>]")
+            print("      python voice_msg.py --probe-reset        # 清掉基线重来")
+            print("  <微信账号数据目录> 形如 ...\\xwechat_files\\wxid_xxxx_1234")
+            print("  第一次跑只拍基线；**播放一条语音条**之后再跑同样的命令。")
+            raise SystemExit(0)
+
+        talker = _opt("--talker")
+        dirs = candidate_dirs(talker, [acct]) if talker else []
+        if not dirs:
+            # 没给会话就把整个账号目录当扫描面（范围更大 = 更容易捞到，但噪音也更多）
+            dirs = [acct] if os.path.isdir(acct) else []
+        if not dirs:
+            print(f"这个目录不存在或读不到：{acct}")
+            raise SystemExit(1)
+
+        try:
+            length = int(_opt("--length", "0") or 0)
+        except ValueError:
+            print("--length 要是数字（就是消息 XML 里 voicemsg 的 length 属性）")
+            raise SystemExit(1)
+        try:
+            tol = int(_opt("--tol", "256") or 256)
+        except ValueError:
+            tol = 256
+
+        text, _res = probe(dirs, length=length, aeskey=_opt("--aeskey"),
+                           state_path=_opt("--state") or None, tol=tol)
+        print(text)
     else:
         print(__doc__.split("##")[0])
         print("用法：")
         print("  python voice_msg.py --xml '<msg><voicemsg aeskey=... /></msg>'")
         print("  python voice_msg.py --file <候选文件> <aeskey>")
+        print("  python voice_msg.py --probe <微信账号数据目录> [--talker <会话>] "
+              "[--length N] [--aeskey <hex>]   # 先拍基线，播放一条再跑一次")
+        print("  python voice_msg.py --probe-reset")
