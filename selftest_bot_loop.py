@@ -1130,6 +1130,69 @@ def t_stall_selfheal():
         bot.live_history.fts_alive = old_alive
 
 
+def t_bot_console():
+    sec("/bot 控制台：一屏总览 + 控制动作复用既有命令（不另写一套逻辑）")
+    import inspect
+
+    cfg = {"provider": "openai", "model": "m", "api_key": "sk-abcdefgh1234",
+           "auto_reply": {"enabled": True, "chats": [{"wxid": "a"}, {"wxid": "b"}]},
+           "watch": {"enabled": True, "chats": [{"wxid": "c"}], "keywords": []},
+           "search": {"enabled": True}, "image": {"mode": "ocr"},
+           "privacy": {"redact": False}, "status": {"enabled": False}}
+
+    out = bot.bot_dashboard(cfg, [])
+    chk(isinstance(out, str) and "助手控制台" in out, f"面板出得来：{str(out)[:60]}")
+    chk("2 人" in out, f"自动回复人数对得上（2 人）：{out}")
+    chk("1 人" in out, f"盯着人数对得上（1 人）：{out}")
+    chk("sk-abcdefgh1234" not in out and "sk-a" in out,
+        f"key 是打码的、**不打全**：{out}")
+    chk("联网搜索" in out and "**开**" in out, f"联网搜索开着要说开：{out}")
+    chk("状态页" in out, f"状态页要有：{out}")
+    chk("/bot 功能" in out, f"给出怎么控制：{out}")
+    # 拿不到健康快照时必须**明说**，不能整行省略（否则用户以为面板就这些）
+    chk("拿不到健康快照" in out or "轮询" in out,
+        f"拿不到健康快照时明说（不静默省略）：{out}")
+
+    # ⚠️ 结构性保证：**面板不可能查库**——它连 client 参数都没有。
+    #    和 /自检 那条一样，这是「不许为了一个面板多打一次 hook」的机器可验形态。
+    sig = inspect.signature(bot.bot_dashboard)
+    chk(list(sig.parameters) == ["cfg", "contacts"],
+        f"bot_dashboard 没有 client 参数（结构上查不了库）：{list(sig.parameters)}")
+
+    # 路由表：不许指向自己（会无限递归），且都指向真实命令
+    self_ref = [k for k, v in bot.BOT_ROUTES.items() if str(v).lower().startswith("/bot")]
+    chk(self_ref == [], f"路由表里没有指向 /bot 自己的（防无限递归）：{self_ref}")
+    bad = [v for v in bot.BOT_ROUTES.values() if not str(v).startswith("/")]
+    chk(bad == [], f"每个路由目标都是一条命令：{bad}")
+
+    # 真·端到端委托：/bot 自检 → /自检（这条不需要 client，能真跑）
+    text, changed = bot.handle_command("/bot 自检", None, cfg, False)
+    chk(isinstance(text, str) and "自检" in text and changed is False,
+        f"/bot 自检 委托到了 /自检（复用同一实现）：{str(text)[:60]}")
+
+    text2, _c2 = bot.handle_command("/bot 功能", None, cfg, False)
+    chk("自动回复" in text2 and "定时" in text2,
+        f"/bot 功能 给出功能清单：{text2[:60]}")
+
+    text3, _c3 = bot.handle_command("/bot 根本不存在的功能", None, cfg, False)
+    chk("没认出来" in text3 and "自动回复" in text3,
+        f"没认出来的功能名 → 如实说 + 给清单：{text3[:60]}")
+
+    # 防呆：临时塞一条自指路由，必须被拒绝而不是递归到栈溢出
+    saved = dict(bot.BOT_ROUTES)
+    try:
+        bot.BOT_ROUTES["自指"] = "/bot"
+        text4, _c4 = bot.handle_command("/bot 自指", None, cfg, False)
+        chk("无限递归" in text4, f"路由自指时被拒绝（不无限递归）：{text4[:60]}")
+    finally:
+        bot.BOT_ROUTES.clear()
+        bot.BOT_ROUTES.update(saved)
+
+    # 大小写/中文别名都要认
+    for alias in ("auto", "自动回复", "watch", "盯着"):
+        chk(alias in bot.BOT_ROUTES, f"别名「{alias}」在路由表里")
+
+
 def t_export(tmp):
     sec("/导出：分页收全 + 如实说截断 + 落盘文件可读且不出现 wxid")
     old_q = bot.live_history.query_contact_history
@@ -1256,6 +1319,7 @@ def main():
     t_usage_cmd()
     t_selfcheck()
     t_stall_selfheal()
+    t_bot_console()
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()

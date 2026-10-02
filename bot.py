@@ -58,6 +58,10 @@ try:
 except ImportError:                                     # pragma: no cover
     usage = None
 try:
+    import semantic
+except ImportError:                                     # pragma: no cover
+    semantic = None
+try:
     import redact
 except ImportError:                                     # pragma: no cover
     redact = None
@@ -201,6 +205,8 @@ def make_llm(cfg):
 
 HELP_TEXT = (
     "可用命令（发到这个聊天即可）：\n"
+    "/bot            **控制台**：一屏看全部功能的当前状态（还能 /bot <功能名> 直接控制）\n"
+    "/bot 功能       列出所有可控制的功能\n"
     "/provider       列出可选服务商（DeepSeek / Claude / 通义 / Kimi / GLM …）\n"
     "/provider <编号> 选一个服务商，自动配好协议+接口+模型\n"
     "/api <key>      设置 API Key（会自动测一次连通性）\n"
@@ -282,6 +288,145 @@ HELP_TEXT = (
 )
 
 
+def _yn(v):
+    return "**开**" if v else "关"
+
+
+# `/bot <功能名>` → 等价命令。**控制动作绝不复刻逻辑**：改写成现有命令再交给
+# `handle_command`，于是「只有一处实现」——将来改 /auto 的行为，/bot 自动跟着变。
+# （项目里 review/persona 撞名那次就是因为两处各有一套说法，用户必然改错东西。）
+BOT_ROUTES = {
+    "自动回复": "/auto", "auto": "/auto", "回复": "/auto",
+    "盯着": "/盯着", "watch": "/盯着", "监听": "/盯着",
+    "定时": "/定时", "schedule": "/定时", "任务": "/定时",
+    "分组": "/分组", "group": "/分组",
+    "预算": "/预算", "budget": "/预算",
+    "用量": "/用量", "usage": "/用量", "花费": "/用量",
+    "素材": "/素材", "图片": "/素材",
+    "导出": "/导出", "export": "/导出",
+    "自检": "/自检", "体检": "/自检",
+    "状态": "/status", "status": "/status",
+    "帮助": "/help", "help": "/help",
+    "模型": "/provider", "provider": "/provider", "服务商": "/provider",
+}
+
+BOT_MENU = (
+    "🤖 `/bot` 能控制这些（后面接功能名；这条只列可控制的，完整命令表发 /help）：\n"
+    "\n"
+    "  模型/密钥   → `/bot 模型`　`/api <key>`　`/model <id>`\n"
+    "  自动回复    → `/bot 自动回复 开|关`　`/bot 自动回复 add 张三`…\n"
+    "  盯着        → `/bot 盯着 开|关`　`/bot 盯着 关键词 <正则>`\n"
+    "  定时任务    → `/bot 定时`　`/bot 定时 加 9:00 张三 早`\n"
+    "  分组        → `/bot 分组`　`/bot 分组 建 同学 张三、李四`\n"
+    "  群发/素材   → 直接说「帮我祝所有人节日快乐」/「发给张三」\n"
+    "  预算        → `/bot 预算`　`/bot 预算 20`　`/bot 预算 关`\n"
+    "  用量        → `/bot 用量`\n"
+    "  导出对话    → `/bot 导出 张三`\n"
+    "  诊断        → `/bot 自检`　`/bot 状态`\n"
+    "\n"
+    "**只读、要在 config.yaml 里改的**（命令不改配置文件，那是你手写的）：\n"
+    "  语义检索 `semantic.enabled` · 联网搜索 `search.enabled` ·\n"
+    "  图片模式 `image.mode` · 送云端前脱敏 `privacy.redact` · 状态页 `status.enabled`\n"
+    "  （改完重启助手生效。语义检索还要先装可选依赖 + `semantic.py --setup/--build`。）"
+)
+
+
+def bot_dashboard(cfg, contacts=None):
+    """一屏总览所有功能的当前状态。**绝不查库、绝不起线程。**
+
+    只读三处：① 传进来的 `cfg`（已由 `settings.effective` 合过）；
+    ② 内存里的健康快照 `_h()`；③ **磁盘上的文件**（语义索引在不在）。
+    理由和 health / status_page 同源：这个面板随时可能被发一次，
+    **不能因为它多打一次 hook**（hook 不支持并发，崩过微信 6 次）。
+
+    每一段都各自兜异常：某个模块坏了只让那一行显示「读不出来」，
+    **绝不整条面板挂掉**（那会让用户以为整个助手坏了）。
+    """
+    c = cfg or {}
+
+    def safe(fn, default=None):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    L = ["🤖 **助手控制台**（`/bot <功能名>` 就能控制；`/bot 功能` 看全部）", ""]
+
+    key = str(c.get("api_key") or "")
+    L.append(f"模型　　{c.get('provider') or 'anthropic'} / {c.get('model') or '（没设）'}"
+             f"　key {mask(key) if key else '**没设**'}　→ `/bot 模型`")
+
+    n_ar = len(safe(lambda: auto_reply.chats(c), []) or [])
+    ar_on = safe(lambda: auto_reply.enabled(c), False)
+    ar_rev = (c.get("auto_reply") or {}).get("review", True)
+    L.append(f"自动回复　{_yn(ar_on)}　· {n_ar} 人　· 审核 {_yn(ar_rev)}"
+             f"　→ `/bot 自动回复 开|关`")
+
+    n_w = len(safe(lambda: watch.chat_list(c), []) or [])
+    n_k = len(safe(lambda: watch.keywords(c), []) or [])
+    L.append(f"盯着　　{_yn(safe(lambda: watch.enabled(c), False))}"
+             f"　· {n_w} 人　· 关键词 {n_k} 条　→ `/bot 盯着 开|关`")
+
+    L.append(f"定时　　{len(safe(lambda: scheduler.tasks(c), []) or [])} 个任务"
+             f"　→ `/bot 定时`")
+    L.append(f"分组　　{len(safe(lambda: groups.all_groups(c), {}) or {})} 个组"
+             f"　→ `/bot 分组`")
+
+    if usage is None:
+        L.append("预算　　**模块没装**（usage.py 不在）　→ 重装一次或看部署")
+    else:
+        bt = safe(lambda: usage.budget_text(c), None)
+        first = (str(bt).splitlines()[0].strip() if bt else "（读不出来）")
+        L.append(f"预算　　{first}　→ `/bot 预算 <金额>`")
+
+    # 语义检索：**状态从磁盘读**（索引文件在不在），不查库。
+    # ⚠️ `semantic is None` 必须**单独说**，不能被 `safe()` 吞成「读不出来」——
+    #    那是静默降级（用户会以为是索引坏了，其实是模块没部署上来）。
+    if semantic is None:
+        L.append("语义检索　**模块没装**（semantic.py 不在）　→ 重装一次或看部署")
+    else:
+        sem = safe(lambda: semantic.cfg_of(c), {}) or {}
+        sem_on = sem.get("enabled") is True
+        idx = safe(lambda: semantic.load_index(c), (None, ""))
+        idx_obj = idx[0] if isinstance(idx, tuple) else None
+        if idx_obj is None:
+            why = ""
+            if isinstance(idx, tuple) and len(idx) > 1 and idx[1]:
+                why = "：" + str(idx[1]).splitlines()[0][:60]
+            istate = f"**没建索引**（要 `semantic.py --build`）{why}"
+        else:
+            istate = f"索引 {len(idx_obj.get('docs') or [])} 条可用"
+        L.append(f"语义检索　{_yn(sem_on)}　{istate}　→ 改 config.yaml 的 semantic.enabled")
+
+    srch = c.get("search") or {}
+    L.append(f"联网搜索　{_yn(srch.get('enabled') is True)}"
+             f"　→ 改 config.yaml 的 search.enabled")
+    img = c.get("image") or {}
+    L.append(f"图片解读　{img.get('mode') or 'ocr'}"
+             f"　· 送云端前脱敏 {_yn((c.get('privacy') or {}).get('redact') is True)}")
+
+    h = _h()
+    if h is not None:
+        s = safe(lambda: h.snapshot(), None)
+        if isinstance(s, dict):
+            L.append(f"运行　　轮询 {s.get('poll_count')} 次　· 登录 "
+                     f"{'正常' if s.get('login_ok') else '**异常**'}　· 分片错误 "
+                     f"{len(s.get('poll_errors') or {})}　· hook 报错 "
+                     f"{_err_count(s.get('hook_errors'))}　· 发送失败 "
+                     f"{_err_count(s.get('send_failures'))}　→ `/bot 自检`")
+        else:
+            L.append("运行　　（读不出健康快照）　→ `/bot 自检`")
+    else:
+        # 拿不到 Health 实例时**要明说**，不能整行省略——用户会以为面板就是这些内容。
+        L.append("运行　　**拿不到健康快照**（health 模块没装或没初始化）　→ `/bot 自检`")
+    st = c.get("status") or {}
+    L.append(f"状态页　{_yn(st.get('enabled') is True)}"
+             f"（{st.get('host') or '127.0.0.1'}:{st.get('port') or 39002}）")
+
+    L += ["", "发 `/bot 功能` 看全部可控制项；发 `/help` 看完整命令表。"]
+    return "\n".join(L)
+
+
 def handle_command(text, wcf, cfg, live_ok, contacts=None):
     """识别 / 开头的命令。返回 (回复文本, 是否改了配置)；非命令返回 (None, False)。"""
     t = text.strip()
@@ -293,6 +438,25 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
 
     if cmd in ("/help", "/帮助"):
         return HELP_TEXT, False
+
+    if cmd in ("/bot", "/控制台", "/面板"):
+        fresh = settings.effective(load_config())
+        if not arg:
+            return bot_dashboard(fresh, contacts), False
+        bits = arg.split(maxsplit=1)
+        key = bits[0].strip()
+        rest = bits[1].strip() if len(bits) > 1 else ""
+        if key.lower() in ("功能", "菜单", "menu", "help", "?", "列表"):
+            return BOT_MENU, False
+        target = BOT_ROUTES.get(key.lower()) or BOT_ROUTES.get(key)
+        if not target:
+            return (f"没认出来「{key}」。\n\n" + BOT_MENU), False
+        sub = f"{target} {rest}".strip()
+        # 防呆：路由表要是被人改成了 /bot 自己，这里就会无限递归。
+        if sub.lower().startswith("/bot"):
+            return "内部错误：`/bot` 的路由指向了自己（会无限递归），已拒绝。", False
+        # **复用既有命令的唯一实现**，不另写一套开关逻辑。
+        return handle_command(sub, wcf, fresh, live_ok, contacts=contacts)
 
     if cmd == "/api":
         if not arg or arg.lower() in ("clear", "清空", "清除"):

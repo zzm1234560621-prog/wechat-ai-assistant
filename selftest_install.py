@@ -250,6 +250,19 @@ def main():
     _, argv2, _, _ = cmd_to_native(line2)
     chk(argv2 == ["autostart.py", "on"], f"带参数时逐个传：{argv2}")
 
+    # ── T2b 提权跑 .ps1（hook 那几个脚本）────────────────────────────
+    # ⚠️ .ps1 **不能**走 build_admin_command：那个是 `-FilePath <python> '<script>'`，
+    #    等于让 python 去解释 PowerShell，必然失败。所以单独立了一条函数。
+    psline = console.build_ps1_admin_command(r"C:\a b\installers\do_hook_install.ps1")
+    chk("-Verb RunAs" in psline, "ps1 也用 -Verb RunAs 提权")
+    chk("powershell.exe" in psline, f".ps1 走 powershell 而不是 python：{psline[:60]}")
+    chk("python" not in psline.split("-Verb")[0].lower().replace("powershell", ""),
+        "命令行里不许出现用 python 跑 ps1 的写法")
+    chk("'-File'" in psline or "-File" in psline, f"要用 -File 传脚本路径：{psline[:90]}")
+    # 路径含空格时必须是**一个**单引号字面量（不能被拆开）
+    chk("'C:\\a b\\installers\\do_hook_install.ps1'" in psline,
+        f"含空格的路径整体包成单引号字面量：{psline}")
+
     pretty = r"C:\Program Files\a b\downgrade.py"
     line3 = console.build_admin_command(pretty, ["a b", "it's"])
     chk("''" in line3, "参数里的单引号被 PowerShell 单引号串规则转义成 ''")

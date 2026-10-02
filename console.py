@@ -1,14 +1,27 @@
 """微信 AI 助手 - 统一控制台（单一入口，控制所有功能）。
 
-双击 助手.bat 就会进入本菜单。
-  一键走完：选 [7] 自动；手动分步：1 降级 -> 2 安装 -> 3 启动
+双击 助手.bat 就会进入本菜单。分四组：
+  · 安装 / 首次配置 —— 一键走完选 [4]；手动分步 1 降级 → 2 装依赖 → 3 配模型
+  · 运行控制 —— 启动（后台/前台）/ 停止 / 重启 / 实时看日志
+  · 诊断排查 —— 看状态 / 看日志 / 真机自检 / 跑全部自测
+  · Hook 与微信 —— 装/摘/装回 hook、看微信版本与自启状态
+
+⚠️ 这个文件是**系统 python** 跑的（见 助手.bat 里的 `where python`），**不是 venv**。
+所以顶层只许导入标准库 + `envsetup`（它也只导标准库）——
+一旦顶层去 import 第三方包（yaml 之类），「装依赖」这条路自己就先崩了，用户会卡死。
+需要读配置时就**在函数里延迟导入**，并且自己兜住异常（见 `_status_page`）。
 """
+import os
 import subprocess
 import sys
 
+import botctl
 import envsetup as env
 
 BASE = env.BASE
+
+# hook 相关脚本（都在 installers\wechat-4.1.10.27\ 下，**都要管理员**）
+HOOK_DIR = os.path.join(BASE, "installers", "wechat-4.1.10.27")
 
 
 def _ps_quote(s):
@@ -120,26 +133,144 @@ def auto():
     subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
 
 
+def build_ps1_admin_command(script_path):
+    """构造「提权跑一个 .ps1」的 PowerShell 命令行（纯函数，便于自测）。
+
+    ⚠️ 不能走 `build_admin_command`：那个是给 **Python 脚本**用的
+    （`-FilePath <python> -ArgumentList '<script>'`）。拿它去跑 `.ps1`
+    等于让 python 去解释 PowerShell，必然失败。
+    `.ps1` 要走 `powershell.exe -File <路径>`。
+
+    同样注意坑：`-ArgumentList` 里每一项都用单引号字面量（`_ps_quote`），
+    路径含空格/中文/单引号都不会被拆开或注入。
+    """
+    args = ",".join([_ps_quote("-NoProfile"), _ps_quote("-ExecutionPolicy"),
+                     _ps_quote("Bypass"), _ps_quote("-File"),
+                     _ps_quote(script_path)])
+    return (f"Start-Process -FilePath 'powershell.exe' "
+            f"-ArgumentList {args} -Verb RunAs")
+
+
+def run_ps1(script, admin=True):
+    """跑 installers 下的 .ps1。返回 `(是否真的拉起来了, 一句人话)`。
+
+    `admin=True` 时用 `-Verb RunAs` 在**新窗口**里提权跑（这些脚本要改微信目录）；
+    失败（比如用户点了「否」UAC）只能靠窗口里的输出，所以这里如实说「已在新窗口启动」。
+    """
+    p = os.path.join(HOOK_DIR, script)
+    if not os.path.isfile(p):
+        return False, f"找不到脚本：{p}"
+    if not admin:
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", p], cwd=BASE)
+        return True, "已跑完。"
+    try:
+        subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                          build_ps1_admin_command(p)])
+    except OSError as e:
+        return False, f"拉不起来：{type(e).__name__}: {e}"
+    return True, ("已在**新窗口**里提权启动（可能弹 UAC，要点「是」）。\n"
+                  "    结果看那个窗口（脚本也会写 *-log.txt 到 installers 目录）。")
+
+
+def _status_page():
+    """读 config.yaml 的 status 段。返回 `(enabled, host, port, 错误)`。
+
+    ⚠️ **yaml 必须延迟导入**：这个文件是系统 python 跑的（见模块头注释），
+    顶层导入 yaml 会让「装依赖」这条路自己也起不来。
+    """
+    try:
+        import yaml
+        with open(os.path.join(BASE, "config.yaml"), encoding="utf-8") as f:
+            d = yaml.safe_load(f) or {}
+        st = d.get("status") or {}
+        try:
+            port = int(st.get("port") or 39002)
+        except (TypeError, ValueError):
+            port = 39002
+        return bool(st.get("enabled")), str(st.get("host") or "127.0.0.1"), port, ""
+    except Exception as e:
+        return False, "", 0, f"{type(e).__name__}: {e}"
+
+
+def _clean(inp):
+    """把用户输入清干净：**去掉 BOM 再去空白**。
+
+    ⚠️ BOM 不是幻想：PowerShell 5.1 往原生程序的管道里写字符串时会带一个 UTF-8 BOM，
+    于是第一行读进来是 `'\\ufeff10'`，菜单会把它当非法输入。
+    手敲键盘不会有 BOM，但**脚本化输入 / 自测会**——这个功能的自测一开始就被它绊了一下。
+    `.strip()` 去不掉 BOM（它不是空白字符），所以必须显式 lstrip。
+    """
+    return str(inp or "").lstrip("\ufeff").strip()
+
+
+def _confirm(prompt):
+    return _clean(input(prompt)).lower() in ("y", "yes", "是")
+
+
+def health_screen():
+    """一屏：进程 + 健康快照。"""
+    print()
+    print(botctl.status_text())
+    print()
+    print(botctl.fmt_health(botctl.read_health()))
+
+
+def _verify_real_flow():
+    """真机自检。**它自己要求 bot 停着**（两路查询同时压在 hook 上会把微信搞崩），
+    所以在跑的话先问要不要停，跑完再问要不要起回来。"""
+    was_running = botctl.is_running()
+    if was_running:
+        print("[!] 真机自检是只读的，但它**要求 bot 先停**——")
+        print("    两路查询同时压在 hook 上实测会把微信搞崩（项目里崩过 6 次）。")
+        if not _confirm("    先停止助手再跑自检？(y/N) "):
+            print("已取消。要自己先停：菜单 [6]。")
+            return
+        ok, msg = botctl.stop()
+        print(("[√] " if ok else "[!] ") + msg)
+        if not ok:
+            return
+    run("verify_real.py")
+    if was_running and _confirm("\n跑完了。要把助手重新启动吗？(y/N) "):
+        ok, msg = botctl.start()
+        print(("[√] " if ok else "[!] ") + msg)
+
+
 def menu():
     while True:
         print()
-        print("=" * 38)
-        print("        微信 AI 助手 · 控制台")
-        print("=" * 38)
-        print("  一键走完选 [7]；手动分步 1 降级→2 安装→3 启动")
-        print("-" * 38)
-        print("  [1] 降级微信 4.x -> 3.9.x")
-        print("  [2] 安装依赖（自动识别版本）")
-        print("  [3] 启动助手（前台，看日志）")
-        print("  [4] 开机自启：开启")
-        print("  [5] 开机自启：关闭")
-        print("  [6] 查看状态（微信版本 / 自启）")
-        print("  [7] 自动（一键：检测→装依赖→启动）")
-        print("  [8] 配置模型（选服务商 + 填 key）")
-        print("  [0] 退出")
-        print("=" * 38)
+        print("=" * 46)
+        print("           微信 AI 助手 · 控制台")
+        print("=" * 46)
+        print("  安装 / 首次配置")
+        print("   [1] 降级微信 4.x -> 3.9.x")
+        print("   [2] 安装依赖（自动识别版本）")
+        print("   [3] 配置模型（选服务商 + 填 key）")
+        print("   [4] 自动（一键：检测→装依赖→启动）")
+        print("  运行控制")
+        print("   [5] 启动助手（后台，无窗口）")
+        print("   [6] 停止助手")
+        print("   [7] 重启助手")
+        print("   [8] 启动助手（前台，看日志）")
+        print("   [9] 实时看日志（Ctrl+C 返回）")
+        print("  诊断 / 排查")
+        print("  [10] 看状态（进程 + 健康快照）")
+        print("  [11] 看最近日志（40 行）")
+        print("  [12] 真机自检（只读；**需先停 bot**，会问你）")
+        print("  [13] 跑全部自测（24 份，不用真微信）")
+        print("  Hook / 微信")
+        print("  [14] 装 hook（放 version.dll + 禁用微信自动更新）")
+        print("  [15] 摘 hook（改名 .disabled，会强杀卡死的微信）")
+        print("  [16] 装回 hook（并重启微信）")
+        print("  [17] 查看微信版本 / 开机自启状态")
+        print("  其它")
+        print("  [18] 开机自启：开启")
+        print("  [19] 开机自启：关闭")
+        print("  [20] 打开状态页（本地只读网页）")
+        print("   [0] 退出")
+        print("=" * 46)
 
-        c = input("请输入数字选择：").strip()
+        c = _clean(input("请输入数字选择："))
 
         if c == "1":
             run("downgrade.py", admin=True)
@@ -147,28 +278,82 @@ def menu():
         elif c == "2":
             run("installer.py")
         elif c == "3":
+            run("setup_llm.py")
+        elif c == "4":
+            auto()
+        elif c == "5":
+            ok, msg = botctl.start()
+            print(("[√] " if ok else "[!] ") + msg)
+        elif c == "6":
+            print(botctl.stop(dry_run=True)[1])
+            if _confirm("确认停止？(y/N) "):
+                ok, msg = botctl.stop()
+                print(("[√] " if ok else "[!] ") + msg)
+            else:
+                print("已取消。")
+        elif c == "7":
+            if _confirm("确认重启助手？(y/N) "):
+                ok, msg = botctl.restart()
+                print(("[√] " if ok else "[!] ") + msg)
+            else:
+                print("已取消。")
+        elif c == "8":
             if not env.venv_ready():
                 print("虚拟环境未就绪（不存在、已失效或依赖缺失），请先选 [2] 安装依赖。")
             else:
                 subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
-        elif c == "4":
-            run("autostart.py", ["on"])
-        elif c == "5":
-            run("autostart.py", ["off"])
-        elif c == "6":
+        elif c == "9":
+            botctl.follow()
+        elif c == "10":
+            health_screen()
+        elif c == "11":
+            print()
+            print(botctl.tail(40))
+        elif c == "12":
+            _verify_real_flow()
+        elif c == "13":
+            run("selftest_all.py")
+        elif c in ("14", "15", "16"):
+            which = {"14": ("do_hook_install.ps1", "装 hook"),
+                     "15": ("do_remove_hook.ps1", "摘 hook（会强杀微信）"),
+                     "16": ("do_restore_hook.ps1", "装回 hook（会重启微信）")}[c]
+            if _confirm(f"确认「{which[1]}」？可能要管理员权限。(y/N) "):
+                ok, msg = run_ps1(which[0])
+                print(("[√] " if ok else "[!] ") + msg)
+            else:
+                print("已取消。")
+        elif c == "17":
             print("\n--- 微信版本 ---")
             run("wechat_version.py")
             print("--- 开机自启 ---")
             run("autostart.py", ["status"])
-        elif c == "7":
-            auto()
-        elif c == "8":
-            run("setup_llm.py")
+        elif c == "18":
+            run("autostart.py", ["on"])
+        elif c == "19":
+            run("autostart.py", ["off"])
+        elif c == "20":
+            enabled, host, port, err = _status_page()
+            if err:
+                print(f"读不到 config.yaml 的 status 段：{err}")
+            elif not enabled:
+                print("状态页是**关着的**（config.yaml 里 `status.enabled: false`）。")
+                print("要开：把那一项改成 true，然后 [7] 重启助手。")
+                print("（它只绑回环地址，页面上有 wxid/群名，别往局域网上开。）")
+            elif not botctl.is_running():
+                print(f"配置里是开着的（{host}:{port}），但**助手没在跑**，页面不会有人响应。")
+                print("先 [5] 启动助手。")
+            else:
+                url = f"http://{host}:{port}"
+                print(f"打开 {url} …")
+                try:
+                    os.startfile(url)          # 只有 Windows 有；这是 Windows 项目
+                except (AttributeError, OSError) as e:
+                    print(f"打不开浏览器（{e}），自己访问：{url}")
         elif c == "0":
             print("再见！")
             break
         else:
-            print("无效选择，请输入 0~8。")
+            print("无效选择，请输入 0~20。")
 
         input("\n按回车返回菜单 ...")
 
