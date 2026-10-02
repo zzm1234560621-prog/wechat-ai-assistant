@@ -25,6 +25,7 @@ import agent_tools
 import assets
 import auto_reply
 import executor
+import file_read
 import groups
 import live_history
 import settings
@@ -211,6 +212,7 @@ HELP_TEXT = (
     "/delchat <wxid> 移除聊天\n"
     "/status         查看当前配置 + 运行健康（轮询 / 分片错误 / 登录态）\n"
     "/自检           诊断一遍（轮询/登录/分片/hook/发送）+ 告诉你该做什么\n"
+    "/导出 <某人>     把这个会话的对话导成一个可读文件（落盘后告诉你路径）\n"
     "/用量 [天数]     看 token 用量和估算费用（默认最近 7 天）\n"
     "/预算            看消费闸状态（最近 24 小时花了多少 / 上限多少）\n"
     "/预算 <金额>     设上限：超了就**拒绝调用模型**并说明原因，不偷偷降级\n"
@@ -440,6 +442,18 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
             # 自检自己坏了也要如实说——不许回一句「一切正常」糊过去
             traceback.print_exc()
             return f"自检本身出错了（这也要如实说）：{type(e).__name__}: {e}", False
+
+    if cmd in ("/导出", "/export"):
+        if not arg:
+            return ("用法：/导出 <昵称|备注|微信号>　把这个会话的对话导成一个可读文件。\n"
+                    "（只导**文本**消息；文件落在导出目录里，会顺带清理旧的导出。）"), False
+        fresh = settings.effective(load_config())
+        try:
+            return export_conversation(wcf, fresh, contacts or [], arg), False
+        except Exception as e:
+            # 导出失败也要如实说，并明说**没生成文件**
+            traceback.print_exc()
+            return f"导出出错了（**没有生成文件**）：{type(e).__name__}: {e}", False
 
     if cmd in ("/用量", "/usage", "/花费"):
         if usage is None:
@@ -1214,6 +1228,87 @@ def selfcheck_text(cfg=None):
         for i, item in enumerate(todo, 1):
             lines.append(f"  {i}. {item}")
     return "\n".join(lines)
+
+
+def _fmt_ts(ts):
+    """epoch 秒 → 本地时间串。读不出来就说读不出来，别显示 1970。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "（时间读不出）"
+
+
+def render_conversation(rows, who, meta, names=None):
+    """把历史行渲染成**给人看 / 存档**的文本。
+
+    两条规矩：
+      * 说话人一律走 `agent_tools.speaker_of`——**绝不出现 wxid**（导出文件常被
+        转发/分享，把 id 写进去等于把内部标识散出去）；
+      * 头部**如实**写清覆盖范围；被截断就明说「这份不完整」——
+        **绝不把「前 N 条」说成「全部」**。
+    """
+    lines = [f"# 和 {who} 的对话导出", ""]
+    span = ""
+    if meta.get("oldest") and meta.get("newest"):
+        span = f"　{_fmt_ts(meta['oldest'])} → {_fmt_ts(meta['newest'])}"
+    lines.append(f"共 {meta.get('count', len(rows))} 条文本消息{span}")
+    if meta.get("truncated"):
+        lines.append("⚠️ **这份不完整**：碰到了本次导出的条数上限，更早的消息**没有导出**。")
+    lines += ["", "-" * 60, ""]
+    for m in rows:
+        spk = agent_tools.speaker_of(m, names or {}, who)
+        lines.append(f"[{_fmt_ts(m.get('time'))}] {spk}：{m.get('content')}")
+    return "\n".join(lines)
+
+
+def export_conversation(wcf, cfg, contacts, who_raw):
+    """`/导出 <某人>` 的实现。返回给用户的文本（**落盘了就给路径**）。"""
+    alias = auto_reply.address_aliases(cfg)
+    cand, err = agent_tools.resolve_one(contacts, who_raw, cfg.get("self_wxid", ""),
+                                       wcf, aliases=alias)
+    if err:
+        return err
+    who = cand.get("remark") or cand.get("name") or who_raw
+    f = (cfg.get("file") or {})
+    try:
+        page = max(20, min(500, int(f.get("export_page", 200))))
+    except (TypeError, ValueError):
+        page = 200
+    try:
+        cap = max(0, int(f.get("export_max_messages", 5000)))
+    except (TypeError, ValueError):
+        cap = 5000
+
+    rows, meta = live_history.collect_contact_history(wcf, str(cand.get("wxid")),
+                                                      page=page, max_items=cap)
+    if not rows:
+        return (f"没查到和「{who}」的**文本**历史（要么确实没有，要么库句柄掉了）。\n"
+                f"可以发 `/自检` 看一眼——它会把「是不是查不到库」说清楚。")
+
+    text = render_conversation(rows, who, meta, auto_reply.contact_names(contacts))
+    try:
+        d = file_read.export_dir(cfg)
+        os.makedirs(d, exist_ok=True)
+        safe = re.sub(r'[\\/:*?"<>|\s]+', "_", str(who))[:40] or "对话"
+        fp = os.path.join(d, f"对话_{safe}_{time.strftime('%Y%m%d-%H%M%S')}.txt")
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as e:
+        return f"导出写文件失败：{e}（**没有生成文件**）"
+    try:
+        # 复用 file_read 的清理（它只扫 .txt —— 所以这里故意导 .txt，
+        # 保证「导出目录会自己清理」这个承诺是真的，而不是新开一处没人管的目录）。
+        file_read.sweep_exports(cfg)
+    except Exception:
+        traceback.print_exc()
+
+    tail = ""
+    if meta.get("truncated"):
+        tail = (f"\n⚠️ 这份**不完整**：到了上限 {cap} 条，更早的没有导。"
+                f"要全量就把 config.yaml 的 `file.export_max_messages` 调大再导一次。")
+    return (f"已导出和「{who}」的对话：**{meta['count']} 条**（翻了 {meta['pages']} 页）。\n"
+            f"文件：{fp}{tail}\n"
+            f"（用记事本/编辑器打开就行；这个目录会自动清理旧的导出。）")
 
 
 def executed_ttl(cfg=None):

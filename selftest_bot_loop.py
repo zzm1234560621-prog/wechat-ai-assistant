@@ -1047,6 +1047,93 @@ def t_stall_selfheal():
         bot.live_history.force_rescan = old
 
 
+def t_export(tmp):
+    sec("/导出：分页收全 + 如实说截断 + 落盘文件可读且不出现 wxid")
+    old_q = bot.live_history.query_contact_history
+    try:
+        # 造 15 条历史。⚠️ 假查询必须**按真实契约返回时间升序**——
+        # `query_contact_history` 的文档写死了「时间升序」，分页靠 until 往回走；
+        # 假数据要是一开始就返回降序，测的就不是真实现了（第一次跑就是这么错的）。
+        all_rows = []
+        for i in range(15):
+            all_rows.append({"time": 1000 + i, "content": f"第{i}条",
+                             "is_self": (1 if i % 2 else 0),
+                             "sender": "" if i % 2 else "wxid_zhangsan",
+                             "sender_name": "张三" if i % 2 else ""})
+
+        def fake_q(client, talker, limit=50, keyword=None, since=None, until=None):
+            """真实语义：`until` 是上界，取它之前（含）**最近**的 limit 条，升序返回。"""
+            rows = [m for m in all_rows if until is None or m["time"] <= until]
+            return sorted(rows, key=lambda m: m["time"])[-limit:]
+
+        bot.live_history.query_contact_history = fake_q
+
+        rows, meta = bot.live_history.collect_contact_history(None, "wxid_a", page=3)
+        chk(len(rows) == 15, f"分页收全 15 条（实际 {len(rows)}）")
+        chk(meta["truncated"] is False, "没到上限 → truncated=False")
+        times = [r["time"] for r in rows]
+        chk(times == sorted(times), "时间**升序**（导出文件要能顺着读）")
+        chk(len({(r["time"], r["content"]) for r in rows}) == len(rows),
+            "相邻页在边界那条上重叠 → **去重了**（不然存档里会有重复行）")
+        chk(meta["pages"] >= 5, f"真的翻了多页（{meta['pages']} 页）")
+        chk(meta.get("oldest") == 1000 and meta.get("newest") == 1014,
+            f"覆盖范围完整：{meta.get('oldest')}~{meta.get('newest')}")
+
+        # 上限：置 truncated，且保留的是**最近的** N 条
+        rows2, meta2 = bot.live_history.collect_contact_history(
+            None, "wxid_a", page=3, max_items=4)
+        chk(len(rows2) == 4 and meta2["truncated"] is True,
+            f"到上限 → 4 条 + truncated=True（{len(rows2)}/{meta2['truncated']}）")
+        chk([r["time"] for r in rows2] == [1011, 1012, 1013, 1014],
+            f"保留**最近**的 4 条：{[r['time'] for r in rows2]}")
+
+        # 时间戳取不到时**必须停下来**（绝不拿死循环去撞 hook）
+        def stuck(client, talker, limit=50, keyword=None, since=None, until=None):
+            return [{"time": 0, "content": "x", "is_self": 0}]
+        bot.live_history.query_contact_history = stuck
+        _r3, m3 = bot.live_history.collect_contact_history(None, "wxid_a", page=3)
+        chk(m3["pages"] <= 3, f"时间戳全是 0 时必须停（翻了 {m3['pages']} 页）")
+
+        bot.live_history.query_contact_history = fake_q
+        rows4, meta4 = bot.live_history.collect_contact_history(None, "wxid_a", page=99)
+        text = bot.render_conversation(rows4, "张三", meta4, {"wxid_zhangsan": "张三"})
+        chk("共 15 条" in text, f"头部写了条数：{text[:40]!r}")
+        chk("wxid_" not in text, "**导出文本里不出现 wxid**（导出常被转发/分享）")
+        chk("我：" in text, "自己发的渲染成「我」")
+        text_t = bot.render_conversation(rows2, "张三", meta2, {})
+        chk("这份不完整" in text_t,
+            "被截断时**明说「这份不完整」**（不许把前 N 条说成全部）")
+
+        # 端到端：真落盘、给路径、内容可读
+        exp = os.path.join(tmp, "exp")
+        cfg = {"self_wxid": "wxid_me", "file": {"export_dir": exp}}
+        out = bot.export_conversation(
+            None, cfg,
+            [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三"}], "张三")
+        files = os.listdir(exp) if os.path.isdir(exp) else []
+        chk(len(files) == 1 and files[0].endswith(".txt"),
+            f"生成了 1 个 .txt（实际 {files}）")
+        chk("文件：" in out and files and os.path.join(exp, files[0]) in out,
+            f"回复里给出了真实路径：{out[:90]!r}")
+        if files:
+            body = open(os.path.join(exp, files[0]), encoding="utf-8").read()
+            chk("第14条" in body, "文件里有真实内容")
+            chk("wxid_" not in body, "**文件里也没有 wxid**")
+            chk("对话导出" in body, "有标题（人打开就知道是什么）")
+
+        # 认不出人 / 没有历史：都要如实说，且**不落一个空文件**
+        out_bad = bot.export_conversation(None, cfg, [], "查无此人")
+        chk("没找到" in out_bad, f"认不出联系人 → 如实说（实际：{out_bad[:60]!r}）")
+        bot.live_history.query_contact_history = lambda *a, **k: []
+        out_empty = bot.export_conversation(
+            None, cfg,
+            [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三"}], "张三")
+        chk("没查到" in out_empty and "/自检" in out_empty,
+            f"没有历史 → 如实说、指向 /自检（实际：{out_empty[:80]!r}）")
+    finally:
+        bot.live_history.query_contact_history = old_q
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1060,6 +1147,7 @@ def main():
         t_state(tmp)
         t_pending_persist(tmp)
         t_executed_once(tmp)
+        t_export(tmp)
         t_batch_survives_consumer_error(tmp)
         t_poll_failure_throttled(tmp)
         t_image_dirs_union(tmp)

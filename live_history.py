@@ -1675,6 +1675,69 @@ def query_contact_history(client, talker, limit=50, keyword=None, since=None,
     return _v3_query_history(client, talker, limit, keyword, since, until)
 
 
+def collect_contact_history(client, talker, page=200, max_items=0, since=None,
+                            until=None):
+    """把一个会话的文本历史**尽量全**地按时间升序收回来（给「导出对话」用）。
+
+    为什么要单独立一个：`query_contact_history` 一次只给 `limit` 条，
+    而「导出和某人的全部对话」要的是**全量**。翻页必须靠 `until` 一页页往回走——
+    只给 `since` 的话每一批都是「最近 page 条」，会拿到同一批（实测过，见上面
+    `query_contact_history` 的说明）。这里显式这么走。
+
+    返回 `(rows, meta)`：
+
+        rows   时间升序的原始行（形状同 `query_contact_history`）
+        meta   {"pages", "count", "truncated", "oldest", "newest"}
+
+    ⚠️ `max_items > 0` 是**硬上限**：到了就停，并把 `truncated=True` 如实带出去——
+    **绝不静默截断**（调用方必须把「只导了前 N 条」说出来，这是本项目最在意的
+    那一类问题）。默认 0 = 不限（由调用方把关，因为这是用户主动发起的动作）。
+
+    ⚠️ 每一页都是一次真实的 hook 查询，所以调用方**必须**给 `max_items` 兜底，
+    别让它无上限地翻（hook 不支持并发，翻页期间轮询会一直等着）。
+    """
+    out = []
+    seen = set()
+    cur_until = until
+    pages = 0
+    truncated = False
+
+    while True:
+        batch = query_contact_history(client, talker, limit=page,
+                                      since=None, until=cur_until)
+        pages += 1
+        if not batch:
+            break
+
+        # `until` 是「<=」（含端点），相邻两批会在边界那条上重叠 —— 必须去重，
+        # 否则导出的文件里会出现重复的一行（而用户是拿它当存档的）。
+        fresh = []
+        for m in batch:
+            key = (m.get("time"), str(m.get("content"))[:120], m.get("is_self"))
+            if key in seen:
+                continue
+            seen.add(key)
+            fresh.append(m)
+        out = fresh + out          # 每批是「更早的那一段」，所以往前面接
+
+        if max_items and len(out) >= max_items:
+            out = out[-int(max_items):]     # 升序，保留最近的 max_items 条
+            truncated = True
+            break
+
+        oldest = min((m.get("time") or 0) for m in batch)
+        if not oldest or oldest == cur_until:
+            # 时间戳取不到、或游标没往前走 —— 停，**绝不拿死循环去撞 hook**
+            break
+        cur_until = oldest
+
+    meta = {"pages": pages, "count": len(out), "truncated": truncated}
+    if out:
+        times = [(m.get("time") or 0) for m in out]
+        meta["oldest"], meta["newest"] = min(times), max(times)
+    return out, meta
+
+
 # ---------- 「这段时间里有多少条」 ----------
 #
 # 只为「如实告诉模型规模」存在：用户问「9 月我们都聊了什么」时，光给最新的 50 条
