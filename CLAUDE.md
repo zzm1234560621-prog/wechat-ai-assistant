@@ -30,6 +30,7 @@
 .venv/Scripts/python.exe selftest_executor_chain.py # 本地执行确认闸门
 .venv/Scripts/python.exe executor_selftest.py       # executor 独立自测
 .venv/Scripts/python.exe selftest_portable.py       # 便携性：无本机路径、.ps1 带 BOM、安装脚本能自己找微信
+.venv/Scripts/python.exe selftest_tool_registry.py  # 工具注册表全量一致性（TOOLS ↔ 处理器 ↔ 两份配置）
 
 # 起 bot（正常入口是双击 启动助手.bat；命令行仅用于调试）
 .venv/Scripts/python.exe bot.py
@@ -532,7 +533,12 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 ## 改代码时的约定
 
 - **动 `live_history.py` 要同时照顾两套 schema**（v3 / v4），并把用例加进 `selftest_aixed.py`（用假服务，不碰真 hook）。
-- **新增 agent 工具要改两处**：`agent_tools.TOOLS` 和 `config.yaml` 的 `system_prompt`。只加前者，模型根本不知道有这工具。
+- **新增 agent 工具要改三处**：`agent_tools.TOOLS`、**`config.example.yaml` 的 `system_prompt`（发出去的那份）**、
+  **本机 `config.yaml`（如果存在）**。只加 TOOLS，模型不知道有这工具；只加本机 config，**功能只在你这台机器上活着**
+  ——真踩过（2026-10-02）：`send_asset` 的 8 行指导和整个 `assets:` 段只加进了本机 `config.yaml`，
+  `config.example.yaml` 里一个字都没有，于是**开发机上好用、发布包里静默失效**。
+  **新增配置段同理**：只加本机 config，别人拿到的包就没有那段。回归：`selftest_tool_registry.py`
+  （全量交叉校验 TOOLS ↔ `t_*` 处理器 ↔ 两份配置的 system_prompt 与顶层段）。
 - **工具返回的文本要顺手告诉模型「该怎么办」。** 查库失败时别只回一句「失败：…」——模型会原地重试，而每次重试都是一次真实的 hook 调用。统一用 `agent_tools._db_fail()`。
 - **往对话记忆里只放原始提问和最终答复**（`bot.dialog_*`），**绝不能放检索到的历史**——那段每轮都重算，记下来等于每轮重发整块历史，token 直接爆。
 - **发消息是不可逆动作**，默认不许乱发：名单外的一律走「待确认」（`agent_tools`）。别绕过这个机制。文本/图片/转发的分派在 `agent_tools.send_pending()`。

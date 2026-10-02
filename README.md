@@ -383,6 +383,7 @@ wechat-ai-assistant/
 ├── selftest_executor_chain.py  # 本地执行确认闸门链路
 ├── selftest_web.py             # 网上搜索（开关 / 不可信判据 / 上限 / 两处注册）
 ├── selftest_portable.py        # 便携性：无本机路径 / .ps1 带 BOM / 安装脚本能自己找微信
+├── selftest_tool_registry.py   # 工具注册表全量一致性（TOOLS ↔ 处理器 ↔ 两份配置）
 ├── executor_selftest.py        # executor 的独立自测
 ├── _probe_enc.py / _probe_xlsx.py / _probe_zip.py   # 临时探针脚本
 └── installers/        # 微信安装包 + hook 源码 + 部署脚本
@@ -407,7 +408,7 @@ wechat-ai-assistant/
 .venv\Scripts\python.exe executor_selftest.py
 ```
 
-一把跑完全部（22 份，**装完之后也能跑，不需要真微信**）：
+一把跑完全部（23 份，**装完之后也能跑，不需要真微信**）：
 
 ```powershell
 .venv\Scripts\python.exe selftest_all.py       # 加 -v 看失败明细
