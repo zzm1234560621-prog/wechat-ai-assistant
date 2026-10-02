@@ -902,6 +902,10 @@ TOOLS = [
             "但**一个字都不回复对方**。用户用大白话说这类要求时必须调用本工具：\n"
             "  「张三发消息告诉我一声」「帮我盯着张三」→ action=add, who=张三\n"
             "  「别盯着张三了」→ action=del, who=张三\n"
+            "  「有人提到报价就告诉我」「消息里出现 XX 就通知我」→ action=keyword, "
+            "pattern=<正则，如 报价|合同>（**任何会话**命中都通知，只看文本消息，"
+            "且只扫每条前 4000 个字符——要如实告诉用户这个限制）\n"
+            "  「别盯报价了」→ action=keyword_del, pattern=报价\n"
             "  「盯着谁了」→ action=status\n"
             "  「先别通知了」→ action=off\n"
             "**注意和 auto_reply 的区别**：auto_reply 是「代用户回对方」，"
@@ -913,9 +917,17 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "action": {"type": "string",
-                           "enum": ["add", "del", "on", "off", "status"]},
+                           "enum": ["add", "del", "on", "off", "status",
+                                    "keyword", "keyword_del"],
+                           "description": ("keyword = 加一条**关键词/正则**监听"
+                                           "（任何会话命中都通知我）；"
+                                           "keyword_del = 删一条")},
                 "who": {"type": "string",
                         "description": "昵称/备注/微信号/wxid；群填 roomid"},
+                "pattern": {"type": "string",
+                            "description": ("action=keyword / keyword_del 时的**正则**，"
+                                            "例如 报价|合同。只看文本消息，"
+                                            "且只扫每条前 4000 个字符。")},
             },
             "required": ["action"],
         },
@@ -1251,7 +1263,7 @@ _AUTO_ACTIONS = ("on", "off", "add", "del", "mode", "review", "persona", "addres
                  "learn", "ctx", "status")
 _GROUP_ACTIONS = ("status", "add", "remove", "del", "labels")
 _SCHED_ACTIONS = ("add", "del", "on", "off", "status")
-_WATCH_ACTIONS = ("add", "del", "on", "off", "status")
+_WATCH_ACTIONS = ("add", "del", "on", "off", "status", "keyword", "keyword_del")
 
 
 class _Budget:
@@ -4079,9 +4091,18 @@ class ToolBox:
         action = str(args.get("action") or "").strip().lower()
         if action not in _WATCH_ACTIONS:
             return f"action 只能是 {' / '.join(_WATCH_ACTIONS)} 之一。"
-        who = str(args.get("who") or "").strip()
-        # 和 /盯着 走同一条实现（含重名不静默取第一个）
-        arg = watch.build_arg(action, who=who)
+        if action in ("keyword", "keyword_del"):
+            # 关键词那条路收的是正则，不是联系人——别去 resolve 人名
+            # （resolve 一个「报价|合同」只会得到一句「没找到」，把用户带偏）。
+            pattern = str(args.get("pattern") or args.get("who") or "").strip()
+            if not pattern:
+                return ("action=keyword 必须给 pattern（正则），例如 "
+                        "pattern=报价|合同。要看已有关键词就用 action=status。")
+            arg = watch.build_arg(action, who=pattern)
+        else:
+            who = str(args.get("who") or "").strip()
+            # 和 /盯着 走同一条实现（含重名不静默取第一个）
+            arg = watch.build_arg(action, who=who)
         text, changed = watch.handle_command(arg, self.cfg_provider(), self._one)
         if changed:
             self.cfg_changed = True

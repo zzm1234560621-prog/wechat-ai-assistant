@@ -1151,6 +1151,75 @@ def t14_groups():
     return True
 
 
+# ---------------- T15：盯着关键词（任何会话命中就通知）----------------
+
+def t15_watch_keywords():
+    print("T15. 盯着关键词：任何会话命中就通知；非法/危险正则当场拒绝")
+    init = {"watch": {"enabled": True, "chats": [], "keywords": []}}
+    with TempSettings(init) as tmp:
+        cfg = settings.effective({})
+        out, changed = watch.handle_command("关键词 报价|合同", cfg, _resolve_one)
+        chk(changed and "已加入关键词" in out, f"加进去了（实际：{out[:40]}）")
+        chk(str(watch.KEYWORD_SCAN_CHARS) in out,
+            "加的时候就必须说清「只扫前 N 个字符」这个真实限制（不许含糊）")
+        disk = tmp.read()["watch"]["keywords"]
+        chk(len(disk) == 1 and disk[0]["pattern"] == "报价|合同", f"落盘正确：{disk}")
+
+        kws = watch.keywords(settings.effective({}))
+        chk([k["pattern"] for k in watch.match_keywords("这个报价什么时候给", kws)]
+            == ["报价|合同"], "命中「报价」")
+        chk(watch.match_keywords("合同编号 A-12", kws) != [], "另一分支也命中（是正则不是子串）")
+        chk(watch.match_keywords("今天天气不错", kws) == [], "不命中就不打扰")
+        chk(watch.match_keywords("", kws) == [], "空文本不炸")
+
+        # 多条
+        watch.handle_command("关键词 发票", settings.effective({}), _resolve_one)
+        chk(len(watch.keywords(settings.effective({}))) == 2, "两条关键词都在")
+
+        # 非法正则：当场拒绝、说清原因、**不落盘**
+        ok, why = watch.check_pattern("报价(")
+        chk(not ok and "正则" in why, f"非法正则被拒且说清：{why[:40]!r}")
+        out_bad, changed_bad = watch.handle_command("关键词 报价(", settings.effective({}),
+                                                   _resolve_one)
+        chk(not changed_bad and "正则" in out_bad, "非法正则不写进配置")
+        chk(len(watch.keywords(settings.effective({}))) == 2, "配置没被弄坏")
+
+        # 回溯炸弹：必须拒（一卡就把轮询/定时/看护全停了）
+        for bomb in ("(a+)+$", "(ab*)*", "(x+)+"):
+            ok_b, why_b = watch.check_pattern(bomb)
+            chk(not ok_b and "嵌套量词" in why_b, f"拒绝回溯炸弹 {bomb!r}")
+
+        # 太长
+        ok_l, why_l = watch.check_pattern("a" * (watch.KEYWORD_MAX_LEN + 1))
+        chk(not ok_l and "太长" in why_l, "超长正则被拒")
+        ok_e, why_e = watch.check_pattern("   ")
+        chk(not ok_e, "空模式被拒")
+
+        # 只扫前 N 个字符：这是**真实限制**，必须有确定行为，不许假装能匹配
+        kws2 = watch.keywords(settings.effective({}))
+        far = ("x" * watch.KEYWORD_SCAN_CHARS) + "报价"
+        chk(watch.match_keywords(far, kws2) == [],
+            "截断窗口之外的内容**匹配不到**（这就是我们要如实告诉用户的限制）")
+        near = "报价" + ("x" * 10)
+        chk(watch.match_keywords(near, kws2) != [], "窗口之内照常匹配")
+
+        # 删除
+        out_del, ch_del = watch.handle_command("关键词 删 发票", settings.effective({}), _resolve_one)
+        chk(ch_del and "已删除" in out_del, f"删除成功：{out_del[:30]!r}")
+        chk(len(watch.keywords(settings.effective({}))) == 1, "删掉一条只剩一条")
+        out_nf, ch_nf = watch.handle_command("关键词 删 根本没有", settings.effective({}),
+                                            _resolve_one)
+        chk(not ch_nf and "没有" in out_nf, "删不存在的如实说")
+
+        # 状态里要看得到
+        st = watch.status_text(settings.effective({}))
+        chk("关键词" in st and "报价|合同" in st, f"状态里能看到关键词：{st[:56]!r}")
+
+        # 工具侧走同一条实现
+        chk(watch.build_arg("keyword", "发票") == "关键词 发票", "工具参数拼得对")
+        chk(watch.build_arg("keyword_del", "发票") == "关键词 删 发票", "删除也拼得对")
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -1164,7 +1233,8 @@ def main():
                t7_id_not_reused, t8_usage_matches_impl,
                t9_review_scope_is_explicit, t10_relative_time,
                t11_per_person_persona, t12_learn_persona_from_history,
-               t13_address_from_history, t14_groups):
+               t13_address_from_history, t14_groups,
+               t15_watch_keywords):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

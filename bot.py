@@ -249,6 +249,8 @@ HELP_TEXT = (
     "/盯着 —— 看名单\n"
     "/盯着 加 <昵称|wxid|roomid> —— 加进来\n"
     "/盯着 删 <昵称|wxid> —— 移出去\n"
+    "/盯着 关键词 <正则> —— **任何会话**里命中这个词就通知我（不回）\n"
+    "/盯着 关键词 / 删 <正则> —— 看 / 删关键词\n"
     "/盯着 开|关 —— 总开关\n"
     "（和 /auto 互斥：那个是代你回对方，这个是只告诉你不回）\n"
     "\n"
@@ -2296,6 +2298,29 @@ def main():
                 in_targets = sender in targets
                 rec = auto_recs.get(sender) if auto_on else None
                 watched = watch_recs.get(sender) if watch_on else None
+
+                # 关键词监听：它盯的是**内容**，不是某个会话，所以必须在下面那条
+                # 「不是我该管的会话就跳过」**之前**判断——否则用户加了关键词也永远不触发。
+                # 只对**文本**消息生效（上面已经把非文本 continue 掉了），且跳过控制会话
+                # （不然自己发一句 `/预算 20` 都会被自己的关键词命中，纯噪音）。
+                if watch_on and sender != control_chat:
+                    try:
+                        _kws = watch.keywords(cfg)
+                        _hits = watch.match_keywords(msg.content or "", _kws)
+                    except Exception:
+                        traceback.print_exc()
+                        _hits = []
+                    for _kw in _hits:
+                        try:
+                            _who = _msg_speaker(msg, auto_reply.contact_names(contacts))
+                        except Exception:
+                            _who = sender
+                        try:
+                            send(watch.format_keyword_hit(_kw, _who, msg.content or ()),
+                                 control_chat)
+                            print(f"[bot] 关键词命中 {_kw.get('raw')!r} ← {_who}")
+                        except Exception:
+                            traceback.print_exc()
 
                 if not in_targets and rec is None and watched is None and reply_only:
                     continue
