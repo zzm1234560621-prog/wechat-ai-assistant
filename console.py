@@ -339,12 +339,78 @@ def act_status_page():
     return None
 
 
+def first_run():
+    """**第一次装**：把「别人想用的话该点哪儿」变成一次点击。
+
+    ⚠️ 为什么要有这个入口：装 hook 是**整件事的第一步**（不做后面全白搭），
+    可它原来藏在 `[8] 更多… → [7] Hook → [1] 装 hook` 里——
+    第一次拿到这个包的人根本不会翻到那儿。用户问「别人想用的话点哪个呢」才暴露出来。
+    所以把它摆到顶层，按真实顺序走一遍。
+    """
+    print()
+    print("=" * 46)
+    print("  第一次装（按顺序走完就能用）")
+    print("=" * 46)
+    print("  1) 把 hook 装进微信（要管理员，会弹 UAC）")
+    print("  2) 装 Python 依赖")
+    print("  3) 启动助手，然后在微信里配 API Key")
+    print()
+    print("⚠️ 前提：这台电脑要装了 **64 位 Python**（3.11 推荐）。")
+    print("   没有的话先去 python.org 装（勾上 Add to PATH），或：")
+    print("     winget install -e --id Python.Python.3.11")
+    print()
+
+    # ── 1 · 装 hook ──
+    ps1 = os.path.join(HOOK_DIR, "do_hook_install.ps1")
+    print("--- 第 1 步：装 hook ---")
+    if not os.path.isfile(ps1):
+        print(f"[!] 包里没有装 hook 的脚本（{ps1}）——包可能不完整。")
+    else:
+        print("    它会把 version.dll 放进微信目录，并挡住微信自动更新把版本顶掉。")
+        print("    要求微信版本是 **4.1.10.27**（微信里「设置 → 关于微信」看一眼）。")
+        if _confirm("    现在装？(y/N) "):
+            ok, msg = run_ps1("do_hook_install.ps1")
+            print(("[√] " if ok else "[!] ") + msg)
+            print("    → 装完**重启微信**，再确认通了：浏览器打")
+            print("      http://127.0.0.1:30001/QueryDB/status   （返回 JSON 就成）")
+        else:
+            print("    已跳过。以后想装：菜单 [8] → [7] → [1]。")
+
+    # ── 2 · 装依赖 ──
+    print()
+    print("--- 第 2 步：装 Python 依赖 ---")
+    if env.venv_ready():
+        print("    虚拟环境已经就绪，跳过。")
+    elif _confirm("    现在装？（要联网下载，第一次可能几分钟）(y/N) "):
+        run("installer.py")
+    else:
+        print("    已跳过。以后想装：菜单 [2]。")
+
+    # ── 3 · 启动 + 配 API ──
+    print()
+    print("--- 第 3 步：启动 + 配 API Key ---")
+    if _confirm("    现在启动助手（后台）？(y/N) "):
+        ok, msg = botctl.start()
+        print(("[√] " if ok else "[!] ") + msg)
+        if ok:
+            print()
+            print("    接下来在微信里打开**文件传输助手**，依次发这两条：")
+            print("      /provider 1        选 DeepSeek，自动配好协议+接口+模型")
+            print("      /api sk-你的key    设密钥，它会当场测一次通不通")
+            print("    然后直接发消息提问就行。")
+    else:
+        print("    已跳过。以后想启动：菜单 [3]。")
+    return None
+
+
 def menu():
     while True:
         print()
         print("=" * 46)
         print("           微信 AI 助手 · 控制台")
         print("=" * 46)
+        print("  第一次用？直接按 [9]（装 hook → 装依赖 → 启动，一路问到底）")
+        print("-" * 46)
         print("   [1] 降级微信 4.x -> 3.9.x")
         print("   [2] 安装依赖（自动识别版本）")
         print("   [3] 启动助手（后台，无窗口）")
@@ -353,6 +419,7 @@ def menu():
         print("   [6] 看日志")
         print("   [7] 一键开始（检测 -> 装依赖 -> 启动）")
         print("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）")
+        print("   [9] 第一次装（装 hook + 装依赖 + 启动）")
         print("   [0] 退出")
         print("=" * 46)
 
@@ -400,11 +467,13 @@ def menu():
                 ])),
                 ("8", "打开状态页（本地只读网页）", act_status_page),
             ])
+        elif c == "9":
+            first_run()
         elif c == "0":
             print("再见！")
             break
         else:
-            print("无效选择，请输入 0~8。")
+            print("无效选择，请输入 0~9。")
 
         input("\n按回车返回菜单 ... ")
 
