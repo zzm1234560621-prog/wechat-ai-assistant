@@ -204,8 +204,18 @@ def _clean(inp):
     return str(inp or "").lstrip("\ufeff").strip()
 
 
-def _confirm(prompt):
-    return _clean(input(prompt)).lower() in ("y", "yes", "是")
+def _confirm(prompt, default_no=True):
+    """问一句 y/N。**空输入时**：`default_no=True`（默认）当「否」，否则当「是」。
+
+    ⚠️ 两个方向的默认值都必须存在，别图省事统一成一个：
+      * 停止/重启/装 hook —— 这些要**明确点头**，空回车一律当「否」（`default_no=True`）；
+      * 「一键配置」那种想让人**一路回车走完**的流程 —— 空回车当「是」（`default_no=False`）。
+        这是用户要的「一键」：按一下 9，然后连按回车就行。
+    """
+    v = _clean(input(prompt)).lower()
+    if not v:
+        return not default_no
+    return v in ("y", "yes", "是")
 
 
 def health_screen():
@@ -349,7 +359,7 @@ def first_run():
     """
     print()
     print("=" * 46)
-    print("  第一次装（按顺序走完就能用）")
+    print("  一键配置（装 hook → 装依赖 → 启动 → 配模型；一路回车即可）")
     print("=" * 46)
     print("  1) 把 hook 装进微信（要管理员，会弹 UAC）")
     print("  2) 装 Python 依赖")
@@ -368,7 +378,7 @@ def first_run():
     else:
         print("    它会把 version.dll 放进微信目录，并挡住微信自动更新把版本顶掉。")
         print("    要求微信版本是 **4.1.10.27**（微信里「设置 → 关于微信」看一眼）。")
-        if _confirm("    现在装？(y/N) "):
+        if _confirm("    现在装？(Y/n) ", default_no=False):
             ok, msg = run_ps1("do_hook_install.ps1")
             print(("[√] " if ok else "[!] ") + msg)
             print("    → 装完**重启微信**，再确认通了：浏览器打")
@@ -381,25 +391,29 @@ def first_run():
     print("--- 第 2 步：装 Python 依赖 ---")
     if env.venv_ready():
         print("    虚拟环境已经就绪，跳过。")
-    elif _confirm("    现在装？（要联网下载，第一次可能几分钟）(y/N) "):
+    elif _confirm("    现在装？（要联网下载，第一次可能几分钟）(Y/n) ", default_no=False):
         run("installer.py")
     else:
         print("    已跳过。以后想装：菜单 [2]。")
 
-    # ── 3 · 启动 + 配 API ──
+    # ── 3 · 启动 + 配模型 ──
     print()
-    print("--- 第 3 步：启动 + 配 API Key ---")
-    if _confirm("    现在启动助手（后台）？(y/N) "):
+    print("--- 第 3 步：启动 + 配置模型 ---")
+    if _confirm("    现在启动助手（后台）？(Y/n) ", default_no=False):
         ok, msg = botctl.start()
         print(("[√] " if ok else "[!] ") + msg)
-        if ok:
-            print()
-            print("    接下来在微信里打开**文件传输助手**，依次发这两条：")
-            print("      /provider 1        选 DeepSeek，自动配好协议+接口+模型")
-            print("      /api sk-你的key    设密钥，它会当场测一次通不通")
-            print("    然后直接发消息提问就行。")
     else:
         print("    已跳过。以后想启动：菜单 [3]。")
+
+    print()
+    print("    接下来配「用哪个模型 + API Key」——**全程在这里，不用去微信里打字**。")
+    print("    没有 key 就去 https://platform.deepseek.com 领一个（有免费额度）。")
+    if _confirm("    现在配？(Y/n) ", default_no=False):
+        run("setup_llm.py")
+        print("    → 配完直接去微信「文件传输助手」发一句话就能用了。")
+    else:
+        print("    已跳过。以后想配：菜单 [8] → [1]，或双击「配置模型.bat」。")
+        print("    （也可以启动后在微信里发 /provider 1，再发 /api <key>。）")
     return None
 
 
@@ -409,7 +423,7 @@ def menu():
         print("=" * 46)
         print("           微信 AI 助手 · 控制台")
         print("=" * 46)
-        print("  第一次用？直接按 [9]（装 hook → 装依赖 → 启动，一路问到底）")
+        print("  第一次用？直接按 [9]「一键配置」，然后**连按回车**走完")
         print("-" * 46)
         print("   [1] 降级微信 4.x -> 3.9.x")
         print("   [2] 安装依赖（自动识别版本）")
@@ -419,7 +433,7 @@ def menu():
         print("   [6] 看日志")
         print("   [7] 一键开始（检测 -> 装依赖 -> 启动）")
         print("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）")
-        print("   [9] 第一次装（装 hook + 装依赖 + 启动）")
+        print("   [9] 一键配置（装 hook + 装依赖 + 启动 + 配模型）")
         print("   [0] 退出")
         print("=" * 46)
 
@@ -478,10 +492,23 @@ def menu():
         input("\n按回车返回菜单 ... ")
 
 
-if __name__ == "__main__":
+def main():
+    """入口。带 `first` 参数就直接进「一键配置」，不用先看菜单（便于脚本化 / 自动化）。
+
+    日常口径只有一个：**双击 `助手.bat` 看菜单**，第一次用按 `[9]`。
+    （我一度另外扔了一个根目录的 `一键配置.bat`，用户指出「在助手.bat里面有个选项就行」——
+    所以撤掉了：**多一个入口就是多一处要维护、也多一个「到底点哪个」的疑问**。）
+    """
+    arg = sys.argv[1].strip().lower() if len(sys.argv) > 1 else ""
     try:
+        if arg in ("first", "--first-run", "setup", "一键配置"):
+            first_run()
         menu()
     except KeyboardInterrupt:
         print("\n已退出。")
     except EOFError:
         print("\n输入结束，已退出。")
+
+
+if __name__ == "__main__":
+    main()
