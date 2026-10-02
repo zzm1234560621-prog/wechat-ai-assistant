@@ -58,6 +58,9 @@ class _Rec:
     def send_xml(self, xml, wxid):
         self._hit("xml", wxid, xml)
 
+    def send_file(self, path, wxid):
+        self._hit("file", wxid, path)
+
 
 class _Boom:
     """一被查库就炸——用来证明这些用例根本没碰客户端。"""
@@ -1425,6 +1428,117 @@ def test_read_file_heavy_goes_background():
     return ok
 
 
+def test_send_file():
+    """发普通文件：当前 hook 没有这个接口 → **当场如实拒绝，且不进待确认队列**。
+
+    为什么「不进队列」也要单独断言：如果先登记待确认项、等用户回「确认」才失败，
+    就等于**让用户白确认一次**——而发文件是不可逆动作，用户的确认成本很高。
+    所以拒绝必须发生在**登记之前**。
+
+    另外这一条守住的是「不许假装发了」：开关关着时**一次 client 调用都不许有**
+    （用 `_Boom` 客户端证明）。
+    """
+    print("\n── 发普通文件：当前 hook 做不到 → 当场拒绝、不白让用户确认 ──")
+    ok = True
+    tmp = tempfile.mkdtemp(prefix="selftest_policy_sendfile_")
+    old_roots = file_read.files_roots
+    file_read.files_roots = lambda: [tmp]
+    contacts = [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三"}]
+    _reset_pending()
+    try:
+        d = os.path.join(tmp, "2026-10")
+        os.makedirs(d, exist_ok=True)
+        good = os.path.join(d, "合同.pdf")
+        with open(good, "wb") as f:
+            f.write(b"%PDF-1.4 x")
+
+        # ① 开关默认关 → 如实拒绝
+        out = _box(contacts=contacts).t_send_file({"to": "张三", "name": "合同.pdf"})
+        ok &= check("默认（没写 send_file_hook）→ 如实拒绝「发不了普通文件」",
+                    "发不了普通文件" in out, out)
+        ok &= check("拒绝时说清根因是 hook 没有这个接口",
+                    "hook" in out and "接口" in out, out)
+        ok &= check("拒绝时明确禁止绕路 / 禁止假装",
+                    "不要改用别的方式" in out and "假装" in out, out)
+        ok &= check("**没有产生待确认项**（不让用户白确认一次）",
+                    agent_tools.list_pending(CHAT) == [],
+                    agent_tools.list_pending(CHAT))
+
+        # fail-safe：写歪的开关值一律当关（和 search.enabled / privacy.redact 同一档）
+        for bad in ("true", 1, "1", 0, None):
+            cfg = {"agent": {"send_file_hook": bad}}
+            out_b = _box(cfg=cfg, contacts=contacts).t_send_file(
+                {"to": "张三", "name": "合同.pdf"})
+            ok &= check(f"send_file_hook={bad!r} → 仍按关处理（fail-safe）",
+                        "发不了普通文件" in out_b, out_b)
+            _reset_pending()
+
+        # ② 开关打开 → 才进入「定位 → 校验 → 待确认」流程
+        cfg_on = {"agent": {"send_file_hook": True}}
+        box = _box(cfg=cfg_on, contacts=contacts)
+
+        out_miss = box.t_send_file({"to": "张三", "name": "根本没有这份.pdf"})
+        ok &= check("文件不存在 → 明说没找到、且没进队列",
+                    "没找到" in out_miss and agent_tools.list_pending(CHAT) == [],
+                    out_miss)
+
+        for n in ("发票A.pdf", "发票B.pdf"):
+            with open(os.path.join(d, n), "wb") as f:
+                f.write(b"%PDF x")
+        out_multi = box.t_send_file({"to": "张三", "name": "发票"})
+        ok &= check("多份命中 → 列候选、**不替用户挑**",
+                    "发票A.pdf" in out_multi and "发票B.pdf" in out_multi, out_multi)
+        ok &= check("多份命中 → 不进队列", agent_tools.list_pending(CHAT) == [])
+
+        out_ok = box.t_send_file({"to": "张三", "name": "合同.pdf"})
+        pend = agent_tools.list_pending(CHAT)
+        ok &= check("开关打开 → 进入待确认（等用户回「确认」）",
+                    "确认" in out_ok and len(pend) == 1, f"{out_ok!r} / {pend}")
+        if pend:
+            desc = agent_tools.describe_pending(pend[0])
+            ok &= check("待确认项描述带文件名、**不带本机路径**",
+                        "合同.pdf" in desc and tmp not in desc, desc)
+            ok &= check("待确认项带 file 字段（重启恢复要用）",
+                        bool(pend[0].get("file")), list(pend[0]))
+            ok &= check("kind 是 file", pend[0].get("kind") == "file",
+                        pend[0].get("kind"))
+
+        # ③ send_pending 的 file 分支：路径复核不过 → 一份都不发
+        _reset_pending()
+        rec = _Rec()
+        n1, err1 = agent_tools.send_pending(
+            rec, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
+                  "file": os.path.join(tmp, "不存在的.pdf"), "text": "x",
+                  "ts": time.time()})
+        ok &= check("复核不过 → 0 条 + 一次都没发给 client",
+                    n1 == 0 and rec.calls == [] and err1 and "复核" in str(err1),
+                    f"{n1} / {rec.calls} / {err1}")
+
+        # ④ 复核通过 → 真去调 client.send_file（把 hook 的真实结果带回来）
+        _reset_pending()
+        rec2 = _Rec()
+        n2, err2 = agent_tools.send_pending(
+            rec2, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
+                   "file": good, "text": "x", "ts": time.time()})
+        ok &= check("复核通过 → 调了 client.send_file 且记账成功",
+                    n2 == 1 and err2 is None and rec2.calls
+                    and rec2.calls[0][0] == "file", f"{n2} / {err2} / {rec2.calls}")
+
+        # ⑤ client 抛异常（就是当前 hook 的真实行为）→ 如实报，且不许说发了
+        _reset_pending()
+        rec3 = _Rec(boom_at=1)
+        n3, err3 = agent_tools.send_pending(
+            rec3, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
+                   "file": good, "text": "x", "ts": time.time()})
+        ok &= check("client 抛异常 → 0 条 + 原错误带回来",
+                    n3 == 0 and err3 is not None, f"{n3} / {err3}")
+    finally:
+        file_read.files_roots = old_roots
+        _reset_pending()
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
 def main():
     ok = True
     print("\n待确认队列 / 发图白名单 / 查询预算 —— 回归自测（不联网、不碰 30001）")
@@ -1442,6 +1556,7 @@ def main():
     ok &= test_read_file_by_name()
     ok &= test_read_file_cursor()
     ok &= test_read_file_heavy_goes_background()
+    ok &= test_send_file()
     _reset_pending()
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")

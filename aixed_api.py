@@ -210,9 +210,29 @@ class AixedClient:
     def send_xml(self, xml, wxid):
         """转发一条已有消息：xml 是那条消息的**原始 XML**（不是摘要）。
 
+        ⚠️ **这条路当前是死的**（2026-10-02 核实）：`wx_send_xml.cpp` 里
+        `ForwardXMLMsg` 对**所有**类型都 `return false`——真机实测转发会把微信进程
+        带崩（连 dmp 都不留），所以作者改成了安全拒绝。所以它现在总是失败，
+        调用方必须如实报「转发不了」，绝不许说成已发出。
+
         用于「把某条消息转给某人」——微信的转发本质就是把原 XML 再发一次。
         """
         return self._request("POST", "/ForwardXMLMsg", {"to_wxid": wxid, "content": xml})
+
+    def send_file(self, path, wxid):
+        """发一个**普通文件**。
+
+        ⚠️⚠️ **当前 hook 版本没有这个接口。** 已核实的接口全集是
+        `SendTextMsg` / `SendImgMsg` / `ForwardXMLMsg` / `Decode_Pic` /
+        `GetSelfProfile` / `QueryDB/{execute,GetAllDBName,status}`
+        （见 `docs/aixed-api.postman.json`），**没有发文件的**。
+        所以这里发出去只会 404/连不上——**这不是「没试过」，是已经查清楚了**。
+
+        留这个方法是为了：换了支持发文件的 hook 之后，**上层一行都不用改**。
+        上层必须由 `agent.send_file_hook` 这个开关把关（默认 false），
+        关着的时候就别调到这儿来（见 agent_tools.t_send_file）。
+        """
+        return self._request("POST", "/SendFileMsg", {"wxidorgid": wxid, "path": path})
 
     def self_profile(self):
         return self._request("POST", "/GetSelfProfile", {})

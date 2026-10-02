@@ -1161,8 +1161,12 @@ TOOLS = [
     {
         "name": "forward_message",
         "description": (
-            "把**某一条已有的消息转发**给别人（含图片、链接、文件、名片这些非文本消息）。\n"
-            "contact + local_id 从 find_images / read_history 的结果里拿。\n"
+            "把**某一条已有的消息转发**给别人。contact + local_id 从 find_images / "
+            "read_history 的结果里拿。\n"
+            "⚠️ **当前 hook 上这条路是死的**（2026-10-02 核实）：转发接口 "
+            "`ForwardXMLMsg` 对所有类型都已被安全关闭——真机实测它会**把微信进程带崩**。"
+            "所以调用它**一定会失败**。失败时**照实告诉用户「转发不了」**："
+            "不要说成已经转了，也不要改用别的方式（比如把原图当新图发）绕过去。\n"
             "和 send_text 一样受确认机制约束：名单外的收件人要先请用户回「确认」。"
         ),
         "parameters": {
@@ -1173,6 +1177,30 @@ TOOLS = [
                 "local_id": {"type": "string", "description": "消息的 local_id"},
             },
             "required": ["to", "contact", "local_id"],
+        },
+    },
+    {
+        "name": "send_file",
+        "description": (
+            "给某人发一个**普通文件**（pdf / Word / Excel / zip …）。"
+            "用户说「把刚才那个 pdf 发给李四」时用这个。`name` 只给**文件名**，"
+            "不要带目录或盘符；文件只允许取**用户在微信里收过或发过的**那些"
+            "（`msg/file/` 下）——先用 find_files 列一下也行。\n"
+            "⚠️⚠️ **当前 hook 版本没有发文件的接口**（已核实的接口全集只有 "
+            "SendTextMsg / SendImgMsg / ForwardXMLMsg，而转发那条路也已安全关闭），"
+            "所以这个工具在默认配置下会**当场如实拒绝**。被拒绝时：\n"
+            "  · **照实告诉用户「发不了普通文件」**，并说明原因是 hook 没有这个接口；\n"
+            "  · **绝不改用别的方式**（当图片发、去跑 run_command 绕过、让用户自己去电脑上发）；\n"
+            "  · **绝不许假装已经发了**。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "收件人的昵称/备注/微信号/wxid"},
+                "name": {"type": "string",
+                         "description": "文件名本身（可只给一部分），不要带目录或盘符"},
+            },
+            "required": ["to", "name"],
         },
     },
     {
@@ -1264,6 +1292,23 @@ _AUTO_ACTIONS = ("on", "off", "add", "del", "mode", "review", "persona", "addres
 _GROUP_ACTIONS = ("status", "add", "remove", "del", "labels")
 _SCHED_ACTIONS = ("add", "del", "on", "off", "status")
 _WATCH_ACTIONS = ("add", "del", "on", "off", "status", "keyword", "keyword_del")
+
+
+def send_file_hook_on(cfg):
+    """当前 hook 版本是否**有**发文件的接口。默认 `False`。
+
+    已核实（2026-10-02）：hook 的接口全集是 SendTextMsg / SendImgMsg /
+    ForwardXMLMsg / Decode_Pic / GetSelfProfile / QueryDB{execute,GetAllDBName,status}
+    （见 `docs/aixed-api.postman.json`），**没有发文件的**；而唯一能搬运已有消息的
+    ForwardXMLMsg 也已被安全关闭（真机实测会崩微信）。所以**当前版本上「发普通文件」
+    就是做不到**。
+
+    ⚠️ 这个开关**不是**「打开就能发」：打开只会让请求打到一个不存在的端点上。
+    它存在的意义是把「换一个带发文件接口的 hook 之后不用改代码」这条路留出来。
+    按项目惯例用 `is True` 严格判定（写 "true"/1 一律当关，fail-safe）。
+    """
+    sec = (cfg or {}).get("agent") or {}
+    return sec.get("send_file_hook") is True
 
 
 class _Budget:
@@ -1444,7 +1489,7 @@ def _alive(chat, ttl):
 
 def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
                 image=None, xml=None, cmd=None, timeout=None, label=None,
-                items=None, spec=None):
+                items=None, spec=None, file=None):
     """登记一条待确认发送。kind 区分来源：agent（用户让助手发的）/ auto（自动回复草稿）。
 
     bot 对两者要求不一样：自动回复草稿只认明确的中文确认词，避免用户在控制
@@ -1477,7 +1522,7 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
     """
     _PENDING.setdefault(str(chat), []).append(
         {"to_wxid": to_wxid, "to_name": to_name, "text": text,
-         "image": image, "xml": xml,
+         "image": image, "xml": xml, "file": file,
          "cmd": cmd, "timeout": timeout, "label": label,
          "items": items, "spec": spec,
          "kind": kind, "count": int(count or 1), "ts": time.time()})
@@ -1592,6 +1637,11 @@ def describe_pending(item):
             raw = item.get("text")
         cmd, note = _clip(str(raw or ""), 200)
         return f"本机命令「{cmd}」{(' ' + note) if note else ''}"
+
+    # 1.2) 发普通文件：只显示**文件名**（全文路径里有本机目录，用户认的是文件名）
+    if kind == "file" or item.get("file"):
+        base = os.path.basename(str(item.get("file") or ""))
+        return f"把文件「{base}」发给 {to_name or '对方'}"
 
     # 1.5) 群发（两道确认）。**绝不用 wxid**，也不列全文——全文由 bot 单独原文直发，
     #      菜单里只需要让用户认出「是哪一批」。
@@ -1793,6 +1843,31 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None):
         if sent:
             remember_sent_image(wxid)     # 免得这张图回显时又被当成新消息
         return sent, None
+    if item.get("file"):
+        # 发普通文件。⚠️ 当前 hook **没有**这个接口（见 aixed_api.send_file 的说明），
+        # 所以这条路只有用户把 `agent.send_file_hook` 打开时才会走到——而即便走到了，
+        # 也**把 hook 的原始结果原样带回来**，绝不因为「以为它会成」就说已发出。
+        path = str(item["file"])
+        # 发送前**再复核一次**路径归属（和图片同一个理由：登记到用户确认之间隔着时间，
+        # 文件可能被换掉、或被换成指向别处的链接）。判据是「按文件名能重新定位到同一个
+        # 文件」——那条路只认微信 `msg/file/` 下的东西。
+        try:
+            real = os.path.realpath(path)
+        except OSError as e:
+            return 0, f"文件路径解析失败：{e}"
+        try:
+            again = file_read.locate(os.path.basename(real))
+        except Exception as e:
+            return 0, f"发送前复核文件失败：{e}"
+        if not again or os.path.realpath(again) != real:
+            return 0, (f"发送前复核不通过：{path} 现在定位不到了（只允许微信 "
+                       f"`msg/file/` 下、按文件名能重新找到的文件）。"
+                       f"**这份没有发出去**。")
+        try:
+            client.send_file(real, wxid)
+        except Exception as e:
+            return 0, e
+        return 1, None
     if item.get("xml"):
         n, err = send_xml_repeated(client, item["xml"], wxid,
                                    item.get("count") or 1, interval)
@@ -3665,6 +3740,63 @@ class ToolBox:
         return (f"「{nm}」不在自动发送名单里，**一张都还没发**。"
                 f"请告诉用户：准备把「{folder}」里的 {len(picked)} 张图发给 {nm}，"
                 f"让他回复「确认」后我再发。{trunc}")
+
+    def t_send_file(self, args):
+        """给某人发一个普通文件。
+
+        ⚠️ 当前 hook **没有**发文件的接口，所以默认走「**当场拒绝**」这条路——
+        而且是在**不产生待确认项**的前提下拒绝：不让用户白确认一次再看失败。
+        将来换了带发文件接口的 hook，把 `agent.send_file_hook` 打开就能用；
+        这个工具的流程（定位 → 校验 → 确认闸门 → 发 → 如实报）已经就绪。
+        """
+        args = args or {}
+        to = str(args.get("to") or "").strip()
+        name = str(args.get("name") or "").strip()
+        if not to or not name:
+            return "参数不全：需要 to（发给谁）和 name（文件名）。"
+
+        # ① 先把文件**真的定位到**（纯磁盘、不查库；边界只认微信 msg/file/ 下的文件）。
+        #    这一步是真实工作：不存在 / 多份命中都要如实说，而不是先让用户确认。
+        path, perr, cands = file_read.pick(name)
+        if path is None:
+            if cands:
+                names = "、".join(str(c.get("name") or c.get("path"))
+                                  for c in cands[:8])
+                return (f"叫「{name}」的文件找到好几份，**我不替你挑**：{names}\n"
+                        f"让用户说清是哪一份（给更完整的文件名），再发。")
+            return (perr or f"没找到叫「{name}」的文件。"
+                    f"（只找用户在微信里收过/发过的文件；可以用 find_files 先列一遍。）")
+
+        # ② 收件人（重名不静默取第一个）
+        cand, err = self._one(to)
+        if err:
+            return err
+
+        # ③ 能力闸：**当场拒绝，不进待确认队列**（不让用户白确认一次）
+        if not send_file_hook_on(self.cfg_provider()):
+            return ("**发不了普通文件**：当前 hook 版本没有发文件的接口"
+                    "（它只暴露 SendTextMsg / SendImgMsg / ForwardXMLMsg，"
+                    "而转发那条路也已经安全关闭了）。\n"
+                    "这不是配置写错、也不是「再试一次就好」——"
+                    "**请如实告诉用户发不了**，并且：不要改用别的方式（把它当图片发、"
+                    "或去跑 run_command 绕过）、也不要假装已经发了。\n"
+                    "（背景：换一个带发文件接口的 hook 之后，把 config.yaml 的 "
+                    "`agent.send_file_hook` 设成 true 就能用，这个工具的流程已就绪。）")
+
+        base = os.path.basename(path)
+        wxid = str(cand.get("wxid"))
+        nm = cand.get("remark") or cand.get("name") or to
+        if self._in_whitelist(wxid, nm) or self._in_whitelist(wxid, to):
+            try:
+                self.client.send_file(path, wxid)
+            except Exception as e:
+                # 失败也要说清「这份没发出去」（发文件不可逆，含糊不得）
+                return f"发文件「{base}」失败（**这份没有发出去**）：{e}"
+            return f"已经尝试把文件「{base}」发给 {nm}。"
+
+        set_pending(self.chat, wxid, nm, f"发文件：{base}", kind="file", file=path)
+        return (f"还没有发。**请用户回「确认」再发**：把文件「{base}」发给 {nm}。\n"
+                f"（用户回「确认」之后我才真正去发。）")
 
     def t_forward_message(self, args):
         to = str(args.get("to") or "").strip()

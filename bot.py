@@ -972,12 +972,14 @@ def restore_pending(chats, cfg):
                     it.get("text") or "", kind=it.get("kind") or "agent",
                     count=it.get("count") or 1, image=it.get("image"),
                     xml=it.get("xml"), cmd=it.get("cmd"), timeout=it.get("timeout"),
-                    # ⚠️ `label` / `items` / `spec` **必须一起恢复**。
+                    # ⚠️ `label` / `items` / `spec` / `file` **必须一起恢复**。
                     # 少了 label，素材那条待确认项就退化成「转发一条消息」（用户认不出
                     # 是哪一条）；少了 items/spec，群发批次会变成「没有收件人」——
                     # 而它的 text 只是**给人看的预览**，真按文本分支发出去就是往空
                     # wxid 发一段预览文字（真机上是「发出去了但没人收到」这种最难查的错）。
-                    label=it.get("label"), items=it.get("items"), spec=it.get("spec"))
+                    # 少了 file，发文件的待确认项会退化成「发一段文字」。
+                    label=it.get("label"), items=it.get("items"), spec=it.get("spec"),
+                    file=it.get("file"))
                 n += 1
             except Exception:
                 traceback.print_exc()
@@ -2590,11 +2592,13 @@ def main():
                             dirs_now = None
                         n, err = agent_tools.send_pending(wcf, item, interval,
                                                           allowed_dirs=dirs_now)
-                        is_text = not item.get("image") and not item.get("xml")
+                        is_text = (not item.get("image") and not item.get("xml")
+                                   and not item.get("file"))
                         if is_text:
                             # 记一下，免得发给自己时又被当成新消息回一遍
                             remember_sent(item["text"])
-                        what = "转发" if item.get("xml") else "图片"
+                        what = ("转发" if item.get("xml")
+                                else "文件" if item.get("file") else "图片")
                         label = item.get("label")
                         if err is not None:
                             print(f"[bot] 确认发送失败（已发 {n}/{count}）: {err}")
