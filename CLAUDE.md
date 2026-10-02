@@ -74,7 +74,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 ```
 
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
-- `agent_tools.py` — 给大模型的工具层（**25 个工具**：find_contact / send_text / broadcast / group / read_history / day_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / send_asset / web_search / run_command / what_happened）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
+- `agent_tools.py` — 给大模型的工具层（**27 个工具**：find_contact / send_text / broadcast / group / read_history / day_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / send_asset / web_search / run_command / what_happened / send_file / semantic_search）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
 - `assets.py` — **素材暂存区**：用户在控制会话里发一次图/表情，之后说「发给谁」就能再发。见下面「素材暂存」。
 - `auto_reply.py` — 代用户本人回指定会话。
   - **审核是「每个会话一份」，全局那份只是默认值**（`review_on(rec, cfg)`：`rec["review"]` 优先，`None` 才继承全局）。
