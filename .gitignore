@@ -13,6 +13,11 @@ settings.json
 data/
 *.log
 
+# ---- 安装脚本的运行日志：每次跑都重写，而且里面带本机用户名和绝对路径
+# （`C:\Users\<你>\...` / 项目所在盘符），是私人信息，别提交 ----
+installers/*-log.txt
+installers/**/*-log.txt
+
 # ---- 自测用的图片（从微信缓存里拷的，是私人内容，别提交）----
 test_images/
 

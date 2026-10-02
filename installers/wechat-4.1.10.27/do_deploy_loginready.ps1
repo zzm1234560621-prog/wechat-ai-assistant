@@ -1,11 +1,23 @@
-# 以管理员身份运行：部署「登录就绪探测」版 version.dll，并结束微信
+﻿# 以管理员身份运行：部署「登录就绪探测」版 version.dll，并结束微信
 $ErrorActionPreference = 'Continue'
-$dir   = 'D:\wechat-ai-assistant\wechat-ai-assistant\installers\wechat-4.1.10.27'
+. (Join-Path $PSScriptRoot '_common.ps1')
+
+# 项目目录 = 本脚本所在目录（以前写死成本机绝对路径，换台电脑就废）
+$dir   = $PSScriptRoot
 $build = Join-Path $dir 'src-4.1.10.27\WeChat-Hook-4.1.10.27\x64\Release\version.dll'
 $log   = Join-Path $dir 'deploy-loginready-log.txt'
-$WX    = 'C:\Program Files\Tencent\Weixin'
 
 "=== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Out-File $log -Encoding utf8
+
+# 微信安装目录自动探测（以前写死成厂商默认路径）
+$WX = Find-Weixin
+if (-not $WX) {
+    "[X] 没找到微信安装目录，无法部署登录就绪版 DLL。" | Out-File $log -Append -Encoding utf8
+    "    已找过：HKCU/HKLM\SOFTWARE\Tencent\Weixin、`$env:ProgramFiles\Tencent\Weixin。" | Out-File $log -Append -Encoding utf8
+    "=== DONE (no weixin) ===" | Out-File $log -Append -Encoding utf8
+    exit 1
+}
+"    [0] 微信目录：$WX" | Out-File $log -Append -Encoding utf8
 
 "[1] 归档新构建" | Out-File $log -Append -Encoding utf8
 try {
