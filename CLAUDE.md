@@ -169,7 +169,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   ```
 
   反解时是拿 `contact.db` 的 `remark / nick_name / alias` **逐行对拍**确认的，不是猜的：
-  `['王小明','','小桐 王小明','亲人','lww00000000','某市 某区','']`。
+  `['张三','','张三丰','同事','zhangsan_001','北京 朝阳','']`。
   实现：`live_history.labels_of_search_key()`（纯函数）+ `contacts_in_label()`。
 - **⚠️ 绝对不能只靠 `LIKE '%标签名%'`**：实测标签「1」LIKE 命中 **412** 行、真成员只有
   **1** 个（`gzh001` 这些微信号里的数字全被骗进去）。所以流程必须是

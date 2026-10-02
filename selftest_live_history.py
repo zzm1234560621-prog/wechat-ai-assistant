@@ -769,7 +769,7 @@ def _label_router(db, sql):
             # 真实布局：备注 \x08 '' \x08 昵称 \x08 标签 \x08 微信号 \x08 地区 \x08 ''
             return "\x08".join([remark, "", nick, labels, alias, region, ""])
         return [
-            {"u": "wxid_a", "k": key("", "王小明", "亲人", "lww1", "某市 某区")},
+            {"u": "wxid_a", "k": key("", "张三", "亲人", "zs001", "北京 朝阳")},
             {"u": "wxid_b", "k": key("王五", "五哥:岩", "亲人,家", "", "中国大陆 ")},
             {"u": "wxid_c", "k": key("", "公众号君", "", "gzh001", "某省 某市")},
             {"u": "wxid_d", "k": key("亲人小卖部", "小卖部", "", "shop1", "")},
@@ -791,7 +791,7 @@ def _t_labels():
     f = live_history.labels_of_search_key
 
     ok &= check("7 段：第 4 段是标签",
-                f("王小明\x08\x08小桐 王小明\x08亲人\x08lww1\x08某市 某区\x08") == ["亲人"])
+                f("张三\x08\x08张三丰\x08亲人\x08zs001\x08北京 朝阳\x08") == ["亲人"])
     ok &= check("多个标签用逗号分开",
                 f("王五\x08\x08五哥:岩\x08亲人,家\x08\x08中国大陆 \x08") == ["亲人", "家"])
     ok &= check("第 4 段为空 = 这个人没有标签",

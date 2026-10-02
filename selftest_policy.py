@@ -944,7 +944,7 @@ class _LabelClient:
         if db == "contact_fts.db" and "contact_fts_v5" in sql:
             def key(remark, nick, labels, alias):
                 return "\x08".join([remark, "", nick, labels, alias, "", ""])
-            return [{"u": "wxid_a", "k": key("", "王小明", "亲人", "lww1")},
+            return [{"u": "wxid_a", "k": key("", "张三", "亲人", "zs001")},
                     {"u": "wxid_b", "k": key("王五", "五哥:岩", "亲人,家", "")},
                     {"u": "wxid_d", "k": key("亲人小卖部", "小卖部", "", "shop1")}]
         return []
