@@ -1,4 +1,4 @@
-"""file_read / llm / settings 的回归自测（T1~T8）。
+"""file_read / llm / settings 的回归自测（T1~T9）。
 
 **不联网、不碰 30001、不需要微信**：假响应对象 + 临时目录 + 现场构造的 zip 样本。
 用法：`.venv/Scripts/python.exe selftest_io_llm.py`
@@ -8,6 +8,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -115,8 +116,8 @@ def _write(path, entries):
     return path
 
 
-def _docx_bytes(text, filler=b""):
-    return {
+def _docx_bytes(text, filler=b"", extra=None):
+    out = {
         "[Content_Types].xml": b'<?xml version="1.0"?><Types/>',
         "word/document.xml": (
             b'<?xml version="1.0" encoding="UTF-8"?><w:document ' + _W.encode() + b'>'
@@ -124,9 +125,11 @@ def _docx_bytes(text, filler=b""):
             + f'<w:p><w:r><w:t>{text}</w:t></w:r></w:p>'.encode("utf-8")
             + b"</w:document>"),
     }
+    out.update(extra or {})
+    return out
 
 
-def _xlsx_bytes(cell):
+def _xlsx_bytes(cell, extra=None):
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     # 多铺几行：太短的文本会被 _looks_garbled 的「短文本算不可靠」规则拦下（那是另一条规则）
@@ -154,6 +157,7 @@ def _xlsx_bytes(cell):
             f'<?xml version="1.0"?><worksheet xmlns="{ns}"><sheetData>{rows}'
             f'</sheetData></worksheet>'
         ).encode("utf-8"),
+        **(extra or {}),
     }
 
 
@@ -686,6 +690,414 @@ def t8_settings():
               settings.SETTINGS_PATH == real_path, settings.SETTINGS_PATH)
 
 
+def t9_image_and_pick():
+    """当文件发来的图片走 OCR + `read_file` 只给 name 的磁盘兜底（2026-10-01 加）。"""
+    print("\n── T9 · 图片按文件读（OCR）+ 只给文件名找文件 ──")
+    import image_read
+
+    cfg = {"file": {"max_bytes": 10 * 1024 * 1024}}
+    img = os.path.join(TMP, "图里的字.jpg")
+    with open(img, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0" + b"fake-jpeg")
+
+    calls = []
+
+    def fake_handoff(path, cfg_, max_bytes=None, collect=None):
+        calls.append((path, max_bytes))
+        return fake_handoff.result
+
+    real_handoff = image_read.handoff
+    image_read.handoff = fake_handoff
+    try:
+        # ① OCR 出来的短文本**不许**被 `_looks_garbled`（<20 字当可疑）拒掉：
+        #    那张真机缩略图只认出「交 易 猫」四个字，按老判据会被当乱码 —— 和音频同一个坑。
+        fake_handoff.result = {"mode": "ocr", "kind": "text", "text": "交 易 猫",
+                               "path": None, "why": ""}
+        text, err = file_read.extract(img, cfg)
+        check("图片走 OCR：短文本没被当乱码拒", err is None and text == "交 易 猫", (text, err))
+        check("图片用的是 file.max_bytes（不是 image.max_bytes）",
+              bool(calls) and calls[-1][1] == cfg["file"]["max_bytes"], calls)
+
+        # ② 图里没字 → 说清是「OCR 只认图里的字」，别和文档的「没有可提取的文字」混一起
+        fake_handoff.result = {"mode": "ocr", "kind": "none", "text": "", "path": None,
+                               "why": "图里没识别到文字（系统 OCR 只认图里的字）"}
+        text, err = file_read.extract(img, cfg)
+        check("OCR 没识别到字 → 如实说、且说明只认图里的字",
+              text is None and err and "没识别到文字" in err, err)
+
+        # ③ OCR 失败（没装/起不来）→ 原因原样带出来，不吞成「解析失败」
+        fake_handoff.result = {"mode": "ocr", "kind": "none", "text": "", "path": None,
+                               "why": "系统 OCR 没成功：起不了 PowerShell：拒绝访问"}
+        text, err = file_read.extract(img, cfg)
+        check("OCR 失败 → 原因带上（不吞）",
+              text is None and err and "起不了 PowerShell" in err, err)
+
+        # ④ 嗅探出是图、但后缀不在白名单（.heic）→ **也走图片通道**，
+        #    让 OCR/视觉模型自己去判认不认；认不出它会如实说（2026-10-02 起按内容嗅探）
+        heic = os.path.join(TMP, "a.heic")
+        with open(heic, "wb") as f:
+            f.write(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 40)
+        calls.clear()
+        fake_handoff.result = {"mode": "ocr", "kind": "text", "text": "HEIC 也走图片通道",
+                               "path": None, "why": ""}
+        text, err = file_read.extract(heic, cfg)
+        check(".heic（不在白名单、但嗅探出是图）→ 交给图片通道",
+              err is None and text == "HEIC 也走图片通道" and len(calls) == 1,
+              (text, err, calls))
+    finally:
+        image_read.handoff = real_handoff
+
+    # ---- pick()：只按文件名找（纯磁盘，不查库）----
+    root = os.path.join(TMP, "pickroot")
+    os.makedirs(os.path.join(root, "2026-10"), exist_ok=True)
+    for fn in ("报告(1).pdf", "发票A.pdf", "发票B.pdf", "笔记.docx"):
+        with open(os.path.join(root, "2026-10", fn), "wb") as f:
+            f.write(b"x")
+    real_roots = file_read.files_roots
+    file_read.files_roots = lambda: [root]
+    try:
+        p, err, cands = file_read.pick("笔记.docx")
+        check("pick 精确命中 → 返回路径",
+              err is None and p and os.path.basename(p) == "笔记.docx" and not cands,
+              (p, err, cands))
+
+        p, err, cands = file_read.pick("报告.pdf")
+        check("pick 认「(N)」这类重名后缀（报告.pdf → 报告(1).pdf）",
+              err is None and p and os.path.basename(p) == "报告(1).pdf", (p, err, cands))
+
+        p, err, cands = file_read.pick("发票")
+        check("pick 命中多份 → **不挑**，返回候选列表",
+              p is None and err is None and len(cands) == 2, (p, err, cands))
+
+        p, err, cands = file_read.pick("根本没有这份")
+        check("pick 找不到 → 明说没找到（带上找的范围）",
+              p is None and err and "没找到" in err and "msg/file" in err, err)
+
+        p, err, cands = file_read.pick("../../windows/system.ini")
+        check("pick 挡住路径穿越（只让给文件名本身）",
+              p is None and err and "不合法" in err, err)
+    finally:
+        file_read.files_roots = real_roots
+
+
+def t10_unlimited_and_sniff():
+    """`file.max_bytes: 0` = 不限（不许被 falsy 吃掉）+ 按内容嗅探（2026-10-02 加）。
+
+    这两条是「任何文件都能读、不限大小」的地基：
+      * 上限里的 `0` 必须和「没配」分开 —— 老写法 `int(v or 30MB)` 会把 0 静默吃成 30MB；
+      * 后缀白名单永远会漏（`README`、`.srt`、无后缀日志…），所以要看**内容**。
+    """
+    print("\n── T10 · 不限大小 + 按内容嗅探 ──")
+    MB = 1024 * 1024
+
+    # ① 体积上限的语义
+    check("没配 max_bytes → 默认 30MB", file_read._cfg({})[0] == 30 * MB, file_read._cfg({})[0])
+    got = file_read._cfg({"file": {"max_bytes": 0}})[0]
+    check("max_bytes: 0 → 0（= 不限，**不许**被 or 吃成 30MB）", got == 0, got)
+    check("max_bytes 写成坏值 → 退回默认",
+          file_read._cfg({"file": {"max_bytes": "abc"}})[0] == 30 * MB)
+    check("max_bytes 负数 → 退回默认",
+          file_read._cfg({"file": {"max_bytes": -1}})[0] == 30 * MB)
+    check("max_chars 没配 → 20000", file_read._cfg({})[1] == 20000)
+
+    # ② 解压封顶：只许调大、不许关
+    check("max_unpack 没配 → 200MB", file_read.unpack_cap({}) == 200 * MB)
+    check("max_unpack 配了 → 用它", file_read.unpack_cap({"file": {"max_unpack": 1024}}) == 1024)
+    buf, old_out = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        cap0 = file_read.unpack_cap({"file": {"max_unpack": 0}})
+    finally:
+        sys.stdout = old_out
+    check("max_unpack: 0 → 退回默认**并告警**（封顶不能关）",
+          cap0 == 200 * MB and "⚠️" in buf.getvalue(), buf.getvalue()[:90])
+    check("max_bytes=0 时解压上限不许退化成 1 字节（老算法会 `max(1, 0*3)`）",
+          file_read._unpack_limit({"file": {"max_bytes": 0}}) == 200 * MB,
+          file_read._unpack_limit({"file": {"max_bytes": 0}}))
+    check("max_bytes 配了 64MB 时解压上限仍是 min(200MB, 192MB)",
+          file_read._unpack_limit({"file": {"max_bytes": 64 * MB}}) == 192 * MB)
+
+    # ③ 交给后台 worker 的阈值
+    check("inline_bytes 默认 2MB", file_read.inline_bytes({}) == 2 * MB)
+
+    # ④ 内容嗅探
+    def put(name, data):
+        p = os.path.join(TMP, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    cases = [
+        ("嗅探-中文.txt", "这是一段正常的中文文本，用来测内容嗅探。".encode("utf-8"), "text"),
+        ("嗅探-无后缀日志", b"2026-10-02 INFO hello\n" * 20, "text"),
+        ("嗅探-控制字符.bin", bytes(range(1, 32)) * 8, "binary"),
+        ("嗅探-NUL.bin", b"abc\x00def" * 10, "binary"),
+        ("嗅探-pdf", b"%PDF-1.4\n" + b"x" * 200, "pdf"),
+        ("嗅探-zip", b"PK\x03\x04" + b"x" * 200, "zip"),
+        ("嗅探-老doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"x" * 200, "ole2"),
+        ("嗅探-png", b"\x89PNG\r\n\x1a\n" + b"x" * 200, "image"),
+        ("嗅探-heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 40, "image"),
+        ("嗅探-mp4", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 40, "video"),
+        ("嗅探-7z", b"7z\xbc\xaf\x27\x1c" + b"x" * 200, "7z"),
+        ("嗅探-rtf", b"{\\rtf1\\ansi hello}", "rtf"),
+    ]
+    for name, data, want in cases:
+        got = file_read.sniff(put(name, data))[0]
+        check(f"{name} → {want}", got == want, got)
+
+    # ⑤ 「任何文件」的一半：**没有后缀的文本**真的能读出来
+    p = put("README", "这是没有后缀的说明文件，内容应该能被读出来，这句足够长以通过乱码判据。".encode("utf-8"))
+    text, err = file_read.extract(p)
+    check("无后缀的文本文件 → 能读出来",
+          err is None and text and "没有后缀的说明文件" in text, (text, err))
+
+    # ⑥ 未知后缀的二进制 → 如实拒绝，且**绝不把二进制喂给模型**
+    p = put("mystery.dat", bytes(range(256)) * 8)
+    text, err = file_read.extract(p)
+    check("未知后缀的二进制 → 拒绝并说明是二进制",
+          text is None and err and "二进制" in err, err)
+
+    # ⑦ 嗅探出的**压缩包**：T7 起已经真接了 —— 坏包要报它自己的问题（不是"不支持"）
+    p = put("pack.zip", b"PK\x03\x04" + b"x" * 200)
+    text, err = file_read.extract(p)
+    check("坏压缩包 → 如实说打不开（不再说「不支持」）",
+          text is None and err and "压缩包" in err, err)
+
+    # ⑧ 真 zip：T7 起能递归读成员（详细用例在 selftest_archive.py）
+    p2 = os.path.join(TMP, "真包.zip")
+    with zipfile.ZipFile(p2, "w") as z:
+        z.writestr("里面的.txt", "这是压缩包里的成员，内容够长以通过乱码判据。".encode("utf-8"))
+    text, err = file_read.extract(p2)
+    check("真压缩包 → 成员内容读出来了",
+          err is None and text and "里面的.txt" in text and "压缩包里的成员" in text,
+          (err, (text or "")[:120]))
+
+
+def t11_paging_and_export():
+    """分页 + 全文导出：不重不漏、cursor 校严、清理要打日志（2026-10-02 加）。
+
+    这是"输入不限大小"的落地方式：本地全文可读，但**一次只给模型一页**
+    （上下文和费用是真限制），靠 cursor 续读。
+    """
+    print("\n── T11 · 分页与全文导出 ──")
+    exp = os.path.join(TMP, "exports")
+    cfg = {"file": {"max_bytes": 0, "max_chars": 100, "export_dir": exp}}
+    full = "".join(f"第{i:04d}行：这是一段用来验证分页的文本，字要够多才切得开。\n"
+                   for i in range(60))
+    p = os.path.join(TMP, "长文本.txt")
+    with open(p, "w", encoding="utf-8", newline="") as f:   # newline=""：别让 Windows 换成 \r\n
+        f.write(full)
+
+    # ① 默认 extract 仍然截断（老行为一个字不变）；full=True 才给全文
+    t_short, e1 = file_read.extract(p, cfg)
+    t_full, e2 = file_read.extract(p, cfg, full=True)
+    check("默认 extract 仍然截断（老行为不变）",
+          e1 is None and t_short and len(t_short) <= 100 + 40 and "只取前" in t_short)
+    check("extract(full=True) 给全文（不截断）",
+          e2 is None and t_full.strip() == full.strip(), len(t_full or ""))
+
+    # ② 第一页 + cursor
+    page1, err = file_read.extract_page(p, cfg)
+    check("第一页读出来了", err is None and page1 and "第0000行" in page1, (page1 or "")[:60])
+    m = re.search(r"cursor=([0-9a-f]{16}:\d+)", page1 or "")
+    check("第一页尾部给了 cursor", bool(m), (page1 or "")[-160:])
+    check("第一页**明说这是节选**（不许说成全读完了）",
+          "一共" in (page1 or "") and "接着读" in (page1 or ""), (page1 or "")[-160:])
+    eid_cursor = m.group(1) if m else ""
+    eid = eid_cursor.split(":")[0]
+
+    # ③ 导出文件真的落地了，内容是全文
+    ep = os.path.join(exp, eid + ".txt")
+    check("全文导出到 export_dir", os.path.isfile(ep), os.listdir(exp))
+    check("导出内容 = 全文（一个字不差）",
+          open(ep, encoding="utf-8").read().strip() == full.strip())
+
+    # ④ 续读：**不重不漏**，拼起来正好是全文
+    got = ""
+    cur = eid_cursor
+    pages = 0
+    while cur and pages < 20:
+        pg, err = file_read.extract_page(None, cfg, cursor=cur)
+        check(f"第 {pages + 2} 页读得出来", err is None and pg, err)
+        body = re.sub(r"^（续读：从第 \d+ 字节开始）\n", "", pg or "")
+        body = re.sub(r"\n\n…（还有内容没读完。.*$", "", body, flags=re.S)
+        got += body
+        pages += 1
+        m2 = re.search(r"cursor=([0-9a-f]{16}:\d+)", pg or "")
+        cur = m2.group(1) if m2 else ""
+    first_body = re.sub(r"\n\n…（这份文件一共.*$", "", page1 or "", flags=re.S)
+    total = first_body + got
+    check("逐页拼回来 == 全文（不重不漏）", total.strip() == full.strip(),
+          f"拼回 {len(total.strip())} 字 / 全文 {len(full.strip())} 字")
+    check("读到末尾会停（不会无限给 cursor）", not cur, cur)
+
+    # ⑤ cursor 校验：坏格式 / 导出不在了
+    t, e = file_read.extract_page(None, cfg, cursor="../../etc/passwd")
+    check("cursor 带路径 → 被格式校验挡住", t is None and e and "格式不对" in e, e)
+    t, e = file_read.extract_page(None, cfg, cursor="deadbeefdeadbeef:0")
+    check("导出不在了 → 如实说（并告诉怎么重来）",
+          t is None and e and "不在了" in e, e)
+
+    # ⑥ 清理：留最近的 N 份，**删了要打日志**
+    for i in range(4):
+        file_read._export_write(f"内容{i}" * 50, f"f{i}.txt", cfg)
+    before = len([n for n in os.listdir(exp) if n.endswith(".txt")])
+    buf, old_out = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        dead = file_read.sweep_exports(cfg, keep=2)
+    finally:
+        sys.stdout = old_out
+    after = len([n for n in os.listdir(exp) if n.endswith(".txt")])
+    check("清理只留最近 2 份", after == 2, (before, after))
+    check("清理**打了日志**（静默丢弃不允许）",
+          dead and "⚠️" in buf.getvalue() and "清理" in buf.getvalue(), buf.getvalue()[:120])
+    check("清理不碰导出目录外的文件（只删 .txt）",
+          all(n.endswith(".txt") for n in os.listdir(exp)), os.listdir(exp))
+
+
+def t12_embedded_images():
+    """文档内嵌图片（docx/pptx/xlsx）+ PDF 扫描页（2026-10-02，规格第九节）。
+
+    要点：① 图片走的是文本后面的"图片段"，**标明来源**；② 读不出来要**说出来**
+    （张数 + 原因），静默丢弃不允许；③ `image.mode=off` 时如实说没解读。
+    """
+    print("\n── T12 · 文档里的图片也被读出来 ──")
+    PNG = b"\x89PNG\r\n\x1a\n" + b"fake-png-body" * 8
+    calls = []
+
+    def fake_from_bytes(data, name, cfg, collect=None):
+        calls.append((name, len(data)))
+        return "图里的字：测试用", ""
+
+    real = file_read._image_from_bytes
+    try:
+        file_read._image_from_bytes = fake_from_bytes
+
+        # ① docx 里带一张位图 + 一张矢量图（emf 读不了 → 要如实说）
+        d = os.path.join(TMP, "带图.docx")
+        _write(d, _docx_bytes("正文第一段", extra={
+            "word/media/image1.png": PNG,
+            "word/media/image2.emf": b"\x01\x00\x00\x00emf",
+        }))
+        calls.clear()
+        text, err = file_read.extract(d)
+        check("docx 正文照旧", err is None and "正文第一段" in text, (text or "")[:80])
+        check("docx 里的位图被解读、且**标明来源**",
+              "word/media/image1.png" in text and "图里的字：测试用" in text,
+              (text or "")[-220:])
+        check("矢量图（emf）**如实说没解读**，不装作没有",
+              "矢量图" in (text or "") and "emf" in (text or ""), (text or "")[-220:])
+
+        # ② 超过单份文档上限时：只解读 20 张，**并把"还有几张"说出来**
+        d2 = os.path.join(TMP, "图很多.docx")
+        many = {f"word/media/image{i:02d}.png": PNG for i in range(1, 26)}
+        _write(d2, _docx_bytes("图很多的文档", extra=many))
+        calls.clear()
+        text2, err2 = file_read.extract(d2)
+        check("超过上限时只解读 20 张", len(calls) == 20, len(calls))
+        check("并把「还有 5 张没解读」说出来",
+              "还有 5 张" in (text2 or ""), (text2 or "")[-220:])
+
+        # ③ pptx / xlsx 的内嵌图也走同一条路
+        p3 = os.path.join(TMP, "带图.pptx")
+        _write(p3, {
+            "[Content_Types].xml": b'<?xml version="1.0"?><Types/>',
+            "ppt/slides/slide1.xml": (
+                '<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a">'
+                '<a:p><a:r><a:t>幻灯片标题</a:t></a:r></a:p></p:sld>').encode("utf-8"),
+            "ppt/media/image1.png": PNG,
+        })
+        t3, e3 = file_read.extract(p3)
+        check("pptx 的内嵌图也读（标明来源）",
+              e3 is None and "ppt/media/image1.png" in (t3 or "") and "幻灯片标题" in (t3 or ""),
+              (t3 or "")[-200:])
+
+        p4 = os.path.join(TMP, "带图.xlsx")
+        _write(p4, _xlsx_bytes("单元格中文", extra={"xl/media/image1.png": PNG}))
+        t4, e4 = file_read.extract(p4)
+        check("xlsx 的内嵌图也读（标明来源）",
+              e4 is None and "xl/media/image1.png" in (t4 or "") and "单元格中文" in (t4 or ""),
+              (t4 or "")[-200:])
+    finally:
+        file_read._image_from_bytes = real
+
+    # ④ image.mode=off：**如实说**有图但没解读（用真实现，不走桩）
+    d5 = os.path.join(TMP, "关掉读图.docx")
+    _write(d5, _docx_bytes("正文", extra={"word/media/image1.png": PNG}))
+    t5, e5 = file_read.extract(d5, {"image": {"mode": "off"}})
+    check("image.mode=off → 说清「有图但没解读」，不静默",
+          e5 is None and "图片解读已关闭" in (t5 or ""), (t5 or "")[-200:])
+
+    # ⑤ PDF 的「整页是图」页：**先用 pypdf 预筛**出真有这种页的样本，再去跑 extract。
+    #    ⚠️ 本测试把 image_cache 桩掉了（`files_roots()` 返回空），所以要按**文件路径**
+    #    把真的 image_cache 加载进来，才能摸到本机真实 PDF；摸不到就跳过。
+    import importlib.util
+    real_roots = []
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_real_image_cache", os.path.join(BASE, "image_cache.py"))
+        ric = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ric)
+        real_roots = [os.path.join(a, "msg", "file") for a in ric.account_dirs()]
+        real_roots = [d for d in real_roots if os.path.isdir(d)]
+    except Exception as e:
+        print(f"  ⏭️  加载真实 image_cache 失败（{type(e).__name__}），跳过 PDF 两条")
+
+    import pypdf as _pypdf
+    pdfs = []
+    for r in real_roots:
+        for dp, _dn, fns in os.walk(r):
+            pdfs += [os.path.join(dp, f) for f in fns if f.lower().endswith(".pdf")]
+    pdfs = sorted(pdfs, key=os.path.getsize)
+    # 预筛只看有限样本：最小的 15 份 + 最大的 5 份（扫描件往往是大文件）
+    picks = pdfs[:15] + pdfs[-5:] if len(pdfs) > 20 else pdfs
+    scanned_pick, multi_pick = None, None
+    for cand in picks:
+        try:
+            rd = _pypdf.PdfReader(cand)
+        except Exception:
+            continue
+        if multi_pick is None and len(rd.pages) > 3:
+            multi_pick = cand
+        if scanned_pick is None:
+            for i, pg in enumerate(rd.pages[:10], 1):
+                if not (pg.extract_text() or "").strip():
+                    try:
+                        if len(pg.images) > 0:
+                            scanned_pick = (cand, i)
+                            break
+                    except Exception:
+                        continue
+        if scanned_pick and multi_pick:
+            break
+
+    if scanned_pick:
+        cand, pageno = scanned_pick
+        file_read._image_from_bytes = fake_from_bytes
+        try:
+            calls.clear()
+            t, e = file_read.extract(cand, {"file": {"max_bytes": 0,
+                                                     "pdf_max_pages": pageno + 2}})
+        finally:
+            file_read._image_from_bytes = real
+        check(f"PDF 扫描页走了图片通道并标明页码（{os.path.basename(cand)[:22]} 第 {pageno} 页）",
+              e is None and "整页是图" in (t or "") and len(calls) >= 1,
+              (t or "")[-200:])
+    else:
+        print(f"  ⏭️  本机 {len(pdfs)} 份 PDF 的预筛样本里没找到「整页是图」，跳过这条")
+
+    # ⑥ 「只读前 N 页」必须说出来（以前写死 40 页且只字不提 = 静默截断）
+    if multi_pick:
+        t6, e6 = file_read.extract(multi_pick, {"file": {"max_bytes": 0,
+                                                        "pdf_max_pages": 3}})
+        check("按 pdf_max_pages 截断时**明说**共几页/读了几页",
+              e6 is None and "pdf_max_pages" in (t6 or "") and "共" in (t6 or ""),
+              (t6 or "")[-200:])
+    else:
+        print("  ⏭️  没有多页 PDF 样本，跳过「页数截断要说明」这条")
+
+
 def main():
     print("=" * 60)
     print("file_read / llm / settings 回归自测（临时目录：%s）" % TMP)
@@ -698,6 +1110,10 @@ def main():
     t6_temperature_retry()
     t7_truncated()
     t8_settings()
+    t9_image_and_pick()
+    t10_unlimited_and_sniff()
+    t11_paging_and_export()
+    t12_embedded_images()
     print("\n" + "=" * 60)
     print("全部通过 ✅" if _ok else "有失败项 ❌")
     print("=" * 60)

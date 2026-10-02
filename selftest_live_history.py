@@ -130,6 +130,42 @@ def _fts_ok(db, sql):
     return []
 
 
+def _fts_history(db, sql):
+    """4.x 的 **fts 主路径**：某个会话的历史从 message_fts 分片里取。
+
+    这条是生产里查历史的主路径（`query_contact_history` 先走它、命中就返回），
+    以前**一个用例都没有**。这里要钉住的是：**非文本消息也必须带 `local_type`**——
+    它的 content 已经被渲染成 `[图片]` 这类标签，光看 content 分不出
+    「一句话」和「一张图的标签」，而 `auto_reply` 的「从历史学语气」正靠这个字段
+    挑出用户自己发的**文本**。fts 那条路以前把这个字段算完就丢了。
+    """
+    if db == "contact.db":
+        return [{"x": 1}]        # v4 探针要通，否则会被判成 3.9.x，走不到 fts 这条链
+    if db == "message_fts.db":
+        if "CREATE VIRTUAL TABLE" in sql:
+            return [{"name": "message_fts_v4_0"}]
+        if "SELECT rowid, username FROM Name2Id" in sql:
+            # fts 库自己的 id 空间：100=对方会话，55=我自己
+            return [{"rowid": 100, "username": "wxid_friend"},
+                    {"rowid": 55, "username": SELF_WXID}]
+        if "SELECT rowid FROM Name2Id" in sql:
+            if SELF_WXID in sql:
+                return [{"rowid": 55}]
+            return [{"rowid": 100}]
+        if "FROM message_fts_v4_0" in sql:
+            return [
+                {"acontent": "我发的一句话", "session_id": 100, "sender_id": 55,
+                 "create_time": NOW + 1, "local_type": 1, "message_local_id": 1},
+                {"acontent": "对方回的一句", "session_id": 100, "sender_id": 100,
+                 "create_time": NOW + 2, "local_type": 1, "message_local_id": 2},
+                # 我发的一张图：fts 里没有正文，content 会被渲染成 `[图片]`
+                {"acontent": "", "session_id": 100, "sender_id": 55,
+                 "create_time": NOW + 3, "local_type": 3, "message_local_id": 7},
+            ]
+        return []
+    _dead_db(db)
+
+
 def _msg_path_alive(db, sql):
     """fts 拿不到、但 Msg_ 表这条路自己捞到了消息（session.db 不在链路上）。"""
     if db == "session.db":
@@ -567,8 +603,14 @@ def main():
                 all("rowid IN" in s and "ORDER BY" not in s for _, s in mapped), mapped)
 
     # ---------------------------------------------------------------
+    print("\n── fts 主路径的历史字段：非文本要带 local_type ──")
+    ok &= _t_fts_history_fields()
+
     print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
     ok &= _t_nonttext_pickup()
+
+    print("\n── 微信自带的「标签」：成员藏在 contact_fts 的 search_key 第 4 段 ──")
+    ok &= _t_labels()
 
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")
@@ -577,6 +619,37 @@ def main():
 
 
 _IMG_TS = 1790000100
+
+
+def _t_fts_history_fields():
+    """fts 主路径的历史必须带 `local_type`——「学语气」靠它挑出用户自己发的文本。
+
+    真踩过（2026-10-01）：`_v4_fts_rows` 把 local_type 读出来渲染完就**丢了**，
+    返回的字典里没有它。后果是 `auto_reply._learn_messages` 里那条
+    「非文本不算语气样本」的过滤**在生产主路径上根本不生效**：图片会被渲染成
+    `[图片]` 混进学习样本。而当时的自测用的是带 local_type 的假数据，
+    所以**测试是绿的、生产是漏的**——这条用例就是把这两边钉在一起。
+    """
+    ok = True
+    c = _FakeClient(_fts_history)
+    hist = live_history.query_contact_history(c, "wxid_friend")
+    ok &= check("fts 主路径拿得到历史（3 条：我一句、对方一句、我一张图）",
+                len(hist) == 3, hist)
+    ok &= check("每条都带 local_type（和 Msg_ 那条路的形状一致）",
+                all("local_type" in m for m in hist), hist)
+    img = [m for m in hist if "[图片]" in str(m.get("content"))]
+    ok &= check("图片渲染成 [图片]、但 local_type 仍是 3（不许塌成 1）",
+                len(img) == 1 and img[0]["local_type"] == 3, img)
+    ok &= check("is_self 认得对（我发的两条、对方一条）",
+                [m["is_self"] for m in hist] == [1, 0, 1],
+                [m["is_self"] for m in hist])
+
+    # 跨模块契约：学语气只该拿「我发的 + 文本」
+    samples = auto_reply._learn_messages(hist)
+    ok &= check("学语气只取我发的文本：图片标签和对方的话都被挡掉",
+                len(samples) == 1 and "我发的一句话" in samples[0]
+                and all("[图片]" not in s for s in samples), samples)
+    return ok
 
 
 class _PickupStub:
@@ -673,6 +746,84 @@ def _t_nonttext_pickup():
     live_history._v4_pickup_nontext(c3, cur3, [], limit=5)
     ok &= check("__nonttext__ 形状不对时自动重置，不抛异常",
                 isinstance(cur3.get("__nonttext__"), dict), cur3.get("__nonttext__"))
+    return ok
+
+
+def _label_router(db, sql):
+    """微信自带「标签」的假库：contact_label 给标签名，contact_fts 给成员。
+
+    刻意混进两条**假命中**（真实数据里这是常态，不是假想）：
+      * `gzh001` —— 微信号里有数字「1」，但标签段是空的；
+      * 「亲人小卖部」—— 备注里有「亲人」两个字，但标签段是空的。
+    实测标签「1」LIKE 命中 412 行、真成员只有 1 个。只看 LIKE 不看第 4 段，
+    就会把 411 个无关的人当成收件人——而**群发是不可逆的**。
+    """
+    if db == "contact.db":
+        if "contact_label" in sql:
+            return [{"label_id_": "2", "label_name_": "亲人"},
+                    {"label_id_": "3", "label_name_": "1"},
+                    {"label_id_": "4", "label_name_": "家"}]
+        return [{"x": 1}]        # v4 探针要通，否则会被判成 3.9.x
+    if db == "contact_fts.db" and "contact_fts_v5" in sql:
+        def key(remark, nick, labels, alias, region):
+            # 真实布局：备注 \x08 '' \x08 昵称 \x08 标签 \x08 微信号 \x08 地区 \x08 ''
+            return "\x08".join([remark, "", nick, labels, alias, region, ""])
+        return [
+            {"u": "wxid_a", "k": key("", "王小明", "亲人", "lww1", "某市 某区")},
+            {"u": "wxid_b", "k": key("王五", "五哥:岩", "亲人,家", "", "中国大陆 ")},
+            {"u": "wxid_c", "k": key("", "公众号君", "", "gzh001", "某省 某市")},
+            {"u": "wxid_d", "k": key("亲人小卖部", "小卖部", "", "shop1", "")},
+            {"u": "wxid_e", "k": key("", "李四", "亲人,家", "", "")},
+        ]
+    return []
+
+
+def _t_labels():
+    """微信自带标签：**成员藏在 contact_fts 的 search_key 第 4 段**。
+
+    契约是 2026-10-01 对着真实数据反解确认的（和 contact.db 的 remark/nick/alias
+    逐行对拍）。钉住三件事：
+      1. 第 4 段才是标签（布局错一位就会把备注/昵称/微信号当标签）；
+      2. **LIKE 命中不算数**，必须精确核对第 4 段；
+      3. 读不到就返回空，**不猜**（上层会如实说读不到，而不是发错人）。
+    """
+    ok = True
+    f = live_history.labels_of_search_key
+
+    ok &= check("7 段：第 4 段是标签",
+                f("王小明\x08\x08小桐 王小明\x08亲人\x08lww1\x08某市 某区\x08") == ["亲人"])
+    ok &= check("多个标签用逗号分开",
+                f("王五\x08\x08五哥:岩\x08亲人,家\x08\x08中国大陆 \x08") == ["亲人", "家"])
+    ok &= check("第 4 段为空 = 这个人没有标签",
+                f("赵六  小学同学\x08\x08六哥\x08\x08zhangsan\x08某国 \x08") == [])
+    ok &= check("备注里出现标签名**不算**标签（位置不对就是不算）",
+                f("亲人小卖部\x08\x08小卖部\x08\x08shop1\x08") == [])
+    ok &= check("段数不足 4（布局对不上）-> 返回空，不猜", f("a\x08b\x08c") == [])
+    ok &= check("空输入不炸", f("") == [] and f(None) == [])
+
+    client = _FakeClient(_label_router)
+    labs = live_history.label_names(client)
+    ok &= check("读出 3 个标签名", [l["name"] for l in labs] == ["亲人", "1", "家"], labs)
+
+    got = live_history.contacts_in_label(client, "亲人")
+    ok &= check("「亲人」的真实成员是 3 个（a/b/e），**两条假命中被剔掉**",
+                got == ["wxid_a", "wxid_b", "wxid_e"], got)
+    ok &= check("gzh001 和「亲人小卖部」都不在里面",
+                "wxid_c" not in got and "wxid_d" not in got, got)
+
+    ok &= check("标签「1」：LIKE 会命中 gzh001，但真成员一个都没有",
+                live_history.contacts_in_label(client, "1") == [])
+    ok &= check("不存在的标签返回空（不瞎给）",
+                live_history.contacts_in_label(client, "没这个标签") == [])
+
+    dead = _FakeClient(_dead_db)
+    ok &= check("库坏了返回 None（**和「没有」区分开**：上层要如实说「读不到」）",
+                live_history.label_names(dead) is None
+                and live_history.contacts_in_label(dead, "亲人") is None)
+    ok &= check("真没有这个标签时返回空列表（不是 None）",
+                live_history.contacts_in_label(client, "没这个标签") == []
+                and live_history.label_names(_FakeClient(
+                    lambda db, sql: [{"x": 1}] if db == "contact.db" else [])) == [])
     return ok
 
 

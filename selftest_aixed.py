@@ -58,6 +58,29 @@ class Stub(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _filtered_msgs(self, db, sql):
+        """按 SQL 里写的条件筛 MSG 行。
+
+        **桩必须真的过滤**：不然游标、时间下界/上界这些逻辑测不出来
+        （测试是绿的、生产是漏的——这个项目栽过不止一次）。
+        """
+        rows = list(MSGS.get(db, []))
+        if "StrTalker = '" in sql:
+            talker = sql.split("StrTalker = '")[1].split("'")[0]
+            rows = [r for r in rows if r["StrTalker"] == talker]
+        if "LIKE '%" in sql:
+            key = sql.split("LIKE '%")[1].split("%'")[0]
+            rows = [r for r in rows if key in r["StrContent"]]
+        # 下界（since）/ 上界（until）：两个都得认，少一个都会让
+        # 「按时间查」那条路在自测里静默失效
+        if "CreateTime >= " in sql:
+            floor = int(sql.split("CreateTime >= ")[1].split()[0])
+            rows = [r for r in rows if r["CreateTime"] >= floor]
+        if "CreateTime <= " in sql:
+            ceil = int(sql.split("CreateTime <= ")[1].split()[0])
+            rows = [r for r in rows if r["CreateTime"] <= ceil]
+        return rows
+
     def do_GET(self):
         if self.path == "/QueryDB/status":
             self._send({"IsLogin": 1, "hWeixin": 123456})
@@ -85,6 +108,15 @@ class Stub(BaseHTTPRequestHandler):
             # 模拟登录失败/查库失败时的错误返回格式
             if "BADSQL" in sql:
                 self._send({"status": -1, "desc": "simulated db handle failure"})
+            # 聚合必须先判：`COUNT(*) AS c, MIN(...), MAX(...)` 这种 SQL 里也有
+            # `MAX(CreateTime)`，落到下面那个「取最大时间」的分支就会回错形状，
+            # 于是 count_history 在自测里静默拿到 0（测试绿的、生产漏的，栽过）。
+            elif "COUNT(*)" in sql and "FROM MSG" in sql:
+                rows = self._filtered_msgs(db, sql)
+                ct = [r["CreateTime"] for r in rows]
+                self._send({"data": [{"c": len(ct),
+                                      "mn": min(ct) if ct else 0,
+                                      "mx": max(ct) if ct else 0}]})
             elif "MAX(CreateTime)" in sql:
                 rows = MSGS.get(db, [])
                 self._send({"data": [{"m": max([r["CreateTime"] for r in rows], default=0)}]})
@@ -97,18 +129,7 @@ class Stub(BaseHTTPRequestHandler):
                 else:
                     self._send({"data": CONTACTS})
             elif "FROM MSG" in sql:
-                rows = list(MSGS.get(db, []))
-                if "StrTalker = '" in sql:
-                    talker = sql.split("StrTalker = '")[1].split("'")[0]
-                    rows = [r for r in rows if r["StrTalker"] == talker]
-                if "LIKE '%" in sql:
-                    key = sql.split("LIKE '%")[1].split("%'")[0]
-                    rows = [r for r in rows if key in r["StrContent"]]
-                # 必须真的按游标过滤，否则测不出游标逻辑对不对
-                if "CreateTime >= " in sql:
-                    floor = int(sql.split("CreateTime >= ")[1].split()[0])
-                    rows = [r for r in rows if r["CreateTime"] >= floor]
-                self._send({"data": rows})
+                self._send({"data": self._filtered_msgs(db, sql)})
             else:
                 self._send({"data": []})
 
@@ -152,12 +173,12 @@ class _NoDbStub(Stub):
 V4_SESSION_TS = NOW + 40
 V4_SESSION_SUMMARY = "给张三发10次你好"
 
-# 真实抓到的 chat_room.ext_buffer（群 11111111111@chatroom），用来验群成员解码。
+# 真实抓到的 chat_room.ext_buffer（群 12345678901@chatroom），用来验群成员解码。
 # 结构：repeated { 1=wxid  2=群昵称  3=角色(群主=9)  4=邀请人 }
 ROOM_BUF = (
-    "0A2C0A12777869645F697636346B78763779676E32311206E88081E7B4AB1809220C"
-    "7465616368657231336C65650A2C0A12777869645F3432323437343232343733323218"
-    "81402213777869645F39326F707273637A673933793132"
+    "0A2C0A12777869645F616161616161616161616161611206E88081E5BCA018"
+    "09220C7465616368657230303030310A2C0A12777869645F62626262626262"
+    "6262626262621881402213777869645F6363636363636363636363636363"
 )
 
 
@@ -204,7 +225,7 @@ class _V4StaleFtsStub(BaseHTTPRequestHandler):
         if db == "contact.db":
             if "FROM chat_room" in sql:
                 self._send({"data": [{"ext_buffer": ROOM_BUF,
-                                      "owner": "wxid_friendD"}]})
+                                      "owner": "wxid_aaaaaaaaaaaaa"}]})
             else:
                 self._send({"data": [{"x": 1}]})
         elif db == "message_fts.db":
@@ -272,6 +293,53 @@ def main():
     ok &= check("all_contacts()", len(contacts) == 2 and contacts[0]["wxid"] == "wxid_friendA", contacts)
     hist = live_history.query_contact_history(c, "wxid_friendA")
     ok &= check("query_contact_history()", len(hist) == 2 and hist[0]["content"].startswith("上个月"), hist)
+    # v3 这条 SQL 的 WHERE 里写死 Type = 1，所以每条都该显式带 local_type=1：
+    # 下游（「从历史学语气」挑用户自己发的文本）按 local_type 判断，不分后端。
+    ok &= check("query_contact_history() 每条都带 local_type=1",
+                all(m.get("local_type") == 1 for m in hist), hist)
+    # since（epoch 秒）= 只看这个时刻之后的消息。**这是「最近 N 天」唯一能被
+    # 真正回答的入口**：不加它，返回的永远是「最新的 limit 条」——按条数不按时间
+    # （2026-10-01 真机：张三那条会话 30 条只覆盖 1.4 天，用户问 10 天答不出来）。
+    # 假数据里 friendA 的两条是 NOW+10 / NOW+11。
+    part = live_history.query_contact_history(c, "wxid_friendA", since=NOW + 11)
+    ok &= check("query_contact_history(since=) 只回该时刻之后的",
+                len(part) == 1 and part[0]["content"] == "我这边还在等回复", part)
+    ok &= check("since 比所有消息都新 → 空结果（不是报错，也不退回全量）",
+                live_history.query_contact_history(
+                    c, "wxid_friendA", since=NOW + 999) == [])
+    ok &= check("since 不影响 keyword 一起用（两个条件串在同一条 SQL 里）",
+                [m["content"] for m in live_history.query_contact_history(
+                    c, "wxid_friendA", keyword="等回复", since=NOW + 10)]
+                == ["我这边还在等回复"],
+                live_history.query_contact_history(
+                    c, "wxid_friendA", keyword="等回复", since=NOW + 10))
+    # until = 上界（含）。**只给 since 翻不到更早**（它锚在「现在」，返回的永远是
+    # 最近 limit 条——实测 days=10 与 days=30 拿到同一批），所以往更早看必须给 until。
+    ok &= check("query_contact_history(until=) 只回该时刻（含）以前的",
+                [m["content"] for m in live_history.query_contact_history(
+                    c, "wxid_friendA", until=NOW + 10)]
+                == ["上个月那个项目怎么样了"],
+                live_history.query_contact_history(
+                    c, "wxid_friendA", until=NOW + 10))
+    ok &= check("since + until = 两头都夹住（只看这一段）",
+                [m["content"] for m in live_history.query_contact_history(
+                    c, "wxid_friendA", since=NOW + 10, until=NOW + 11)]
+                == ["上个月那个项目怎么样了", "我这边还在等回复"],
+                live_history.query_contact_history(
+                    c, "wxid_friendA", since=NOW + 10, until=NOW + 11))
+    # count_history：只为了把规模如实说给模型听——「9 月一共 1400 条，
+    # 这里只给你最新的 200 条」和「只给 200 条」是完全不同的两句话。
+    cnt = live_history.count_history(c, "wxid_friendA",
+                                     since=NOW + 10, until=NOW + 11)
+    ok &= check("count_history 报出范围内条数 + 时间跨度",
+                cnt.get("count") == 2 and cnt.get("first") == NOW + 10
+                and cnt.get("last") == NOW + 11, cnt)
+    ok &= check("count_history 和取数用同一套过滤（只数该时刻之后的）",
+                live_history.count_history(
+                    c, "wxid_friendA", since=NOW + 11).get("count") == 1)
+    ok &= check("范围里一条都没有 → count=0，不是报错",
+                live_history.count_history(
+                    c, "wxid_friendA", since=NOW + 999).get("count") == 0)
     found = live_history.search_history(c, "项目")
     ok &= check("search_history()", len(found) == 3, [f["content"] for f in found])
     resolved = live_history.resolve_contact(c, "老张")
@@ -372,20 +440,20 @@ def main():
     ok &= check("名字唯一时正常返回", cand2 and cand2["wxid"] == "wxid_a", (cand2, err2))
 
     print("\n── 预取路径也必须显示名字（build_user_prompt 用的就是它）──")
-    bnames = {"wxid_x": "王小明", "11111111111@chatroom": "165汉阙总群"}
+    bnames = {"wxid_x": "张三", "12345678901@chatroom": "老同学群"}
     ok &= check("单聊显示备注名",
                 bot._msg_speaker(
-                    {"talker": "wxid_x", "is_self": 0, "sender": "wxid_x"}, bnames) == "王小明")
+                    {"talker": "wxid_x", "is_self": 0, "sender": "wxid_x"}, bnames) == "张三")
     ok &= check("自己发的显示「我」",
                 bot._msg_speaker({"talker": "wxid_x", "is_self": 1, "sender": ""}, bnames) == "我")
     ok &= check("群聊带上群名和发言人",
                 bot._msg_speaker(
-                    {"talker": "11111111111@chatroom", "is_self": 0, "sender": "wxid_x"},
-                    bnames) == "165汉阙总群/王小明")
+                    {"talker": "12345678901@chatroom", "is_self": 0, "sender": "wxid_x"},
+                    bnames) == "老同学群/张三")
     ok &= check("群里认不出发言人时不编",
                 bot._msg_speaker(
-                    {"talker": "11111111111@chatroom", "is_self": 0, "sender": ""},
-                    bnames) == "165汉阙总群/群成员")
+                    {"talker": "12345678901@chatroom", "is_self": 0, "sender": ""},
+                    bnames) == "老同学群/群成员")
     # 这条以前期望返回裸 `wxid_zzz`——那**正是** CLAUDE.md 明令禁止的
     # 「把 talker 原样塞进给模型的文本」。改成：查不到显示名就退回「对方」。
     ok &= check("认不出的 wxid 不外泄原始 id（退回「对方」）",
@@ -396,7 +464,7 @@ def main():
     mem = live_history.decode_room_members(ROOM_BUF)
     ok &= check("解出成员数", len(mem) == 2, mem)
     ok &= check("解出 wxid + 群昵称 + 角色",
-                mem and mem[0] == {"wxid": "wxid_friendD",
+                mem and mem[0] == {"wxid": "wxid_aaaaaaaaaaaaa",
                                    "name": "老张", "role": 9}, mem)
     ok &= check("群昵称缺失时留空、不编",
                 len(mem) > 1 and mem[1]["name"] == "" and mem[1]["role"] == 8193, mem[1:])
@@ -463,11 +531,11 @@ def main():
     ok &= check("有 sender_name 就用它",
                 agent_tools.speaker_of(
                     {"is_self": 0, "sender": "wxid_x", "sender_name": "老张"},
-                    {"wxid_x": "王小明"}, "群", True) == "老张")
+                    {"wxid_x": "张三"}, "群", True) == "老张")
     ok &= check("没有 sender_name 才回退查表",
                 agent_tools.speaker_of(
-                    {"is_self": 0, "sender": "wxid_x"}, {"wxid_x": "王小明"},
-                    "群", True) == "王小明")
+                    {"is_self": 0, "sender": "wxid_x"}, {"wxid_x": "张三"},
+                    "群", True) == "张三")
 
     print("\n── 短期对话记忆：TTL / 上限 / 会话隔离 ──")
     dcfg = {"agent": {"dialog_turns": 2, "dialog_ttl": 900}}
@@ -538,7 +606,7 @@ def main():
     # 群成员：走 contact.db 的 chat_room.ext_buffer（不碰 fts）
     box5 = agent_tools.ToolBox(v4c, {"agent": {"max_queries": 5}}, [],
                                SELF_WXID, "wxid_control")
-    gtxt = box5.t_group_members({"contact": "11111111111@chatroom"})
+    gtxt = box5.t_group_members({"contact": "12345678901@chatroom"})
     ok &= check("group_members 标出群昵称和群主", "老张（群主）" in gtxt, gtxt)
     ok &= check("group_members 报出总人数", "共 2 人" in gtxt, gtxt)
     ok &= check("非群会话被拒绝，不硬查",

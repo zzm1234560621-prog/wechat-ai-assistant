@@ -8,10 +8,10 @@ PROVIDER_PRESETS = [
         "name": "DeepSeek（深度求索）",
         "provider": "openai",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "model": "deepseek-flash",
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
         "key_url": "https://platform.deepseek.com",
-        "note": "便宜、中文好。key 形如 sk- 加 32 位字符",
+        "note": "便宜、中文好，**deepseek-flash 支持图像理解**（收图）；key 形如 sk- 加 32 位字符",
     },
     {
         "short": "Claude 官方",

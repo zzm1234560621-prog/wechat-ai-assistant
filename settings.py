@@ -115,9 +115,11 @@ def effective(base_cfg):
     """合并 config.yaml 与 settings.json，settings 优先（None 项忽略）。
 
     dict 值做**一层深合并**：像 auto_reply / agent 这种分段配置，settings.json
-    里只存被命令改过的键，config.yaml 里的 persona_* 之类默认值仍然生效。
-    整段替换的话，用户在 settings.json 里存过一次，之后改 config.yaml 就再也
-    不生效了（会被那份旧副本盖住）。
+    里只存被命令改过的键，config.yaml 里没被改过的键（如 auto_reply.min_gap）
+    仍然生效。整段替换的话，用户在 settings.json 里存过一次，之后改 config.yaml
+    就再也不生效了（会被那份旧副本盖住）——auto_reply.persona_self 就是这样：
+    用 `/auto persona 全局` 设过之后，config.yaml 那份默认人设不再生效，
+    要 `/auto persona 全局 清空`（删键）才能退回。
     """
     merged = dict(base_cfg)
     for k, v in load().items():

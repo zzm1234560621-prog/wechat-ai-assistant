@@ -82,6 +82,42 @@ def disk_snapshot():
     return out
 
 
+def voice_temp_dirs():
+    """`cache\\<月>\\Message\\<md5(会话)>\\VoiceTemp\\` —— **语音就落在这里**（2026-10-01 找到）。
+
+    命名 `<local_id>_<create_time>`，与图片的 `Thumb\\<local_id>_<create_time>_thumb.jpg`
+    完全对称。实测现状：有语音的会话这目录**存在但基本是空的**
+    （19 个里几乎全空，只有一个剩两个 **0 字节**文件）。`filehelper` 连这个目录都没有
+    ——因为它里面一条语音都没有过。
+
+    所以「发一条语音 → 这个目录出现文件」就是判定「字节到底会不会落地」的**直接证据**，
+    比全盘 diff 更聚焦（Temp 目录常常是明文/半明文，比加密 `.dat` 好解）。
+    """
+    out = []
+    for acct in _audio_accounts():
+        cache = os.path.join(acct, "cache")
+        if not os.path.isdir(cache):
+            continue
+        for month in os.listdir(cache):
+            mdir = os.path.join(cache, month, "Message")
+            if not os.path.isdir(mdir):
+                continue
+            for chat in os.listdir(mdir):
+                vt = os.path.join(mdir, chat, "VoiceTemp")
+                if not os.path.isdir(vt):
+                    continue
+                files = []
+                for r, _dd, ff in os.walk(vt):
+                    for fn in ff:
+                        p = os.path.join(r, fn)
+                        try:
+                            files.append((fn, os.path.getsize(p)))
+                        except OSError:
+                            pass
+                out.append((os.path.join(month, "Message", chat), vt, files))
+    return out
+
+
 def rec_dirs():
     """所有 `Rec` 目录 + **递归**文件数。
 

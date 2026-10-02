@@ -184,6 +184,29 @@ def t_pending_persist(tmp):
              "count": 1, "ts": time.time()}]})
         chk(bot.restore_pending([chat], {"agent": {"confirm_ttl": ttl}}) == 0,
             "不在控制会话里的条目不恢复（不跨会话串台）")
+
+        # 群发批次与素材指代必须**整条恢复**：只恢复 8 个基础字段的话，
+        # 群发批次会变成「没有 items」，然后按文本分支把**给人看的预览**
+        # 往一个**空 wxid** 发出去（真机上最难查的那种错）。
+        agent_tools._PENDING.pop(chat, None)
+        batch_items = [{"wxid": "wxid_a", "name": "张三", "text": "老张，节日快乐"},
+                       {"wxid": "wxid_b", "name": "李四", "text": "李四，节日快乐"}]
+        agent_tools.set_pending(chat, "", "", "给 2 个人群发…", kind="broadcast",
+                                items=batch_items, label="群发内容")
+        agent_tools.set_pending(chat, "wxid_a", "张三", "那张图", kind="agent",
+                                xml="<xml/>", label="那张图")
+        bot.save_pending([chat], {"agent": {"confirm_ttl": ttl}})
+        agent_tools._PENDING.pop(chat, None)
+        n3 = bot.restore_pending([chat], {"agent": {"confirm_ttl": ttl}})
+        chk(n3 == 2, f"群发批次 + 素材项都恢复了（实际 {n3}）")
+        back = agent_tools.list_pending(chat, ttl)
+        bcast = [i for i in back if i.get("kind") == "broadcast"]
+        chk(len(bcast) == 1 and [x["text"] for x in (bcast[0].get("items") or [])]
+            == ["老张，节日快乐", "李四，节日快乐"],
+            f"群发的逐条内容一字不差地恢复了（实际 {bcast[0].get('items') if bcast else None}）")
+        mat = [i for i in back if i.get("label") == "那张图"]
+        chk(len(mat) == 1, "素材项的用户指代（label）也恢复了——不然用户认不出是哪一条")
+        agent_tools._PENDING.pop(chat, None)
     finally:
         bot.STATE_PATH, bot._STATE = old_path, old_state
         agent_tools._PENDING.pop(chat, None)
@@ -219,6 +242,52 @@ def t_redact_wiring():
 
     nod = bot.build_user_prompt("他的手机号", None, [], other, _HistStub(), False)
     chk("13812345678" in nod, "配置里没有 privacy 段：按关闭处理（fail-safe）")
+
+
+# ============================================================
+#  6.5) 预取的历史窗口必须自曝范围
+# ============================================================
+_HIST_WIN_CONTACTS = [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三"}]
+
+
+def t_history_window_label():
+    """提示词里那段历史是**按条数**截的窗口——它必须自己说清这一点。
+
+    2026-10-01 真机：用户问「我跟张三最近 10 天说了什么」，模型拿的就是这段
+    （30 条、实际只覆盖 9/30–10/1），却答成「最近 10 天（9/30–10/1）」——
+    而那条会话从 2026-01 起有 6486 条。修复后这段的标题带条数、带实际覆盖范围、
+    带「取满上限」的警告；结尾还有一条硬规矩：问时间范围必须带 days 去查库。
+    """
+    sec("预取历史：自曝「只有多少条 / 覆盖到什么时候」")
+    real_q = bot.query_contact_history
+    real_s = bot.search_history
+    real_r = bot.recent_messages
+    msgs = [{"time": "2026-09-30 16:02:02", "content": "考完了", "is_self": 1,
+             "talker": "wxid_zhangsan", "local_type": 1},
+            {"time": "2026-10-01 20:28:33", "content": "认真说下 muse", "is_self": 1,
+             "talker": "wxid_zhangsan", "local_type": 1}]
+
+    def fake_q(client, talker, limit=50, keyword=None, since=None):
+        return (msgs * 50)[:int(limit)]        # 永远填满上限（最坏情况）
+
+    try:
+        bot.query_contact_history = fake_q
+        bot.search_history = lambda *a, **k: []
+        bot.recent_messages = lambda *a, **k: []
+        cfg = {"recent_messages": 4, "target_chats": [], "search_topk": 8}
+        p = bot.build_user_prompt("我跟张三最近10天说了什么", None,
+                                  _HIST_WIN_CONTACTS, cfg, None, True)
+    finally:
+        bot.query_contact_history = real_q
+        bot.search_history = real_s
+        bot.recent_messages = real_r
+
+    chk("按**条数**取的窗口" in p, "标题写明这是按条数截的窗口（不是时间范围）")
+    chk("不是全部历史" in p, "标题写明这不是全部历史")
+    chk("实际覆盖" in p and "2026-09-30" in p, "带上这批实际覆盖的时间跨度")
+    chk("更早的没有取" in p, "取满上限时明说「更早的没有取」")
+    chk("read_history" in p and "days" in p,
+        "结尾钉了「问时间范围必须调 read_history 并带 days」")
 
 
 # ============================================================
@@ -493,6 +562,10 @@ def t_stash_media(tmp):
     old_path = assets.PATH
     old_latest = live_history.latest_media
     old_xml = live_history.message_xml
+    # ⚠️ 副本目录也必须指到临时目录：这条链路里会 stash/clear，而 assets 现在会
+    # 「清掉没人引用的副本」——指向真目录的话会把你真机上刚收下来的那张明文图删掉。
+    old_stash = assets.STASH_DIR
+    assets.STASH_DIR = os.path.join(tmp, "stash_dir")
     assets.PATH = os.path.join(tmp, "stash_assets.json")
     sent = []
 
@@ -502,9 +575,9 @@ def t_stash_media(tmp):
     def _msg(local_type=3, is_self=1, ts=1000):
         return aixed_api.Msg("filehelper", "[图片]", is_self, ts, local_type)
 
-    def _row(kind="图片", local_type=3, is_self=1, ts=1000, lid="42"):
+    def _row(kind="图片", local_type=3, is_self=1, ts=1000, lid="42", image=None):
         return {"talker": "filehelper", "local_id": lid, "local_type": local_type,
-                "kind": kind, "is_self": is_self, "image": None, "time": "", "_ts": ts}
+                "kind": kind, "is_self": is_self, "image": image, "time": "", "_ts": ts}
 
     try:
         live_history.latest_media = lambda client, talker, limit=3: [_row()]
@@ -512,11 +585,25 @@ def t_stash_media(tmp):
 
         chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send) is True,
             "图片：返回 True（这轮到此为止，不再当成提问丢给模型）")
-        chk(len(sent) == 1 and "已暂存" in sent[0][0] and "发给谁" in sent[0][0],
-            "回执说「已暂存」，并告诉用户接下来怎么说")
+        chk(len(sent) == 1 and "已暂存" in sent[0][0] and "发不出去" in sent[0][0],
+            "只有消息引用时：回执**如实说这张发不出去**（转发接口在本版微信上会崩，"
+            "已禁用），而不是让用户以为「已暂存 = 随时能发」")
         items = assets.load()
         chk(len(items) == 1 and items[0]["xml"] == "<msg><img/></msg>",
-            "原始 XML 原样存进暂存区（转发要的就是它）")
+            "原始消息引用照样存下来（hook 将来修好还能用）")
+
+        # 有明文（微信缓存的缩略图）-> 存明文，回执告诉用户「说发给谁我就发」
+        thumb = os.path.join(tmp, "明文缩略图.jpg")
+        with open(thumb, "wb") as f:
+            f.write(b"\xff\xd8\xff\xd9")
+        assets.clear()
+        live_history.latest_media = lambda client, talker, limit=3: [_row(image=thumb)]
+        sent.clear()
+        chk(bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send) is True
+            and "发给谁" in sent[-1][0]
+            and assets.plaintext_of(assets.load()[-1]) == thumb,
+            "有明文时：存的是明文，回执告诉用户「说发给谁我就发」")
+        live_history.latest_media = lambda client, talker, limit=3: [_row()]
 
         bot.stash_control_media(None, {"assets": {}}, "filehelper", _msg(), _send)
         chk(len(assets.load()) == 1 and "已经存过了" in sent[-1][0],
@@ -562,10 +649,182 @@ def t_stash_media(tmp):
         chk(bot.stash_control_media(None, {"assets": {"enabled": False}}, "filehelper",
                                     _msg(), _send) is False and sent == [],
             "assets.enabled=false：不暂存、不回执、不查库")
+
+        # ★ 用户在微信界面里发图时，微信在 temp\RWTemp 留的**明文原图**：
+        #   这是「自己在微信里发的图」唯一能拿到的明文（正式落盘只有加密 .dat），
+        #   必须优先收它、而且立刻复制走（那个临时目录会被清理）。
+        import image_cache
+        real_accounts = image_cache.account_dirs
+        real_stash = assets.STASH_DIR
+        acct = os.path.join(tmp, "acct_rw")
+        rw = os.path.join(acct, "temp", "RWTemp", "2026-10", "aaa")
+        os.makedirs(rw, exist_ok=True)
+        with open(os.path.join(rw, "abcdef0123456789.jpg"), "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"y" * 32)
+        assets.STASH_DIR = os.path.join(tmp, "stash_rw")
+        image_cache.account_dirs = lambda: [acct]
+        try:
+            now = int(time.time())
+            live_history.latest_media = lambda client, talker, limit=3: [
+                _row(ts=now, lid="523")]
+            assets.clear()
+            sent.clear()
+            chk(bot.stash_control_media(None, {"assets": {}}, "filehelper",
+                                        _msg(ts=now), _send) is True
+                and "明文原图" in sent[-1][0] and "发给谁" in sent[-1][0],
+                "发图时微信留的**明文原图**被收下，回执说明是明文原图")
+            _it = assets.load()[-1]
+            chk(assets.plaintext_of(_it)
+                and str(_it.get("path") or "").startswith(assets.STASH_DIR),
+                "存的是**复制进来**的明文副本（微信那个临时目录会被清理）")
+        finally:
+            image_cache.account_dirs = real_accounts
+            assets.STASH_DIR = real_stash
     finally:
         assets.PATH = old_path
+        assets.STASH_DIR = old_stash
         live_history.latest_media = old_latest
         live_history.message_xml = old_xml
+
+
+def t_broadcast_preview_note():
+    """群发预览必须**原样**补在答复后面（不让模型转述）。
+
+    模型转述十条正文必然走样：漏一条、改一个字，用户就在**没看清内容**的情况下
+    回「确认」把消息发给一群人。所以这段由 bot 拿 ToolBox 记下的事实直接拼上去。
+    """
+    sec("群发预览原样直发（模型转述必走样）")
+    out = bot.with_broadcast_preview("已经准备好了，回确认即可",
+                                     "给 2 个人群发：\n1. 张三：A\n2. 李四：B")
+    chk("预览被补在答复后面", out.endswith("2. 李四：B") and out.startswith("已经准备好了"))
+    chk("逐条内容一字不差", "1. 张三：A" in out and "2. 李四：B" in out)
+    chk("没有预览时**原样返回**、不加空行",
+        bot.with_broadcast_preview("就一句话", "") == "就一句话")
+    chk("没有预览且答复为空 -> 空串（别造出一条空消息）",
+        bot.with_broadcast_preview("", "") == "")
+
+
+def _tiny_png(path):
+    """造一张 1×1 的真 PNG（纯标准库：不依赖 Pillow，也不依赖系统程序）。"""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+    return path
+
+
+def t_inline_image_round(tmp):
+    """`image.mode=inline`：原图**附给模型当次调用**，而且（关键）**不进对话记忆**。
+
+    三条是这条链的全部价值，缺一条就变成"烧钱"或"撒谎"：
+      ① 图真的进了模型的这一次请求（含 base64 的 image_url）；
+      ② 只附一次 —— 后续轮次的 messages 里**不再有**这张图（否则每轮重发，token 翻倍）；
+      ③ 超过 `image.max_per_round` 的图**说不出来**（不静默少给模型几张）。
+    """
+    sec("inline 图：进模型当次调用、不进对话记忆")
+    import json as _json
+
+    import file_read
+    import llm as llm_mod
+
+    sub = os.path.join(tmp, "2026-10")          # locate/search 都按 <root>/<月>/ 找
+    os.makedirs(sub, exist_ok=True)
+    png1 = _tiny_png(os.path.join(sub, "图一.png"))
+    png2 = _tiny_png(os.path.join(sub, "图二.png"))
+    with open(os.path.join(sub, "说明.txt"), "w", encoding="utf-8", newline="") as f:
+        f.write("这是一份纯文本说明，内容足够长以通过乱码判据，用来占位。")
+    old_roots = file_read.files_roots
+    file_read.files_roots = lambda: [tmp]
+
+    class _Boom:
+        def __getattr__(self, name):
+            raise AssertionError(f"不该查库，却调了 {name}")
+
+    cfg = {"agent": {"max_rounds": 4},
+           "image": {"mode": "inline", "ocr_first": False, "downscale": 0,
+                     "max_per_round": 1},
+           "file": {"inline_bytes": 10 ** 7}}
+    seen = []
+    rounds = [
+        # 第一轮：一口气读两张图（第二张会撞 max_per_round=1 的上限）
+        [llm_mod.ToolCall("c1", "read_file", {"name": "图一.png"}),
+         llm_mod.ToolCall("c2", "read_file", {"name": "图二.png"})],
+        # 第二轮：改读纯文本（不再收图）
+        [llm_mod.ToolCall("c3", "read_file", {"name": "说明.txt"})],
+        # 第三轮：给结论
+        [],
+    ]
+
+    class _LLM:
+        def chat_with_tools(self, system, messages, tools):
+            seen.append(messages)
+            calls = rounds[min(len(seen) - 1, len(rounds) - 1)]
+            return llm_mod.ChatResult("" if calls else "看过了：图里是一块红色。", calls)
+
+    state = {}
+    try:
+        answer, _changed = bot.run_agent(
+            _LLM(), "你是助手", "看看我刚发的那两张图", _Boom(), [], cfg, "filehelper",
+            "", cfg_provider=lambda: cfg, history=[], state=state)
+    finally:
+        file_read.files_roots = old_roots
+
+    def images_in(msgs):
+        out = []
+        for m in msgs:
+            c = m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "image_url":
+                        out.append(b)
+        return out
+
+    chk(len(seen) >= 2, f"模型至少被调了两轮（实际 {len(seen)}）")
+    chk(not images_in(seen[0]), "第一轮没有图（工具还没读）")
+    n2 = len(images_in(seen[1]))
+    chk(n2 == 1, f"第二轮**图真的附上了**（含 base64 的 image_url），实际 {n2} 张")
+    if n2:
+        url = images_in(seen[1])[0]["image_url"]["url"]
+        chk(url.startswith("data:image/") and ";base64," in url,
+            f"附的是 data URL + base64（{url[:40]}…）")
+    chk(any("没给" in str(n) for n in state.get("image_notes", [])),
+        f"超过 max_per_round 的那张**如实说出来**了：{state.get('image_notes')}")
+    # 工具回给模型的话也**不许**说"已经给模型看了"（那张明明没给）——自测抓出来的撒谎点
+    over_cap_tool_text = ""
+    for m in seen[1]:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str) \
+                and "图二" in m["content"]:
+            over_cap_tool_text = m["content"]
+    chk("没能" in over_cap_tool_text and "已把原图交给模型看" not in over_cap_tool_text,
+        "没给成的那张，工具如实说「没能交给模型看」")
+    chk(len(seen) < 3 or not images_in(seen[2]),
+        f"第三轮**不再带图**（只附一次，不每轮重发），共 {len(seen)} 轮")
+    chk("base64" not in _json.dumps(bot.dialog_history("filehelper", cfg), ensure_ascii=False),
+        "对话记忆里没有 base64（图绝不进 dialog）")
+    chk("红色" in answer, f"答复正常返回：{answer[:40]}")
+
+    # attach_images 不许就地改调用方传进来的列表（否则图会被留在 messages 里）
+    base = [{"role": "user", "content": "原消息"}]
+    out = bot.attach_images(base, [(png1, "图一")])
+    chk(base == [{"role": "user", "content": "原消息"}]
+        and len(out) == 2 and isinstance(out[-1]["content"], list),
+        f"attach_images 返回新列表、不改原列表（返回 {len(out)} 条）")
+    chk(bot.attach_images(base, []) is base, "没有图时原样返回（不白加一条消息）")
+
+    # 如实说明由 bot 补在答复后面
+    noted = bot.with_image_notes("答复正文", ["⚠️ 有一张没给模型看"])
+    chk(noted.startswith("答复正文") and "没给模型看" in noted,
+        f"with_image_notes 把说明补在后面：{noted[:40]}")
+    chk(bot.with_image_notes("答复正文", []) == "答复正文", "没有说明时原样返回")
 
 
 def main():
@@ -584,12 +843,15 @@ def main():
         t_poll_failure_throttled(tmp)
         t_image_dirs_union(tmp)
         t_stash_media(tmp)
+        t_inline_image_round(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     t_redact_wiring()
+    t_history_window_label()
     t_usage_cmd()
     t_check_ret()
     t_own_image()
+    t_broadcast_preview_note()
 
     print("\n" + "=" * 60)
     if _FAIL:

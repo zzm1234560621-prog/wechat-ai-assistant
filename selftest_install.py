@@ -118,6 +118,17 @@ def cmd_to_native(cmd):
     return fpath, argv, workdir, verb
 
 
+def _no_elevation(line):
+    """把 `-Verb RunAs` 去掉再执行。
+
+    这几条验的是**参数绑定 / 参数有没有原样送到子进程**，跟提权无关；而真去执行提权那条
+    会**弹 UAC 对话框等人点** —— 在自动化跑的机器上必然卡满 60 秒超时，全量自测就会偶发变红
+    （2026-10-02 实测抓到的就是这个：单跑有时过、全量跑有时挂，看着像"偶发"，其实是等 UAC）。
+    提权本身不靠执行验证：那些用 `build_admin_command` 的字符串断言 `-Verb RunAs` 就够。
+    """
+    return line.replace(" -Verb RunAs", "")
+
+
 def main():
     print("=" * 60)
     print("安装 / 环境链路自测（不联网、不安装、不碰微信、不改注册表）")
@@ -283,13 +294,13 @@ def main():
     work = tempfile.mkdtemp(prefix="wx selftest console ")   # 名字故意带空格
     try:
         safe = console.build_admin_command("/c", ["exit", "0"], python=cmdexe, base=work)
-        r2 = subprocess.run(["powershell", "-NoProfile", "-Command", safe],
+        r2 = subprocess.run(["powershell", "-NoProfile", "-Command", _no_elevation(safe)],
                             capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=60)
         err = r2.stderr or ""
         chk("ParameterBindingException" not in err and "Cannot validate argument" not in err,
             f"★ 等价验证（cmd.exe /c exit 0，无害）参数绑定通过：rc={r2.returncode}")
-        r3 = subprocess.run(["powershell", "-NoProfile", "-Command", bad],
+        r3 = subprocess.run(["powershell", "-NoProfile", "-Command", _no_elevation(bad)],
                             capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=60)
         chk("ArgumentList" in (r3.stderr or ""),
@@ -307,7 +318,7 @@ def main():
                 os.remove(out_json)
             line_ok = console.build_admin_command(worker, [out_json] + extra,
                                                  python=sys.executable, base=work)
-            subprocess.run(["powershell", "-NoProfile", "-Command", line_ok],
+            subprocess.run(["powershell", "-NoProfile", "-Command", _no_elevation(line_ok)],
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=60)
             got = None

@@ -329,3 +329,15 @@ plain_tail = bytes(b ^ 0x6C for b in blob[15 + aesz:])
 ```
 
 用到的第三方库：`zstandard`、`pycryptodome`、`pefile`、`capstone`、`numpy`（都已装进 .venv）。
+
+
+## 缩略图缓存的实测覆盖率（2026-10-01 晚，从 CLAUDE.md 搬来）
+
+**实测覆盖率（2026-10-01 晚）**：文件传输助手（`md5("filehelper")=9e20f478…`）
+`cache\2026-09\…\Thumb` **1** 张、`2026-10\…\Thumb` **0** 张，而 `Bubble\` 里
+**14** 个加密 `_b.dat`（当天 5 个）；全机 Thumb **913** vs Bubble **2176**。
+结论：**「发给自己就能读聊天图」不成立**（最近发的基本都没有明文缩略图），
+要读图就走 `file_read` 那条「**当文件发原图**」（见上面 `file_read.py`）。
+
+
+含义：**「发给自己就能读聊天图」不成立**（最近发的基本都没有明文缩略图），要读图就走 `file_read` 那条「当文件发原图」。

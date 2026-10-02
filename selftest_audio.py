@@ -15,6 +15,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -83,13 +84,31 @@ class _FakeWhisper:
 
 
 class _Env:
-    """临时把模块/依赖状态换掉，退出时还原（免得污染别的用例）。"""
+    """临时把模块/依赖状态换掉，退出时还原（免得污染别的用例）。
+
+    ⚠️ **只动 `sys.modules` 是不够的**（2026-10-02 真踩到）：`audio_read._has()` 用的是
+    `importlib.util.find_spec()`，它看**磁盘上装没装**，不看 `sys.modules`。
+    以前本机真没装 faster-whisper，"从 sys.modules 里删掉"就等于"没装"；
+    用户让下模型、我们真装上之后，这个模拟就失效了——用例会走到"模型没下"那条分支，
+    然后抱怨提示里没有 pip install。现在**连带把 `find_spec` 也钉住**，模拟才成立。
+    """
 
     def __init__(self, **kw):
         self.kw = kw
         self.saved = {}
+        self._real_find_spec = None
 
     def __enter__(self):
+        import importlib.util
+        missing = {k for k, v in self.kw.items() if v is None}
+        if missing:
+            self._real_find_spec = importlib.util.find_spec
+            real = self._real_find_spec
+
+            def fake_find_spec(name, *a, **kw):
+                return None if name in missing else real(name, *a, **kw)
+
+            importlib.util.find_spec = fake_find_spec
         for k, v in self.kw.items():
             self.saved[k] = sys.modules.get(k)
             if v is None:
@@ -99,6 +118,9 @@ class _Env:
         return self
 
     def __exit__(self, *a):
+        if self._real_find_spec is not None:
+            import importlib.util
+            importlib.util.find_spec = self._real_find_spec
         for k, v in self.saved.items():
             if v is None:
                 sys.modules.pop(k, None)
@@ -291,13 +313,23 @@ def t4_dispatch(tmp):
     check("回归：.txt 仍按纯文本读", text and text.startswith("这是一份普通文本") and note is None,
           (text, note))
 
-    # 不支持的后缀：文案里要提到音频也能读（否则用户不知道有这功能）
-    z = os.path.join(tmp, "x.zip")
+    # 不支持的类型：文案里要提到音频也能读（否则用户不知道有这功能）
+    # 用「未知后缀 + 二进制内容」这条路（2026-10-02 起压缩包已被 T7 接掉，
+    # 再拿 PK 头当"不支持"的例子就过时了）；二进制内容会被嗅探判成 binary。
+    z = os.path.join(tmp, "x.unknownext")
     with open(z, "wb") as f:
-        f.write(b"PK\x03\x04")
+        f.write(b"\x00\x01\x02\x03" * 12)
     text, note = file_read.extract(z, cfg)
-    check("回归：不支持的后缀仍如实拒绝", text is None and note, (text, note))
+    check("回归：不支持的类型仍如实拒绝", text is None and note, (text, note))
     check("……且文案里提到了音频（新能力可被发现）", ".m4a" in (note or ""), note)
+
+    # 压缩包是**支持**的（T7）：拿一个坏 zip 验"报的是它自己的问题"，不是"不支持"
+    bad = os.path.join(tmp, "坏包.zip")
+    with open(bad, "wb") as f:
+        f.write(b"PK\x03\x04")
+    text, note = file_read.extract(bad, cfg)
+    check("坏压缩包：如实说打不开（而不是含糊的「不支持」）",
+          text is None and note and "压缩包" in note, (text, note))
 
     # 音频上限：file_read 自己那道体积闸先生效（证明这条路上 file.max_bytes 管着）
     text, note = file_read.extract(a, dict(cfg, file={"max_bytes": 8}))
@@ -390,6 +422,157 @@ def t6_cloud_failure(tmp):
     check("……并明说没有编内容", "没有编内容" in err, err)
 
 
+def t7_long_audio_windows(tmp):
+    """长音频**分段续读**（2026-10-02 P2）：超上限不再拒绝，而是切段 + 给 cursor。
+
+    这里用桩替掉「转写」那一步（本机没装 faster-whisper），但**切段是真跑 PyAV**：
+    验的是分段数学（哪一段、还有没有下一段）、cursor 契约（`<id>:<秒>`）、
+    临时切片用完即删，以及短音频**不该被切**（原来那条路一个字都不动）。
+    """
+    print("\n── T7 长音频分段（切段真跑，转写用桩） ──")
+    import array
+    import wave
+
+    import audio_read
+    import file_read
+
+    wav = os.path.join(tmp, "四十分钟.wav")
+    rate, secs = 8000, 40
+    buf = array.array("h", [0] * (rate * secs))
+    for i in range(0, len(buf), 8):
+        buf[i] = 3000
+    with wave.open(wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(buf.tobytes())
+    check("样本时长确实是 40 秒", abs(audio_read._duration(wav) - 40) < 1,
+          audio_read._duration(wav))
+
+    # ① 切段是真的（这一步不需要 whisper）
+    out1 = os.path.join(tmp, "切片1.wav")
+    n = audio_read.slice_to_wav(wav, out1, start=0, secs=20)
+    with wave.open(out1, "rb") as w:
+        d1 = w.getnframes() / w.getframerate()
+    out2 = os.path.join(tmp, "切片2.wav")
+    audio_read.slice_to_wav(wav, out2, start=20, secs=20)
+    with wave.open(out2, "rb") as w:
+        d2 = w.getnframes() / w.getframerate()
+    check("切出第一段（≈20 秒）", n > 0 and 19 < d1 < 21, d1)
+    check("从第 20 秒切第二段（≈20 秒、不重不漏）", 19 < d2 < 21, d2)
+
+    # ② window 的分段数学（转写用桩，免得依赖模型）
+    real_tr = audio_read.transcribe
+    seen = []
+
+    def fake_tr(path, cfg=None, max_bytes=None):
+        seen.append(os.path.basename(path))
+        return f"第 {len(seen)} 段的转写", ""
+
+    audio_read.transcribe = fake_tr
+    try:
+        cfg = {"audio": {"max_seconds": 20, "backend": "local"}, "file": {"max_bytes": 0}}
+        text, nxt, note = audio_read.window(wav, cfg, start=0)
+        check("第一段：转写的是**切出来的临时文件**（不是原文件）",
+              text.startswith("第 1 段") and seen and seen[-1] != os.path.basename(wav), seen)
+        check("第一段还有下一段（next_start=20）", nxt == 20, nxt)
+        text2, nxt2, _ = audio_read.window(wav, cfg, start=nxt)
+        check("第二段：读到末尾（next_start=None）", text2.startswith("第 2 段") and nxt2 is None, nxt2)
+        check("临时切片用完就删（目录里没有 .wav 残留）",
+              not [x for x in os.listdir(audio_read.tmp_dir()) if x.endswith(".wav")],
+              os.listdir(audio_read.tmp_dir()))
+
+        # 短音频：走老路，**不切**
+        seen.clear()
+        short = os.path.join(tmp, "十秒.wav")
+        small = array.array("h", [0] * (rate * 10))
+        with wave.open(short, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(small.tobytes())
+        text3, nxt3, _ = audio_read.window(short, cfg, start=0)
+        check("短音频（10 秒 < 上限 20 秒）**不切**、直接转写原文件",
+              seen and seen[-1] == os.path.basename(short) and nxt3 is None, seen)
+    finally:
+        audio_read.transcribe = real_tr
+
+    # ③ 整条链：cursor 契约（file_read._audio → extract_page）
+    real_tr2 = audio_read.transcribe
+    audio_read.transcribe = lambda path, cfg=None, max_bytes=None: ("整段转写内容", "")
+    try:
+        cfg = {"audio": {"max_seconds": 20, "backend": "local"}, "file": {"max_bytes": 0}}
+        text, err = file_read.extract(wav, cfg)
+        check("extract 给出 cursor（形状 id:秒）",
+              bool(text) and re.search(r"cursor=([0-9a-f]{16}:\d+)", text) is not None, (err, text))
+        cur = re.search(r"cursor=([0-9a-f]{16}:\d+)", text).group(1)
+        check("cursor 指向第 20 秒", cur.endswith(":20"), cur)
+        more, err2 = file_read.extract_page(cfg=cfg, cursor=cur)
+        check("「继续」从第 20 秒接着读（不是从头再来）",
+              bool(more) and not err2 and "末尾" in more, (err2, (more or "")[:120]))
+        check("……而且不再给 cursor（已经到末尾）", "cursor=" not in (more or ""), more)
+        d = file_read.export_dir(cfg)
+        check("转写按段累积在导出文件里",
+              any(n.startswith("a_") and n.endswith(".txt") for n in os.listdir(d)),
+              os.listdir(d))
+        over, err3 = file_read.extract_page(cfg=cfg, cursor=cur)
+        check("重复「继续」也如实说（不返空、不重读）",
+              (err3 and "末尾" in err3) or (over and "末尾" in over), (err3, over))
+    finally:
+        audio_read.transcribe = real_tr2
+        audio_read.sweep_tmp(max_age=0)
+
+
+
+def t8_max_bytes_zero(tmp):
+    """`file.max_bytes: 0` = **不限大小**，音频这条路也必须认（2026-10-02 真机抓到的 bug）。
+
+    真机现场：`file.max_bytes: 0`（新默认值）时，音频**全部被拒**——报"超过上限 0.0MB"。
+    根因是 `_precheck` 里 `int(max_bytes or _max_bytes(cfg))`：`_max_bytes` 把 0 当"没配"
+    退回 30MB 的那套写法，在**音频**这条路上算出来的上限是 **0 字节** → 任何非空音频都超。
+    和 `file_read._opt_int` 那个 0/没配不分家的坑**是同一个**，只是漏在了音频这一支。
+
+    这里钉两条：0 = 放行；给了具体值就照样拦。
+    """
+    print("\n── T8 `file.max_bytes: 0` = 不限（音频也要认） ──")
+    import audio_read
+
+    wav = os.path.join(tmp, "两秒.wav")
+    import array
+    import wave
+    with wave.open(wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(array.array("h", [100] * 16000).tobytes())
+
+    check("0 被识别成「不限」而不是「上限 0 字节」",
+          audio_read._max_bytes({"file": {"max_bytes": 0}}) == 0,
+          audio_read._max_bytes({"file": {"max_bytes": 0}}))
+    check("没配时才退回 30MB 默认",
+          audio_read._max_bytes({"file": {}}) == 30 * 1024 * 1024,
+          audio_read._max_bytes({"file": {}}))
+
+    ok, why = audio_read._precheck(wav, {"file": {"max_bytes": 0}})
+    check("★ max_bytes=0 时**放行**（这就是真机那个 bug）", ok, why)
+    ok2, why2 = audio_read._precheck(wav, {"file": {"max_bytes": 8}})
+    check("给了具体上限照样拦（8 字节 < 这个文件）", not ok2 and "超过上限" in why2, why2)
+    ok3, _ = audio_read._precheck(wav, {"file": {"max_bytes": 0}}, max_bytes=8)
+    check("调用方显式传的 max_bytes 优先（视频切出来的 wav 就是这么传的）", not ok3)
+
+    # 端到端：0 时真的会去转写（用桩，免得依赖模型在不在）
+    import file_read
+    real = audio_read.transcribe
+    audio_read.transcribe = lambda path, cfg=None, max_bytes=None: ("桩：转写成功", "")
+    try:
+        text, err = file_read.extract(wav, {"file": {"max_bytes": 0},
+                                           "audio": {"backend": "local", "max_seconds": 1800}})
+        check("★ 端到端：max_bytes=0 时音频能读到文字（不再被 0 字节上限拒掉）",
+              text and "转写成功" in text and not err, (err, text))
+    finally:
+        audio_read.transcribe = real
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="selftest_audio_")
     global _OK
@@ -404,6 +587,8 @@ def main():
         t4_dispatch(tmp)
         t5_cloud(tmp)
         t6_cloud_failure(tmp)
+        t7_long_audio_windows(tmp)
+        t8_max_bytes_zero(tmp)
     finally:
         if _real_fw is None:
             sys.modules.pop("faster_whisper", None)

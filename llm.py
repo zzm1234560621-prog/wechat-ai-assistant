@@ -249,13 +249,42 @@ class _AnthropicImpl:
         return ChatResult(text, calls, truncated=_is_truncated(resp))
 
 
+def _anthropic_blocks(blocks):
+    """中立 content 数组 → Anthropic 的 content block。
+
+    **图片那块的形状两边不一样**：中立/OpenAI 是
+    `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,…"}}`，
+    而 Anthropic 要 `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`。
+    直接透传会被 API 拒；所以这一层必须翻译。
+    """
+    out = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            out.append({"type": "text", "text": str(b.get("text") or "")})
+        elif b.get("type") == "image_url":
+            url = str(((b.get("image_url") or {}).get("url")) or "")
+            if url.startswith("data:") and ";base64," in url:
+                head, data = url.split(";base64,", 1)
+                media = (head[len("data:"):] or "image/jpeg").strip() or "image/jpeg"
+                out.append({"type": "image", "source": {
+                    "type": "base64", "media_type": media, "data": data}})
+    return out
+
+
 def _anthropic_messages(messages):
     """中立格式 -> Anthropic 的 content block 格式。"""
     out = []
     for m in messages:
         role = m.get("role")
         if role == "user":
-            out.append({"role": "user", "content": m.get("content", "")})
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # 带图片的那条（image.mode=inline 才会出现）
+                out.append({"role": "user", "content": _anthropic_blocks(content)})
+            else:
+                out.append({"role": "user", "content": content})
         elif role == "assistant":
             blocks = []
             if m.get("content"):

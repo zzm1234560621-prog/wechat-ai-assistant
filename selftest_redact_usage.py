@@ -382,6 +382,10 @@ sec("【8】价目表：未知模型返回 None；summarize 明说「没有价�
 
 chk(usage.price_of("deepseek-chat") == (2.0, 8.0), "deepseek-chat 有价目表")
 chk(usage.price_of("deepseek-reasoner") == (4.0, 16.0), "deepseek-reasoner 有价目表")
+# 2026-10-02 换成的现役模型（官方定价页核过，按高峰价填）
+chk(usage.price_of("deepseek-flash") == (2.0, 8.0), "deepseek-flash 有价目表（收图的那个）")
+chk(usage.price_of("deepseek-v4-pro") == (9.0, 27.0), "deepseek-v4-pro 有价目表")
+chk(usage.price_of("DeepSeek-Flash") == (2.0, 8.0), "flash 也大小写不敏感")
 chk(usage.price_of("DeepSeek-Chat") == (2.0, 8.0), "大小写不敏感")
 chk(usage.price_of("  deepseek-chat  ") == (2.0, 8.0), "前后空白不影响")
 chk(usage.price_of("openai/deepseek-chat") == (2.0, 8.0), "已知 provider 前缀会被剥掉")

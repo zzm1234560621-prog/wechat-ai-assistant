@@ -14,6 +14,7 @@
 import ast
 import json
 import re
+import time
 
 import live_history
 import settings
@@ -48,6 +49,21 @@ _GROUP_RULES = """
 - 除了这个 JSON，什么都不要输出。
 例子：{"reply": "好的，我下午过去"}
 例子：{"reply": null}
+"""
+
+# 「称呼」——我平时怎么叫这个人。**单独一份、独立注入**，不塞进人设正文里：
+# 人设是散文，一旦用户手写或重写，夹在里面的称呼就跟着没了。
+_ADDRESS_MAX = 20          # 称呼必须是个词（「老张」「张哥」），不是一句话
+# 「清空 / 学习」这两个魔法词和人设**共用同一套写法**（_PERSONA_CLEAR / _PERSONA_LEARN）：
+# 同一句话在两个字段上意思一样，没必要各写一份、以后慢慢漂移。
+
+# 称呼在**回复时**的注入文案。独立成段，因为它是给模型的一条硬约束：
+# 叫错人比语气不对严重得多。
+_ADDRESS_RULE = """
+【怎么称呼对方】
+你平时叫对方「{addr}」——回消息时自然这么叫（比如开口或句中带上）。
+但只在自然的时候用：对方刚发来的话里不适合套称呼、或者你拿不准，就直接说事，
+**不要硬塞称呼、更不要叫成别的名字或「亲爱的」这类你没用过的叫法**。
 """
 
 _FENCE = re.compile(r"```[a-zA-Z0-9]*\r?\n?(.*?)```", re.S)
@@ -224,8 +240,90 @@ def _extract_group_reply(raw):
     return t
 
 
+# 人设（语气）文本的硬上限。这段会被**整段**塞进每次自动回复的 system prompt，
+# 所以太长既贵、又会压过 _COMMON_RULES 里「简短、只输出消息」那些要求。
+# 超了**如实拒绝**，绝不静默截断：截断一段描述行为的话，可能正好把
+# 「不确定的事别编」那半句切掉，而用户以为自己说的话全生效了。
+PERSONA_MAX = 300
+
+# 「清空人设」的写法：整段文本**等于**其中之一才算（不做子串匹配，
+# 否则「别用默认那种语气」会被当成清空指令）。
+_PERSONA_CLEAR = ("清空", "清除", "重置", "恢复默认", "默认", "clear", "reset", "none")
+
+# 全局范围词。和 agent_tools.t_auto_reply 里 review 用的是同一套写法——
+# 「全局」在这个项目里一向是**范围词**，不是某个人的昵称。
+_GLOBAL_WORDS = ("全局", "所有", "全部", "默认", "all", "*")
+
+# 「学语气」的写法：整段文本**等于**其中之一才算（和 _PERSONA_CLEAR 同一姿势：
+# 不做子串匹配，否则「别学我那么客气」会被当成学习指令）。
+_PERSONA_LEARN = ("学习", "重新学习", "再学习", "学一下", "重新学", "learn", "relearn")
+
+# ---- 从历史对话里学语气 ----
+LEARN_SAMPLE = 200        # 默认取多少条**自己发出去的**话当样本（config: auto_reply.learn_sample）
+LEARN_MIN_MINE = 5        # 少于这么多条就学不出语气，**如实拒绝**、不硬编一段
+_LEARN_TARGET = 150       # 让模型往多少字写（软目标）；PERSONA_MAX 仍是硬上限
+
+_LEARN_SYSTEM = (
+    "你是语气与称呼分析师。下面给你的是「我」在微信里跟**某一个人**聊天时、"
+    "我自己发出去的消息。请从这些样本里总结两件事，并按要求输出。\n"
+    "要求输出**严格 JSON**，只有这两个字段：\n"
+    '{"address": "我平时对 TA 的称呼", "persona": "一整段人设"}\n'
+    "· address：我**叫**对方的那个词（「老张」「张哥」「宝贝」这类）。"
+    "**只填称呼本身**——不要填备注、全名、关系说明（不写「朋友」「同事」），"
+    "也不要填对方怎么叫我。样本里看不出固定称呼、或者我压根不叫称呼"
+    "（直接说事），就写空串 \"\"。\n"
+    f"· persona：一段**可以直接当人设使用**的角色设定，{_LEARN_TARGET} 字以内。"
+    "用第二人称写给一个要代替我回消息的 AI（「你正在代替我…」这种口吻），"
+    "**必须把这些底线一并写进去**：用第一人称、口语简短、像平时打微信那样、"
+    "不要用书面语/列表/markdown、不要暴露自己是 AI、不确定的事别编、"
+    "不要复述对方刚说过的话。在这之上把语气特征写清楚：正式还是随便、"
+    "句子长短、爱不爱开玩笑、常用口头语等。\n"
+    "除了这个 JSON 什么都不要输出，不要解释、不要 markdown 围栏。\n"
+    "样本里只有我单方面发出去的话（没有对方的消息），据此推断即可，"
+    "不要编造事实、不要凭空猜人名或关系。\n"
+    '例子：{"address": "老张", "persona": "你正在代替我本人回复微信消息…"}'
+)
+
+# 模型有时会自己加个「人设：」的前缀，剥掉。
+_LEAD_LABEL = re.compile(r"^(人设|设定|语气设定|语气|persona)\s*[:：]\s*", re.I)
+_SENT_END = "。！？；.!?;"
+
+
+def _clean_persona(text):
+    """人设描述压成一行：换行/连续空格折成一个空格。
+
+    微信消息里可以有换行，而这段会进 system prompt；折成一行既好存也好显示，
+    不影响语义（人设是散文，不是格式）。
+    """
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _persona_too_long(text):
+    """太长就返回一句**如实拒绝**的话，否则返回 None。"""
+    n = len(_clean_persona(text))
+    if n <= PERSONA_MAX:
+        return None
+    return (f"人设太长了（{n} 字，上限 {PERSONA_MAX} 字）。这段会被整段塞进每次"
+            f"自动回复的提示里，太长会压过「简短口语」那些要求——请压缩后再发。")
+
+
+def _short(text, n=24):
+    """状态页里的一行摘要，长了截断（只影响显示，不动存的原文）。"""
+    t = _clean_persona(text)
+    return t if len(t) <= n else t[:n] + "…"
+
+
 def persona_for(rec, auto_cfg):
-    """这个人设：聊天单独配的 > 全局对应 mode 的 > 代码里的兜底。"""
+    """这个人设：聊天单独配的 > 全局对应 mode 的 > 代码里的兜底。
+
+    **单条是「整体替换」，不是叠加**（用户 2026-10-01 定的）：给某人设了 persona，
+    就整段用它，不再拼全局那份。原因是叠加会让「你写的话」和「代码写的话」
+    优先级纠缠不清，出问题极难查；替换至少行为是确定的。
+
+    代价必须说清：替换之后，_DEFAULT_SELF 里那句「不要暴露你是 AI」也没了。
+    所以**工具层要求模型把一句大白话补成一段完整人设**（含该有的底线），
+    而不是只把「随便点」三个字塞进来——见 agent_tools 里 auto_reply 的说明。
+    """
     own = str(rec.get("persona") or "").strip()
     if own:
         return own
@@ -233,6 +331,61 @@ def persona_for(rec, auto_cfg):
     if mode == "assistant":
         return str(auto_cfg.get("persona_assistant") or "").strip() or _DEFAULT_ASSISTANT
     return str(auto_cfg.get("persona_self") or "").strip() or _DEFAULT_SELF
+
+
+def _clean_address(text):
+    """把称呼洗成一个「词」。
+
+    称呼是**要叫出口**的东西，所以必须短、单行、不带引号书名号——
+    这些都可能在拼进提示词时把结构搞乱，或者让模型照抄一堆符号叫出来。
+    """
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = t.strip().strip('"').strip("'").strip("“”").strip("「」").strip("《》")
+    t = t.strip("[]【】()（）").strip()
+    return t
+
+
+def _address_too_long(text):
+    """称呼太长就返回一句如实拒绝的话，否则 None。"""
+    t = _clean_address(text)
+    if len(t) <= _ADDRESS_MAX:
+        return None
+    return (f"称呼太长了（{len(t)} 字，上限 {_ADDRESS_MAX} 字）。称呼是**要叫出口的那个词**"
+            f"（像「老张」「张哥」），不是一句话——请只给称呼本身。")
+
+
+def address_for(rec):
+    """这个人我平时怎么叫。空串 = 没有固定称呼（回复时就不提称呼）。"""
+    return _clean_address((rec or {}).get("address"))
+
+
+def address_rule(addr):
+    """把称呼渲染成给模型的一段约束（独立成段，见 _ADDRESS_RULE 的注释）。"""
+    return _ADDRESS_RULE.format(addr=addr)
+
+
+def address_aliases(cfg):
+    """`{称呼: [候选, ...]}` —— 给联系人解析当别名用（`resolve_contacts`）。
+
+    **一个称呼可能对上多个人**（两个人都被叫「老张」），所以值是候选列表，
+    调用方必须照旧走重名保护，**绝不能静默取第一个**（CLAUDE.md 铁律）。
+
+    数据只有一份真源：`auto_reply.chats[].address`。代价是**只有自动回复名单里的人
+    才有别名**——学习就是从「加进名单」触发的。别在别处再存一份称呼。
+    """
+    out = {}
+    for r in chat_list(cfg):
+        a = address_for(r)
+        if not a:
+            continue
+        out.setdefault(a, []).append({
+            "wxid": r.get("wxid"),
+            "name": r.get("name") or r.get("wxid"),
+            "remark": r.get("name") or "",
+            "alias": "",
+            "_by": "称呼",
+        })
+    return out
 
 
 def make_reply(llm, rec, msgs, names, cfg, group=False):
@@ -245,6 +398,10 @@ def make_reply(llm, rec, msgs, names, cfg, group=False):
         return ""
 
     system = persona_for(rec, auto_cfg) + "\n" + _COMMON_RULES
+    # 称呼**独立于 persona** 注入：用户重写人设、或者手写一份时，称呼不该跟着丢。
+    addr = address_for(rec)
+    if addr:
+        system += address_rule(addr)
     if group:
         system += _GROUP_RULES
         ask = "按要求的 JSON 输出，判断最后一条消息是否需要我回应。"
@@ -293,23 +450,35 @@ def review_on(rec, cfg):
 
 
 # 只有这几个键由命令管理、也**只把**它们写进 settings.json。
-# persona_* / min_gap / max_reply_chars 留在 config.yaml：settings.json 里
+# min_gap / max_reply_chars 留在 config.yaml：settings.json 里
 # 存一份副本的话，用户之后改 config.yaml 就再也不生效了。
-_MANAGED = ("enabled", "review", "chats", "context_messages")
+#
+# persona_self / persona_assistant 是 2026-10-01 加进来的（「/auto persona 全局」）：
+# 用户用大白话改默认语气时，**只能**落到 settings.json——总不能替他去改
+# config.yaml（那里面有注释，程序回写会把注释冲掉）。代价同样是「存过一次之后
+# 改 config.yaml 就不再生效」，所以配置注释和 CLAUDE.md 里都写明了这一点。
+_MANAGED = ("enabled", "review", "chats", "context_messages",
+            "persona_self", "persona_assistant")
 
 
-def _save(**changes):
+def _save(_unset=(), **changes):
     """把改动写进 settings.json 的 auto_reply 段（只写命令管的键）。
 
     settings.effective() 对 dict 做一层深合并，所以这里不需要写整段——
-    config.yaml 里的 persona_* 等默认值仍然会生效。
+    config.yaml 里的 min_gap / max_reply_chars 等默认值仍然会生效。
 
     基准取自磁盘上的现值（不是传进来的 cfg）：cfg 可能是上一条命令之前的
     快照，用它当基准会把上一条命令的改动丢掉。
+
+    `_unset` 是**删键**（不是写空串）：全局人设写 "" 会盖住 config.yaml 里那份，
+    于是「恢复默认」反而变成「什么都不生效、只剩代码兜底」。删掉键才能真的
+    退回 config.yaml。
     """
     saved = settings.load().get("auto_reply")
     data = dict(saved) if isinstance(saved, dict) else {}
     data.update(changes)
+    for k in _unset:
+        data.pop(k, None)
     settings.set_value("auto_reply", {k: v for k, v in data.items() if k in _MANAGED})
 
 
@@ -326,8 +495,14 @@ def _split_target(rest):
     return " ".join(parts).strip(), mode
 
 
-def _resolve(client, who, can_lookup=True):
-    """昵称/备注/wxid/roomid -> (wxid, 显示名, 候选列表)。"""
+def _resolve(client, who, can_lookup=True, cfg=None):
+    """昵称/备注/**称呼**/wxid/roomid -> (wxid, 显示名, 候选列表)。
+
+    学到的「称呼」也是一种名字，所以先查自己的称呼表。它和库里查到的结果是
+    **合并**（不是谁覆盖谁）：万一另一个人备注真叫「老张」，两边都要摆出来
+    让调用方按既有的重名规则去问，**绝不能静默挑一个**（那会写错人）。
+    这也让「没连上库」（can_lookup=False）时靠称呼仍然解析得出来。
+    """
     who = str(who or "").strip()
     if not who:
         return None, None, []
@@ -335,12 +510,17 @@ def _resolve(client, who, can_lookup=True):
         return who, who, [{"wxid": who}]
     if who.lower().startswith("wxid_") or who == "filehelper":
         return who, who, [{"wxid": who}]
-    if not can_lookup:
-        return None, None, []
-    try:
-        cands = live_history.resolve_contact(client, who, limit=5)
-    except Exception:
-        cands = []
+
+    cands = list((address_aliases(cfg) if cfg is not None else {}).get(who) or [])
+    seen = {str(c.get("wxid")) for c in cands}
+    if can_lookup:
+        try:
+            for c in live_history.resolve_contact(client, who, limit=5):
+                if str(c.get("wxid")) not in seen:
+                    seen.add(str(c.get("wxid")))
+                    cands.append(c)
+        except Exception:
+            pass
     if not cands:
         return None, None, []
     c = cands[0]
@@ -348,7 +528,13 @@ def _resolve(client, who, can_lookup=True):
 
 
 def _find(recs, who):
-    """按 wxid 精确、再按显示名精确、再按名字包含，找一条记录。"""
+    """按 wxid 精确、显示名精确、称呼精确、最后名字包含，找一条记录。
+
+    **称呼也要认**：用户心里那个人就叫「老张」，让他为了改审核/身份先想起
+    这个人在微信里备注成「张三」，是没道理的。
+    称呼重名（两个人都被叫「老张」）时返回 None、**不静默挑一个**——
+    和下面「名字包含」那条的既有规矩一致，宁可让用户说清楚。
+    """
     who = str(who or "").strip()
     if not who:
         return None
@@ -358,8 +544,330 @@ def _find(recs, who):
     for r in recs:
         if str(r.get("name") or "") == who:
             return r
+    by_addr = [r for r in recs if address_for(r) and address_for(r) == who]
+    if len(by_addr) == 1:
+        return by_addr[0]
+    if len(by_addr) > 1:
+        return None
     hits = [r for r in recs if who in str(r.get("name") or "")]
     return hits[0] if len(hits) == 1 else None
+
+
+def _persona_disk_override(key):
+    """settings.json 里存过这个人设键没有（用来在状态里说清来源）。"""
+    saved = settings.load().get("auto_reply")
+    if not isinstance(saved, dict):
+        return False
+    return key in saved
+
+
+def _split_rec_target(rest, recs):
+    """把 `<谁> <内容>` 的 rest 拆成 (记录, 是否全局, mode, 内容)。
+
+    persona 和 address 两条命令共用它——两边的「谁」是同一套名字。
+    返回的**内容为 None = 目标没认出来**（调用方据此报「名单里没有…」）；
+    内容为空串 = 没给内容（调用方按「查看当前值」处理）。
+
+    为什么不用 `_split_target`：人设描述 / 称呼后面**必然带空格**
+    （「跟张三说话随便点」），根本没法用一个规则判断名字到哪儿结束。
+    但这两样只对**已在名单里的人**有意义，而名单是已知的——于是「名字」这一侧
+    可以穷举，改成**最长前缀匹配**：先试最长的，`张三` 和 `张三丰` 同时存在时
+    也不会认错人。匹配要求 key 后面**跟着空格**（或整段就是 key），
+    所以「张三丰」不会被「张三」吃掉。
+    **`address` 也算名字**：用户心里那个人就叫「老张」，让他为了改称呼
+    先想起这个人在微信里备注成「张三」，是没道理的。
+
+    全局那一支：`<命令> 全局 [self|assistant] <内容>`。名单里真有个人的
+    显示名就叫「全局」时**他优先**（显式对象胜过范围词），和 review 那条一致。
+    """
+    rest = str(rest or "").strip()
+    if not rest:
+        return None, False, None, ""
+
+    best = None
+    for r in recs:
+        for key in (str(r.get("name") or "").strip(),
+                    str(r.get("wxid") or "").strip(),
+                    address_for(r)):
+            if not key:
+                continue
+            if rest == key or rest.startswith(key + " "):
+                if best is None or len(key) > len(best[1]):
+                    best = (r, key)
+    if best is not None:
+        return best[0], False, None, rest[len(best[1]):].strip()
+
+    parts = rest.split(maxsplit=1)
+    if parts[0].strip().lower() in _GLOBAL_WORDS:
+        tail = parts[1].strip() if len(parts) > 1 else ""
+        mode = None
+        if tail:
+            bits = tail.split(maxsplit=1)
+            if bits[0].lower() in _MODE_WORDS:
+                mode = bits[0].lower()
+                tail = bits[1].strip() if len(bits) > 1 else ""
+        return None, True, mode, tail
+    return None, False, None, None
+
+
+def _persona_clear(text):
+    """这段文本是不是「清空人设」指令（**整段相等**，不做子串匹配）。"""
+    t = str(text or "").strip().lower()
+    return t in {c.lower() for c in _PERSONA_CLEAR}
+
+
+def _persona_learn(text):
+    """这段文本是不是「学语气」指令（同样整段相等）。"""
+    t = str(text or "").strip().lower()
+    return t in {c.lower() for c in _PERSONA_LEARN}
+
+
+# ============================================================
+#  从历史对话里学语气
+# ============================================================
+
+def _is_text_msg(m):
+    """这条历史是不是一条**文本**消息。
+
+    图片/文件/表情在 live_history 里会被渲染成 `[图片]` 这类标签，**内容看上去
+    和真文本没区别**，拿它去学语气就是喂噪声。判据只能用 `local_type`：
+    `_v4_history_from_tables` 一直带这个字段，`_v4_fts_rows`（生产主路径）
+    2026-10-01 才补上——**别按 `content` 是不是以 `[` 开头来判**，手打的
+    「[呲牙]」也是真文本，那样会误删。
+
+    取不到 local_type 时**当文本**：宁可多带一句，也比整段学不到强。
+    """
+    lt = (m or {}).get("local_type")
+    if lt is None:
+        return True
+    try:
+        return int(lt) == 1
+    except (TypeError, ValueError):
+        return True
+
+
+def _learn_messages(msgs):
+    """挑出**我自己发出去的**文本——要复制的是「我对这个人怎么说话」。
+
+    **只送我自己那一侧**：对方的话对「我的语气」没有信息量，还白多送一份隐私
+    给模型服务商（用户 2026-10-01 定的）。
+    """
+    out = []
+    for m in msgs or []:
+        if not m.get("is_self"):
+            continue
+        if not _is_text_msg(m):
+            continue
+        t = str(m.get("content") or "").strip()
+        if t:
+            out.append(f"[{m.get('time', '?')}] {t}")
+    return out
+
+
+def _clean_learned(raw):
+    """把模型返回的整段文字洗成人设文本（**不是**消息，别用 sanitize）。"""
+    t = _FENCE.sub(lambda m: m.group(1), str(raw or "")).strip()
+    t = _LEAD_LABEL.sub("", t).strip()
+    t = t.strip().strip('"').strip("'").strip("“”").strip("「」")
+    return _clean_persona(t)
+
+
+def _cut_at_sentence(text, limit):
+    """超长时按句末标点截到 limit 以内（截不到就在 limit 处硬截）。"""
+    head = text[:limit]
+    cut = max(head.rfind(ch) for ch in _SENT_END)
+    return (head[:cut + 1] if cut >= limit // 2 else head).rstrip()
+
+
+def _learn_result(raw):
+    """解析学习输出，返回 `(address, persona)`。
+
+    * 认出 JSON（有 `persona` 键）→ `persona` 取正文，`address` 取值：
+      拿到了就是字符串（可能是空串 = 模型明确说「没有固定称呼」），
+      **字段缺失/是 null 时给 `None`**（意思是「这次别动已有的称呼」）；
+    * 没按 JSON 走（模型还是只给了一段散文）→ **整段当人设**、`address=None`。
+
+    **绝不能因为解析不出来就把整次学习判成失败**：人设那条路在加称呼之前一直是好的，
+    加个字段不该让它变脆——所以 JSON 认不出就退回「原文当人设」。
+    也**不许**从散文里猜一个称呼（那等于编），猜错比没有严重得多（会叫错人）。
+    """
+    t = _FENCE.sub(lambda m: m.group(1), str(raw or "")).strip().lstrip("\ufeff")
+    if t.startswith("{") and t.endswith("}"):
+        data = None
+        try:
+            data = json.loads(t)
+        except (ValueError, TypeError):
+            # 有些模型吐 Python 字面量（单引号）。literal_eval 只认字面量、不执行代码。
+            try:
+                data = ast.literal_eval(t)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                data = None
+        if isinstance(data, dict) and "persona" in data:
+            addr = data.get("address")
+            addr = None if addr is None else str(addr).strip()
+            return addr, _clean_learned(data.get("persona"))
+    return None, _clean_learned(t)
+
+
+def learn_persona(client, llm, rec, cfg, sample=None):
+    """从我和这个人的历史对话里学出**语气 + 称呼**。
+
+    返回 `(ok, data, message)`：
+
+    * `ok=False` → `data` 只有 `n`（用了几条样本），`message` 是**如实说明为什么没学成**；
+    * `ok=True`  → `data = {"persona": str, "address": str|None, "n": int}`；
+      `message` 只放需要额外告知的话（比如「太长已经压过」）。
+      `address=None` 表示**这次没拿到称呼，调用方不许动原来那份**；
+      `address=""` 是模型明确说「没有固定称呼」，那是有效的学习结果。
+
+    一次调用同时给两样（用户 2026-10-01 要的），所以**不额外多一次读库/模型调用**。
+    成本就是原来的**一次读库 + 一次模型调用**，跑在收消息那条线程上——`do_auto_reply`
+    本来就在同一条线程上调模型，不是新引入的并发风险。读库只调一次
+    `live_history.query_contact_history`（带会话过滤取 N 条，文档里的快路径），
+    绝不裸拼 SQL。
+    """
+    who = str((rec or {}).get("wxid") or "").strip()
+    name = str((rec or {}).get("name") or who or "").strip()
+    if not who:
+        return False, {"n": 0}, "没指定是谁，学不了。"
+    if client is None:
+        return False, {"n": 0}, "现在读不了聊天记录（没连上微信），这次没学成。"
+    if llm is None:
+        return (False, {"n": 0},
+                f"没配 API Key，学不了——先发 /api <key> 配好模型，"
+                f"再发 /auto persona {name} 学习。")
+
+    try:
+        n = int(sample if sample is not None else (section(cfg).get("learn_sample")
+                                                   or LEARN_SAMPLE))
+    except (TypeError, ValueError):
+        n = LEARN_SAMPLE
+    n = max(LEARN_MIN_MINE, min(2000, n))
+
+    try:
+        msgs = live_history.query_contact_history(client, who, limit=n)
+    except Exception as e:
+        return False, {"n": 0}, f"读聊天记录失败（{type(e).__name__}: {e}），这次没学成。"
+
+    lines = _learn_messages(msgs)
+    if len(lines) < LEARN_MIN_MINE:
+        return (False, {"n": len(lines)},
+                f"{name} 这里我只找到 {len(lines)} 条**你自己**发的话（少于 "
+                f"{LEARN_MIN_MINE} 条学不出语气），先按默认人设回。"
+                f"想学的话先多聊几句，再发 /auto persona {name} 学习。")
+
+    prompt = "【我自己发出去的消息】（时间从早到晚）\n" + "\n".join(lines[-n:])
+    try:
+        raw = llm.chat(_LEARN_SYSTEM, [{"role": "user", "content": prompt}])
+    except Exception as e:
+        return False, {"n": len(lines)}, f"模型调用失败（{type(e).__name__}: {e}），这次没学成。"
+
+    addr, text = _learn_result(raw)
+    if not text:
+        return (False, {"n": len(lines)},
+                "模型这次没学出可用的语气（返回是空的），没动你的人设。")
+
+    notes = []
+    if len(text) > PERSONA_MAX:
+        cut = _cut_at_sentence(text, PERSONA_MAX)
+        notes.append(f"⚠️ 学出来的人设太长（{len(text)} 字，上限 {PERSONA_MAX}），"
+                     f"已按句末标点压到 {len(cut)} 字。")
+        text = cut
+    if addr is not None:
+        addr = _clean_address(addr)
+        if len(addr) > _ADDRESS_MAX:
+            # 称呼是**要叫出口**的词，长了就不是称呼。宁可当没有（并说出来），
+            # 也不能截一半存下去——那会叫出一个用户从没说过的半截称呼。
+            notes.append(f"⚠️ 模型给的称呼太长（{len(addr)} 字，上限 {_ADDRESS_MAX}），"
+                         f"已按「没有固定称呼」处理，没动称呼。")
+            addr = None
+    return True, {"persona": text, "address": addr, "n": len(lines)}, "\n".join(notes)
+
+
+def _store_learned(rec, data, fields, n):
+    """把学到的**人设 / 称呼**连同来源一起记进去。
+
+    来源必须记：不然「学到的」和「你手写的」在状态里长得一样，
+    用户根本分不清手上这一段是谁写的，也不知道重学会不会盖掉自己的东西。
+
+    **只写 `fields` 里点名的字段**：`/auto address 谁 学习` 只学称呼时，
+    绝不能顺手把人设的 `persona_source` 从「你手写的」改成「学到的」——
+    那等于把来源记脏，用户以后再也分不清哪段是自己写的。
+
+    `data["address"] is None` = 这次没拿到称呼 → **一个字都不动**（不是清空）。
+    """
+    if "persona" in fields:
+        rec["persona"] = data["persona"]
+        rec["persona_source"] = "learned"
+        rec["persona_at"] = int(time.time())
+        rec["persona_n"] = int(n)
+    if "address" in fields and data["address"] is not None:
+        rec["address"] = data["address"]
+        rec["address_source"] = "learned"
+
+
+def _maybe_learn(rec, recs, cfg, client, llm_factory, force, fields=None):
+    """按规矩决定要不要学，返回 `(是否改了配置, 要追加给用户的一段话)`。
+
+    规矩（用户 2026-10-01 定的）：**只有当前没设过时才自动学**；
+    已经有（手写的或上次学的）一律不动，要重学必须用户明说 `force=True`。
+    这样加人时自动学一次，但绝不会把你精心写的东西默默冲掉。
+
+    `fields` 是要**写回**的字段（默认人设+称呼）。分开是为了支持
+    `/auto address 谁 学习`——只学称呼、**一个字都不动人设**。
+
+    学习失败**绝不影响调用方**（加人照样成功）：拿不到模型、没历史、读库出错
+    都只回一句真话。
+    """
+    fields = tuple(fields or ("persona", "address"))
+    name = str(rec.get("name") or rec.get("wxid") or "")
+
+    blocked = []
+    if "persona" in fields and str(rec.get("persona") or "").strip() and not force:
+        blocked.append("人设")
+    if "address" in fields and address_for(rec) and not force:
+        blocked.append("称呼")
+    if blocked:
+        return False, (f"\n（{'、'.join(blocked)}没动：{name} 已经设过了。"
+                       f"想按最近的聊天重学，发 /auto persona {name} 重新学习；"
+                       f"只想重学称呼，发 /auto address {name} 学习）")
+
+    if llm_factory is None:
+        return False, ("\n（这条链路没接模型，学不了。）" if force else "")
+
+    try:
+        llm = llm_factory()
+    except Exception as e:
+        return False, (f"\n（学习没成：拿不到模型（{type(e).__name__}: {e}），"
+                       f"{name} 先用原来的。）")
+
+    ok, data, msg = learn_persona(client, llm, rec, cfg)
+    if not ok:
+        return False, f"\n（没学成：{msg}）"
+
+    n = data["n"]
+    _store_learned(rec, data, fields, n)
+    _save(chats=recs)
+
+    out = f"\n已从你们最近 {n} 条**你自己**发的话里学出对{name}的"
+    if "persona" in fields:
+        out += f"语气：\n{data['persona']}\n"
+    else:
+        out += "称呼。\n"
+    if "address" in fields:
+        addr = data["address"]
+        if addr:
+            out += f"称呼：{addr}\n"
+        elif addr == "":
+            out += "称呼：（没有固定称呼，回的时候直接说事）\n"
+        else:
+            out += "称呼：这次没学到，原来那份**没动**。\n"
+    if "persona" in fields:
+        out += (f"（学到的人设是**整体替换**默认那份；想自己改就直接发 "
+                f"/auto persona {name} <描述>）")
+    if msg:
+        out += f"\n{msg}"
+    return True, out
 
 
 def status_text(cfg):
@@ -370,15 +878,32 @@ def status_text(cfg):
         f"审核模式：{'开启（草稿先发给你，回「确认」才发出去）' if sec.get('review') else '关闭（直接发给对方）'}",
         (f"上下文 {sec.get('context_messages', 20)} 条  |  "
          f"冷却 {sec.get('min_gap', 6)} 秒  |  单条上限 {sec.get('max_reply_chars', 200)} 字"),
+        "人设：每个人可以单独一份（整体替换默认）；没单独设的用全局默认",
+        "     看/改：/auto persona <昵称> [描述]   学语气：/auto persona <昵称> 学习",
+        "     称呼：/auto address <昵称> [称呼]    学称呼：/auto address <昵称> 学习",
         f"名单（{len(recs)}）：",
     ]
     if not recs:
-        lines.append("  （空）发 /auto add <昵称|wxid|roomid> [self|assistant] 添加")
+        lines.append("  （空）发 /auto add <昵称|wxid|roomid> [self|assistant] 添加"
+                     "（加进来会顺手学一次语气和称呼）")
     for r in recs:
         rev = sec.get("review") if r.get("review") is None else r.get("review")
         kind = "（群）" if is_group(r.get("wxid")) else ""
+        own = str(r.get("persona") or "").strip()
+        if not own:
+            tone = "人设=（默认）"
+        elif r.get("persona_source") == "learned":
+            tone = f"人设=学到[{r.get('persona_n') or '?'}条]:{_short(own, 14)}"
+        else:
+            tone = f"人设=你设的:{_short(own, 14)}"
+        addr = address_for(r)
+        if addr:
+            src = "学到" if r.get("address_source") == "learned" else "你设的"
+            tone += f"  称呼={src}:{addr}"
+        else:
+            tone += "  称呼=（无）"
         lines.append(f"  · {r.get('name') or r.get('wxid')}{kind}  "
-                     f"人设={r.get('mode') or 'self'}  审核={'开' if rev else '关'}")
+                     f"身份={r.get('mode') or 'self'}  审核={'开' if rev else '关'}  {tone}")
     return "\n".join(lines)
 
 
@@ -388,7 +913,12 @@ _USAGE = (
     "/auto on | off           开 / 关（关掉就你自己回）\n"
     "/auto add <昵称|wxid|roomid> [self|assistant]\n"
     "/auto del <昵称|wxid>\n"
-    "/auto mode <昵称|wxid> self|assistant\n"
+    "/auto mode <昵称|wxid> self|assistant   身份（self=假装你本人 / assistant=明说是助手）\n"
+    "/auto persona <昵称> [描述]   这个人的语气人设；不带描述=看，清空=恢复默认\n"
+    "/auto persona <昵称> 学习     从你和他的历史对话里学语气+称呼（覆盖已有的）\n"
+    "/auto address <昵称> [称呼]   你平时怎么叫他；不带=看，清空=不套称呼\n"
+    "/auto address <昵称> 学习     只从历史里学称呼，**一个字都不动人设**\n"
+    "/auto persona 全局 [self|assistant] [描述]   没单独设的人用的默认人设\n"
     "/auto review on|off [昵称|wxid]   不带对象则改全局\n"
     "/auto ctx <1~30>         上下文条数\n"
     "（群只能填 roomid，形如 xxx@chatroom）"
@@ -409,7 +939,8 @@ def summary_line(cfg):
             f"审核{'开' if sec.get('review') else '关'}")
 
 
-def build_arg(action, who="", mode=None, review=None, context=None):
+def build_arg(action, who="", mode=None, review=None, context=None, persona=None,
+              address=None):
     """把 agent 工具的结构化参数拼成 /auto 的子命令串。
 
     让工具和命令走**同一条**实现（handle_command），省得两套逻辑各自跑偏。
@@ -428,6 +959,22 @@ def build_arg(action, who="", mode=None, review=None, context=None):
         if review is None:
             return "review"
         return f"review {'on' if review else 'off'} {who}".strip()
+    if a == "persona":
+        text = _clean_persona(persona)
+        # who 为空 = 全局（和上面 review 一样：「空 who」就是改全局默认，
+        # t_auto_reply 里已经拦过「模型漏参数」那一头）。
+        # 全局人设有 self / assistant 两份，所以全局那支才需要带 mode；
+        # 单人那份和身份无关（整体替换），带了反而会把 mode 当成描述的一部分。
+        if not who:
+            return " ".join(x for x in ("persona", "全局", mode if text else None, text)
+                            if x)
+        return " ".join(x for x in ("persona", who, text) if x)
+    if a == "learn":
+        # 学语气**按人**学，没有全局那一支（who 为空时 t_auto_reply 已经拦住）。
+        return " ".join(x for x in ("persona", who, "重新学习") if x)
+    if a == "address":
+        text = _clean_address(address)
+        return " ".join(x for x in ("address", who, text) if x)
     if a == "ctx":
         if context is None:
             return "ctx"
@@ -438,12 +985,17 @@ def build_arg(action, who="", mode=None, review=None, context=None):
     return a
 
 
-def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
+def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
+                   llm_factory=None):
     """处理 /auto 系列子命令。返回 (回复文本, 是否改了配置)。
 
     name_hint 是给 agent 工具用的：工具会先把昵称解析成 wxid（它的精确匹配比
     这里严格），再让 `/auto add` 按 wxid 走，显示名就会被记成 wxid_xxx，
     /auto 列表里看不到人名。带上原名当显示名即可。
+
+    llm_factory 是**可选的、懒调用的**模型工厂（`() -> llm`）：只有真要去学语气
+    时才调它，所以普通命令不会因为多一个参数就多建一个模型客户端。
+    不传 = 这条链路没有学习能力，`/auto persona 谁 学习` 会如实说学不了。
     """
     parts = str(arg or "").split(maxsplit=1)
     sub = parts[0].strip().lower() if parts else ""
@@ -466,7 +1018,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
         who, mode = _split_target(rest)
         if not who:
             return _USAGE, False
-        wxid, disp, cands = _resolve(client, who, can_lookup)
+        wxid, disp, cands = _resolve(client, who, can_lookup, cfg=cfg)
         if not wxid:
             hint = ("当前实时查库不可用，只能直接填 wxid（群填 roomid）。"
                     if not can_lookup else
@@ -503,9 +1055,18 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
                 rec["mode"] = mode
             head = f"{disp} 已在名单里"
         _save(chats=recs)
+
+        # 加进名单就顺手学一次语气（用户 2026-10-01 要的：「开启自动回复之后，
+        # AI 能通过历史对话学出对这个人的语气」）。
+        # **只有当前没设过人设时才会真的学**——已有的一律不动，想重学要明说，
+        # 免得你精心写的人设被一次自动学习默默冲掉。
+        # 学习要读一次库 + 调一次模型，所以这条命令会慢几秒；失败**绝不影响加人**。
+        _learned, learn_note = _maybe_learn(rec, recs, cfg, client, llm_factory,
+                                           force=False)
+
         tail = "" if sec.get("enabled") else "\n总开关还是关着的，记得发 /auto on。"
-        return (f"{head}（人设={rec.get('mode')}，"
-                f"self=假装你本人 / assistant=明说是助手）。{tail}"), True
+        return (f"{head}（身份={rec.get('mode')}，"
+                f"self=假装你本人 / assistant=明说是助手）。{tail}{learn_note}"), True
 
     if sub in ("del", "delete", "remove", "删", "删除"):
         who, _ = _split_target(rest)
@@ -515,7 +1076,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
         _save(chats=[r for r in recs if r is not rec])
         return f"已移出自动回复名单：{rec.get('name') or rec.get('wxid')}。", True
 
-    if sub in ("mode", "人设"):
+    if sub in ("mode", "身份"):
         who, mode = _split_target(rest)
         if not who or not mode:
             return "用法：/auto mode <昵称|wxid> self|assistant", False
@@ -524,7 +1085,145 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None):
             return f"名单里没有「{who}」。", False
         rec["mode"] = mode
         _save(chats=recs)
-        return f"{rec.get('name') or rec.get('wxid')} 的人设已改为 {mode}。", True
+        return f"{rec.get('name') or rec.get('wxid')} 的身份已改为 {mode}。", True
+
+    # 称呼：**我平时怎么叫这个人**。和 persona 分开存、也分开注入到提示词里——
+    # 理由是 persona 是散文，用户重写人设（或干脆手写一份）时，
+    # 夹在里面的称呼会跟着一起丢；称呼要能独立活下来。
+    # 它同时被当成联系人解析的别名（见 address_aliases），所以「给老张发消息」也认。
+    if sub in ("address", "称呼", "叫法", "称谓"):
+        if not rest.strip():
+            return _USAGE, False
+        rec, glob, _am, text = _split_rec_target(rest, recs)
+
+        if text is None:
+            who = str(name_hint or "").strip() or (rest.split(maxsplit=1)[0]
+                                                   if rest.strip() else "")
+            return (f"名单里没有「{who}」。称呼是**每个人一份**、只对自动回复名单里的人"
+                    f"生效——先发 /auto add {who} 把他加进来。"), False
+        if glob:
+            return ("称呼是**按人**的，没有「全局」那一份（只有语气人设有全局默认）。"
+                    "发 /auto address <昵称> <称呼>。"), False
+
+        name = rec.get("name") or rec.get("wxid")
+        cur = address_for(rec)
+        if not text:                      # 不带内容 = 查看
+            if cur:
+                src = ("你手写的" if rec.get("address_source") == "manual"
+                       else "从历史学到的")
+                return (f"{name} 的称呼＝{src}：{cur}\n"
+                        f"改：/auto address {name} <称呼>   从历史学："
+                        f"/auto address {name} 学习   清空：/auto address {name} 清空"), False
+            return (f"{name} 还没设称呼（回消息时不套称呼、直接说事）。\n"
+                    f"设：/auto address {name} <称呼>（例：老张）   "
+                    f"从历史学：/auto address {name} 学习"), False
+        # 「学习」= 只学称呼、**一个字都不动人设**（force 只管称呼这一路；
+        # 人设不在 fields 里，_store_learned 也就不会碰它）
+        if _persona_learn(text):
+            changed, note = _maybe_learn(rec, recs, cfg, client, llm_factory,
+                                         force=True, fields=("address",))
+            return note.lstrip("\n"), changed
+        if _persona_clear(text):
+            if not cur:
+                return f"{name} 本来就没称呼，没动。", False
+            rec["address"] = ""
+            rec.pop("address_source", None)
+            _save(chats=recs)
+            return f"{name} 的称呼已清空（回消息时不套称呼）。", True
+        bad = _address_too_long(text)
+        if bad:
+            return bad, False
+        rec["address"] = _clean_address(text)
+        rec["address_source"] = "manual"
+        _save(chats=recs)
+        return (f"{name} 的称呼已设为「{rec['address']}」——回复时会自然这么叫，"
+                f"你说「给{rec['address']}发消息」也能认出是他。"
+                f"想取消发 /auto address {name} 清空"), True
+
+    # ⚠️ 命令词分家（2026-10-01）：「人设」这个别名以前挂在 mode（self/assistant）上，
+    # 而真正的人设字段叫 persona —— 两个都叫「人设」，用户一定会改错东西。
+    # 现在 mode = **身份**（假装你本人 / 明说是助手），persona = **人设/语气**。
+    # `/auto mode` 这个命令词保持不变（不破坏已经记住它的手）；只把中文别名挪对了。
+    if sub in ("persona", "人设", "语气", "口吻"):
+        if not rest.strip():              # 裸 /auto persona → 用法（别拿空串去查名单）
+            return _USAGE, False
+        rec, glob, pmode, text = _split_rec_target(rest, recs)
+
+        # text 为 None = 目标没认出来（不是名单里的人，也不是全局范围词）
+        if text is None:
+            who = str(name_hint or "").strip() or (rest.split(maxsplit=1)[0]
+                                                   if rest.strip() else "")
+            return (f"名单里没有「{who}」。人设是**每个人一份**、只对自动回复名单里的人"
+                    f"生效——先发 /auto add {who} 把他加进来。"), False
+
+        if glob:
+            m = pmode or "self"
+            key = f"persona_{m}"
+            cur = str(sec.get(key) or "").strip()
+            if not text:
+                if cur:
+                    src = "你设的（存在 settings.json）"
+                else:
+                    src = "config.yaml / 代码兜底"
+                    cur = _DEFAULT_ASSISTANT if m == "assistant" else _DEFAULT_SELF
+                return (f"全局默认人设（{m} 模式，没单独设人设的人都用它）：\n{cur}\n"
+                        f"（来源：{src}；改法：/auto persona 全局 {m} <描述>）"), False
+            # 学语气是**按人**学的：全局那份没有对应的「一个人」的历史可学。
+            # 不拦住的话「学习」两个字会被当成人设正文存进去（静默存一段没意义的东西）。
+            if _persona_learn(text):
+                return ("全局人设没法从历史里学——语气是**按人**学的。"
+                        "发 /auto persona <昵称> 学习 学某个人。"), False
+            if _persona_clear(text):
+                if not _persona_disk_override(key):
+                    return f"全局 {m} 的人设本来就没单独设过，没动。", False
+                _save(_unset=(key,))
+                return "已清掉全局 {} 的人设覆盖，重新用 config.yaml 里的默认人设。".format(m), True
+            bad = _persona_too_long(text)
+            if bad:
+                return bad, False
+            val = _clean_persona(text)
+            _save(**{key: val})
+            return (f"全局默认人设已设（{m} 模式，**整体替换**原默认人设）：\n{val}\n"
+                    f"⚠️ 这是**没单独设人设的人**的默认值；单独设过的会话不受影响。"), True
+
+        name = rec.get("name") or rec.get("wxid")
+        own = str(rec.get("persona") or "").strip()
+        if not text:                      # 不带描述 = 查看当前人设
+            cur = persona_for(rec, sec)
+            if own:
+                src = ("你手写的" if rec.get("persona_source") == "manual"
+                       else f"从历史学到的（用了 {rec.get('persona_n') or '?'} 条你自己发的话）")
+                src += "，整体替换默认"
+            else:
+                src = f"默认（{rec.get('mode') or 'self'} 模式那份）"
+            return (f"{name} 的人设＝{src}：\n{cur}\n"
+                    f"改：/auto persona {name} <描述>   学：/auto persona {name} 学习"
+                    f"   恢复默认：/auto persona {name} 清空"), False
+        # 「学习 / 重新学习」= 明说 · 这时才允许盖掉已有的人设
+        if _persona_learn(text):
+            changed, note = _maybe_learn(rec, recs, cfg, client, llm_factory,
+                                          force=True)
+            return note.lstrip("\n"), changed
+        if _persona_clear(text):
+            if not own:
+                return f"{name} 本来就用默认人设，没动。", False
+            rec["persona"] = ""
+            for k in ("persona_source", "persona_at", "persona_n"):
+                rec.pop(k, None)
+            _save(chats=recs)
+            return f"{name} 的人设已恢复默认（{rec.get('mode') or 'self'} 模式那份）。", True
+        bad = _persona_too_long(text)
+        if bad:
+            return bad, False
+        rec["persona"] = _clean_persona(text)
+        # 记下来源：手写的和学习到的在状态里必须能分辨（不然用户分不清手上
+        # 这一段是谁写的、也不知道「重新学习」会不会盖掉自己的东西）。
+        rec["persona_source"] = "manual"
+        for k in ("persona_at", "persona_n"):
+            rec.pop(k, None)
+        _save(chats=recs)
+        return (f"{name} 的人设已设为（**整体替换**默认人设）：\n{rec['persona']}\n"
+                f"回复「{name}」时会整段用它。想退回默认，发 /auto persona {name} 清空"), True
 
     if sub in ("review", "审核"):
         bits = rest.split()

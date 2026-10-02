@@ -54,3 +54,28 @@ pypdf>=4.0
 # pywxdump 仅 export_history.py 手动导出时才需要；它强锁 protobuf==3.10.0，
 # 与 wcferry 的 grpcio-tools 冲突会导致安装失败，故不随主程序安装。
 # 需要手动导出时再单独装：pip install pywxdump
+#
+# Pillow：**只有 PDF 内嵌图片**这条支路才需要（pypdf 的 `page.images` 要它）。
+# 不装也能读：扫描页绝大多数是 DCTDecode(JPEG)，file_read 会**自己从页里掏 JPEG 流**
+# 直接喂系统 OCR（实测 564 页扫描件第 2 页走的就是这条路）。
+# 装了它则多覆盖 FlateDecode 之类需要重编码的图。
+#     .venv\Scripts\python.exe -m pip install Pillow
+#
+# av（PyAV，wheel 自带 FFmpeg）：**视频**读音频轨/抽帧用（P2）。不装则视频那一类读不了，
+# 其余一切照常。它是这几个里最大的一个（几十 MB）。
+#     .venv\Scripts\python.exe -m pip install av
+#
+# extract-msg：Outlook **.msg** 邮件最稳的读法。不装就退到 olefile（只取主题/正文/
+# 收发件人，拿不到附件），再没有就如实说。
+#     .venv\Scripts\python.exe -m pip install extract-msg
+#
+# py7zr / rarfile（.7z / .rar 压缩包）与 extract-msg（Outlook .msg 邮件）见 P3，
+# 用到时按提示单独装；.rar 还需要外部解压器（没有就如实说读不了）。
+#
+# xlrd：**老 .xls 表格**用它读（纯 Python，比启动 Excel 快也稳）。不装也能读——
+# legacy_office 会自动落到 Office COM / WPS / LibreOffice 那一串。
+#     .venv\Scripts\python.exe -m pip install xlrd
+#
+# olefile：老 .doc 的**最后一级兜底**（粗略抽取，质量不保证，会如实标注）。
+# 不装就只有前四级；都没有就如实说读不了。.msg 邮件以后也会用它。
+#     .venv\Scripts\python.exe -m pip install olefile

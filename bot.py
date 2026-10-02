@@ -8,6 +8,7 @@
 
 依赖 wcferry（必须匹配微信版本）。用法：python bot.py，Ctrl+C 退出。
 """
+import base64
 import json
 import os
 import re
@@ -23,9 +24,11 @@ import agent_tools
 import assets
 import auto_reply
 import executor
+import groups
 import live_history
 import settings
 import providers
+import read_worker
 import scheduler
 import watch
 from llm import ChatLLM
@@ -167,11 +170,18 @@ HELP_TEXT = (
     "—— 自动回复（让 AI 代替我本人回某个人）——\n"
     "下面这些也能直接用大白话说，助手会自己调用工具：\n"
     "   「以后张三的消息你帮我回」 「别自动回李四了」 「发之前先给我看一眼」\n"
-    "/auto                    看开关、审核和名单\n"
+    "   「以后跟张三说话随便点」 「对李四别那么客气」 「回他的时候叫他老张」\n"
+    "/auto                    看开关、审核、人设、称呼和名单\n"
     "/auto on | off           开 / 关（关掉就你自己回）\n"
-    "/auto add <昵称|wxid|roomid> [self|assistant]  加入名单\n"
+    "/auto add <昵称|wxid|roomid> [self|assistant]  加入名单（会顺手学一次语气和称呼）\n"
     "/auto del <昵称|wxid>    移出名单\n"
-    "/auto mode <谁> self|assistant   改人设\n"
+    "/auto mode <谁> self|assistant   改身份（假装你本人 / 明说是助手）\n"
+    "/auto persona <谁> [描述]  给这个人单独一套语气；不带描述=看，清空=恢复默认\n"
+    "/auto persona <谁> 学习    从你和他的历史对话里学语气+称呼（会覆盖已有的）\n"
+    "/auto address <谁> [称呼]  你平时怎么叫他；不带=看，清空=不套称呼\n"
+    "/auto address <谁> 学习    只学称呼，不动人设\n"
+    "/auto persona 全局 [描述]  没单独设的人用的默认语气\n"
+    "（学到的称呼也是别名：「给老张发消息」能认出来）\n"
     "/auto review on|off [谁] 开审核（草稿先发你，回「确认」才发）\n"
     "/auto ctx <1~30>         上下文条数\n"
     "\n"
@@ -191,6 +201,24 @@ HELP_TEXT = (
     "/盯着 删 <昵称|wxid> —— 移出去\n"
     "/盯着 开|关 —— 总开关\n"
     "（和 /auto 互斥：那个是代你回对方，这个是只告诉你不回）\n"
+    "\n"
+    "—— 群发（一次给多个人发，各按自己的语气和称呼）——\n"
+    "也可以直接说「给张三、李四发…」或「帮我祝所有人节日快乐」。\n"
+    "· 你给出**要发的那句话本身** -> 所有人收到同一段，一字不改；\n"
+    "· 你只给出**意思** -> 按每个人的语气和称呼分别写一条。\n"
+    "「所有人」= 你的所有好友，会**先确认范围**（那步一个字都不发），\n"
+    "确认后才生成内容：免确认名单里的人直接收到，其余的人等你看过再发。\n"
+    "单次人数上限见 config.yaml 的 agent.broadcast_max（默认 100）。\n"
+    "\n"
+    "—— 分组（把联系人分好组，群发直接按组发）——\n"
+    "/分组                      看所有分组和成员\n"
+    "/分组 建 <组名> <人名、人名>  建一个组（组名不能带空格）\n"
+    "/分组 加 <组名> <人名、人名>  往组里加人（组不存在就建）\n"
+    "/分组 移 <组名> <人名、人名>  从组里移人\n"
+    "/分组 删 <组名>             删掉整个组（人本身不动）\n"
+    "/分组 标签                  看**微信自带**的标签和人数（只读，不算分组）\n"
+    "之后说「给大学同学组发…」就行，不用点名。\n"
+    "微信里已经建好的标签也能直接发：说「给亲人发…」即可（标签在微信那边改）。\n"
     "\n"
     "—— 素材暂存（发一次图/表情，之后说「发给谁」就能再发）——\n"
     "在这里发一张图或一个表情，我就记下来（默认最多 5 条，新的顶掉最老的）。\n"
@@ -369,29 +397,52 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
     if cmd in ("/auto", "/自动回复"):
         # 重新读一次配置再处理：连着发几条 /auto 时，传进来的 cfg 还是上一条
         # 命令之前的快照，直接用它会在「读-改-写」里丢掉上一次的改动。
-        return auto_reply.handle_command(arg, settings.effective(load_config()), wcf,
-                                         can_lookup=live_ok)
+        fresh = settings.effective(load_config())
+        # llm_factory 是**懒调用**的：只有 `/auto add` 或 `/auto persona 谁 学习`
+        # 真要去学语气时才建模型客户端，普通 /auto 命令一分钱不花。
+        return auto_reply.handle_command(arg, fresh, wcf, can_lookup=live_ok,
+                                         llm_factory=lambda: make_llm(fresh))
 
     if cmd in ("/定时", "/schedule", "/提醒"):
         # 同 /auto：重新读一次，避免连着发命令时丢掉上一条的改动。
         fresh = settings.effective(load_config())
+        # 学到的「称呼」也当名字：用户说「给老张发消息」时能认出来。
+        # 只有一份真源（auto_reply.chats[].address），这里只是取出来传给统一解析。
+        alias = auto_reply.address_aliases(fresh)
 
         def resolve(who):
             # 走和 agent 工具**同一套**解析：重名不静默取第一个
             return agent_tools.resolve_one(contacts, who,
-                                           fresh.get("self_wxid", ""), wcf)
+                                           fresh.get("self_wxid", ""), wcf,
+                                           aliases=alias)
 
         return scheduler.handle_command(arg, fresh, resolve, can_lookup=live_ok)
 
     if cmd in ("/盯着", "/watch", "/盯"):
         # 同 /auto：重新读一次，避免连着发命令时丢掉上一条的改动。
         fresh = settings.effective(load_config())
+        alias = auto_reply.address_aliases(fresh)      # 同上：称呼也当名字用
 
         def resolve_watch(who):
             return agent_tools.resolve_one(contacts, who,
-                                           fresh.get("self_wxid", ""), wcf)
+                                           fresh.get("self_wxid", ""), wcf,
+                                           aliases=alias)
 
         return watch.handle_command(arg, fresh, resolve_watch)
+
+    if cmd in ("/分组", "/group", "/组"):
+        # 分组只用来决定「群发发给谁」，不发消息。同 /盯着：重新读配置 + 同一套解析
+        # （重名不静默取第一个；学到的称呼也当名字用）。
+        fresh = settings.effective(load_config())
+        alias = auto_reply.address_aliases(fresh)
+
+        def resolve_group(who):
+            return agent_tools.resolve_one(contacts, who,
+                                           fresh.get("self_wxid", ""), wcf,
+                                           aliases=alias)
+
+        # `client` 只有「/分组 标签」那一支要用（看微信自带的标签）。
+        return groups.handle_command(arg, fresh, resolve_group, client=wcf)
 
     if cmd in ("/素材", "/asset", "/assetbank"):
         # 容量的钳制在 _assets_cap 里（配置写歪了也只告警钳制，不静默放大）。
@@ -456,15 +507,28 @@ def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
         return str(talker) not in targets
 
     if live_ok:
+        win = cfg.get("recent_messages", 30)
         mentions = find_mentions(query, contacts)
         if mentions:
-            parts.append("【你提到的联系人，最近的历史对话】")
+            # **这段是按条数截的窗口，不是时间范围。** 标题必须自己说清这一点：
+            # 2026-10-01 真机踩过——用户问「我跟张三最近 10 天说了什么」，
+            # 模型看到这里只有 9/30 起的 30 条，就把它答成
+            # 「最近 10 天（9/30–10/1）」；而那条会话从 2026-01 起有 6486 条，
+            # 30 条其实只覆盖 1.4 天。范围是它自己编的，因为没人告诉它窗口有多小。
+            parts.append(
+                f"【你提到的联系人，最近的历史对话】（**每个会话只有最近 {win} 条**"
+                f"——这是按**条数**取的窗口，不是按时间范围取的，**不是全部历史**）")
             for c in mentions[:3]:
                 name = c.get("remark") or c.get("name") or c.get("wxid")
-                msgs = query_contact_history(
-                    wcf, c["wxid"], limit=cfg.get("recent_messages", 30)
-                )
-                parts.append(f"--- 与 {name}（{c['wxid']}）---")
+                msgs = query_contact_history(wcf, c["wxid"], limit=win)
+                cover = f"以下 {len(msgs)} 条"
+                span = agent_tools.span_of(msgs)
+                if span:
+                    cover += f"，实际覆盖 {span}"
+                if len(msgs) >= win:
+                    cover += (f"；⚠️ 取满了 {win} 条上限——**更早的没有取**，"
+                              f"所以这段不能当成全部历史")
+                parts.append(f"--- 与 {name}（{c['wxid']}）--- {cover}")
                 for m in msgs:
                     who = "我" if m["is_self"] else name
                     parts.append(f"[{m['time']}] {who}: {m['content']}")
@@ -472,6 +536,7 @@ def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
         terms = extract_keywords(query)
         if terms:
             seen = set()
+            snips = []
             for term in terms[:4]:
                 for m in search_history(wcf, term, limit=8):
                     if not keep(m.get("talker")):
@@ -481,18 +546,24 @@ def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
                         continue
                     seen.add(key)
                     who = _msg_speaker(m, names)
-                    parts.append(f"[{m['time']}] {who}: {m['content']}")
+                    snips.append(f"[{m['time']}] {who}: {m['content']}")
+            if snips:
+                parts.append("【按关键词搜到的历史片段】"
+                             "（每个关键词最多 8 条，**只是片段、不是全部历史**）")
+                parts.extend(snips)
         else:
             # 问句里没有可检索的关键词（例如「最近聊了什么」），直接给最近的聊天
-            parts.append("【最近的聊天记录】")
-            for m in recent_messages(wcf, limit=cfg.get("recent_messages", 30)):
+            parts.append("【最近的聊天记录】"
+                         "（**每个会话只取最后一条**，而且只覆盖最近活跃的那些"
+                         "——**不是全部历史**，也不是某个时间范围）")
+            for m in recent_messages(wcf, limit=win):
                 if not keep(m.get("talker")):
                     continue
                 who = _msg_speaker(m, names)
                 parts.append(f"[{m['time']}] {who}: {m['content']}")
     else:
         hits = static_history.search(query, cfg.get("search_topk", 8))
-        parts.append("【相关历史片段（静态导出）】")
+        parts.append("【相关历史片段（静态导出）】（**是片段，不是全部历史**）")
         for m in hits:
             parts.append(f"[{m.get('time','?')}] {m.get('sender','?')}: {HistoryStore.text(m)}")
 
@@ -500,6 +571,14 @@ def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
         parts.append("（历史记录里没查到相关内容）")
 
     parts.append("")
+    # 上面那些全都是**按条数**取的窗口。用户问时间范围时必须去查库，
+    # 不许把窗口的跨度当成用户问的范围（2026-10-01 真机踩过，见上面 mentions 那段）。
+    parts.append(
+        "⚠️ 上面这段历史是**按条数**取的窗口，**不等于用户问的时间范围**。"
+        "用户问「最近 N 天 / 上周 / 某天 / 这一个月」时，必须调用 read_history 工具"
+        "并把 days 填上（N 天就填 N）重新查；回答时**照实说这次覆盖到什么时候**。"
+        "窗口里没有**不等于**那段时间没有记录——只能说「我这边只取到 X 以来」，"
+        "绝不许把上面这段的跨度当成用户问的范围。")
     parts.append(f"【用户的问题】{query}")
     text = "\n".join(parts)
     # 送云端前脱敏：**默认关闭**（config.yaml 的 privacy.redact）。
@@ -799,7 +878,13 @@ def restore_pending(chats, cfg):
                     chat, it.get("to_wxid") or "", it.get("to_name") or "",
                     it.get("text") or "", kind=it.get("kind") or "agent",
                     count=it.get("count") or 1, image=it.get("image"),
-                    xml=it.get("xml"), cmd=it.get("cmd"), timeout=it.get("timeout"))
+                    xml=it.get("xml"), cmd=it.get("cmd"), timeout=it.get("timeout"),
+                    # ⚠️ `label` / `items` / `spec` **必须一起恢复**。
+                    # 少了 label，素材那条待确认项就退化成「转发一条消息」（用户认不出
+                    # 是哪一条）；少了 items/spec，群发批次会变成「没有收件人」——
+                    # 而它的 text 只是**给人看的预览**，真按文本分支发出去就是往空
+                    # wxid 发一段预览文字（真机上是「发出去了但没人收到」这种最难查的错）。
+                    label=it.get("label"), items=it.get("items"), spec=it.get("spec"))
                 n += 1
             except Exception:
                 traceback.print_exc()
@@ -827,16 +912,23 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
     # 夹到 [1, 10]：轮次直接线性放大对 hook 的调用次数，而 CLAUDE.md 记着
     # 「hook 不能并发、已被并发查询搞崩 6 次」。光靠注释劝人「别放开」不算闸门。
     max_rounds = max(1, min(10, int(agent_cfg.get("max_rounds", 3))))
-    box = agent_tools.ToolBox(wcf, cfg, contacts, self_wxid, chat, cfg_provider)
+    box = agent_tools.ToolBox(wcf, cfg, contacts, self_wxid, chat, cfg_provider,
+                              llm_factory=lambda: llm)
 
     messages = list(history or []) + [{"role": "user", "content": prompt}]
     last_text = ""
     for _ in range(max_rounds):
-        result = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
+        # 上一轮工具收下的**原图**（image.mode=inline）：附给**这一次**调用，取走即清。
+        # 这样图只花一次 token；而且永远不进 messages / dialog 记忆。
+        pending = box.take_images() if hasattr(box, "take_images") else []
+        call_messages = attach_images(messages, pending) if pending else messages
+        result = llm.chat_with_tools(system, call_messages, agent_tools.TOOLS)
         last_text = result.text or last_text
         if not result.tool_calls:
             if state is not None:
                 state["shell_queued"] = box.shell_queued
+                state["broadcast_preview"] = box.broadcast_preview
+                state["image_notes"] = list(box.image_notes)
             return result.text or "（模型没有返回内容）", box.cfg_changed
 
         messages.append({
@@ -856,6 +948,8 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
                      "content": "（工具调用轮次已用完，请直接给出最终答复，不要再调用工具。）"})
     if state is not None:
         state["shell_queued"] = box.shell_queued
+        state["broadcast_preview"] = box.broadcast_preview
+        state["image_notes"] = list(box.image_notes)
     try:
         final = llm.chat_with_tools(system, messages, agent_tools.TOOLS)
         return (final.text or last_text or "（工具调用次数用完了，没能给出答复）",
@@ -1006,6 +1100,64 @@ def with_shell_truth_note(answer, shell_queued):
         print("[bot] 回答声称已提交命令，但本轮没有登记任何 shell 项 → 追加真话")
         return text + SHELL_NOT_QUEUED_NOTE
     return text
+
+
+def with_image_notes(answer, notes):
+    """把「这一轮的图片没给成」之类的**如实说明**追加在答复后面。
+
+    和 `with_shell_truth_note` / `with_broadcast_preview` 同一个姿势：
+    事实由工具层记下来，bot 原样补上——绝不让模型自己转述
+    （它多半会漏掉"有一张没给模型看"，用户就以为模型看过全部图了）。
+    """
+    rows = [str(n).strip() for n in (notes or []) if str(n).strip()]
+    text = str(answer or "")
+    if not rows:
+        return text
+    return (text.rstrip() + "\n\n" + "\n".join(rows)).strip()
+
+
+def attach_images(messages, items):
+    """把「要交给模型看的原图」附成**这一次调用**的一条 user 消息。
+
+    两条硬规矩（见 docs/file-input-spec.md 第八节）：
+      * 只附**这一次**：图片不进 `messages` 列表，后续轮次不会重发（token 会翻倍）；
+      * **绝不进 `bot.dialog_*`**：那份记忆每轮都重发，图进去＝反复计费。
+    """
+    if not items:
+        return messages
+    blocks = [{"type": "text", "text": "（下面是刚读到的图片原图，请直接看图回答）"}]
+    for path, label in items:
+        try:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode()
+        except OSError as e:
+            print(f"[bot] ⚠️ 这张图附不上去（{e}）：{path}")
+            continue
+        ext = "png" if str(path).lower().endswith(".png") else "jpeg"
+        blocks.append({"type": "text", "text": f"【{label}】"})
+        blocks.append({"type": "image_url",
+                       "image_url": {"url": f"data:image/{ext};base64,{data}"}})
+    if len(blocks) == 1:
+        return messages
+    return list(messages) + [{"role": "user", "content": blocks}]
+
+
+def with_broadcast_preview(answer, preview):
+    """群发的预览（人数 + 逐条正文）**由 bot 原样补在答复后面**。
+
+    为什么不靠模型转述：用户是照着这段回「确认」的，而里面有**人数**和**每条正文**——
+    模型转述十条正文必然走样（漏一条、改一个字，用户就在没看清的情况下把消息
+    发给了一群人）。所以这里和 `with_shell_truth_note` 一个姿势：拿 ToolBox 记下的
+    **事实**（`box.broadcast_preview`）直接给用户看。
+
+    放在答复**之后**：模型常常会写一句「已经准备好了，回确认即可」，那句在前、
+    权威的那段在后，用户看到的是能照着确认的东西。
+    """
+    prev = str(preview or "").strip()
+    text = str(answer or "")
+    if not prev:
+        return text
+    return (text.rstrip() + "\n\n" + prev).strip()
 
 
 # ============================================================
@@ -1198,20 +1350,44 @@ def stash_control_media(wcf, cfg, talker, msg, send):
              f"（转发它需要那条原始消息）。", talker)
         return True
 
-    try:
-        xml = live_history.message_xml(wcf, talker, target["local_id"])
-    except Exception:
-        traceback.print_exc()
-        xml = ""
-    if not xml:
-        print(f"[bot] 素材暂存失败：local_id={target.get('local_id')} 取不到原始 XML")
-        send(f"{assets.this_label(kind)}我取不到原始内容（转发不了），暂存失败。", talker)
-        return True
-
     cap = assets.cap_of(cfg)          # 唯一一处钳制逻辑（assets.cap_of）
+    # 明文来源按「质量/可靠性」排序，取到就用，取不到就退一步：
+    #   ① 微信发图时暂存的**明文原图**（`temp\RWTemp`，实测比消息行早 2 秒）——原图质量，
+    #      而且这是「自己在微信里发的图」唯一能拿到的明文；它会被清理，所以立刻复制走；
+    #   ② 微信缓存的**明文缩略图**（有的话，质量差些）；
+    #   ③ 都没有就只留一条**消息引用**（发不出去，回执里会明说）。
+    # 为什么要这么麻烦：hook 的 XML 转发在 4.1.10.27 上会把微信搞崩、已在源码里禁用
+    # （见 wx_send_xml.cpp），所以**只有明文发得出去**。
+    pl = str(target.get("image") or "")
+    item = None
+    note = ""
+    if kind == "图片":
+        try:
+            item, note = agent_tools.capture_sent_plaintext(
+                ts, kind=kind, talker=talker, local_id=target.get("local_id"))
+        except Exception:
+            traceback.print_exc()
+            item, note = None, ""
+    if item is None and pl and os.path.isfile(pl):
+        item = assets.entry_from_file(pl, kind=kind, talker=talker,
+                                     local_id=target.get("local_id"))
+        note = "明文缩略图"
     try:
-        items, added, dropped = assets.stash(
-            assets.entry_from_media(target, xml), cap)
+        if item is None:
+            try:
+                xml = live_history.message_xml(wcf, talker, target["local_id"])
+            except Exception:
+                traceback.print_exc()
+                xml = ""
+            if not xml:
+                print(f"[bot] 素材暂存：local_id={target.get('local_id')} "
+                      f"既没有明文也取不到原始 XML")
+                send(f"{assets.this_label(kind)}我既拿不到明文、也取不到原始内容，"
+                     f"暂存失败——要发它请**以「文件」方式**再发一次。", talker)
+                return True
+            item = assets.entry_from_media(target, xml)
+            note = "消息引用（发不出去）"
+        items, added, dropped = assets.stash(item, cap)
     except Exception as e:
         traceback.print_exc()
         send(f"暂存{assets.this_label(kind)}时出错：{e}", talker)
@@ -1231,7 +1407,18 @@ def stash_control_media(wcf, cfg, talker, msg, send):
         extra = f"（暂存区共 {len(items)} 条，第 1 条是最近那张）"
     else:
         extra = ""
-    send(head + "说「发给谁」我就发；想连发就说「发 3 次」。" + extra, talker)
+    # 回执必须说清**这张到底发不发得出去**：hook 的 XML 转发在 4.1.10.27 上会把
+    # 微信搞崩、已在 hook 源码里禁用（见 wx_send_xml.cpp），所以只有拿到明文
+    # （微信缓存的缩略图 / 用户以「文件」方式发来的原图）才发得出去。
+    # 不告诉用户的话，他会以为「已暂存 = 随时能发」，然后撞一句"发不了"。
+    if assets.plaintext_of(items[-1]):
+        tail = (f"说「发给谁」我就发（存的是{note or '明文图'}）；"
+                f"想连发就说「发 3 次」。")
+    else:
+        tail = ("⚠️ 但这张**只有消息引用、发不出去**（微信只留加密原图，"
+                "hook 的转发接口会把微信搞崩、已禁用）——要发它，"
+                "请把这张图**以「文件」方式**再发一次，那样就有明文了。")
+    send(head + tail + extra, talker)
     return True
 
 
@@ -1606,6 +1793,10 @@ def main():
                 # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
                 # 本轮其实没登记时，同样要追一句真话（否则用户回「确认」白等）。
                 answer = with_shell_truth_note(answer, run_state.get("shell_queued", False))
+                answer = with_image_notes(answer, run_state.get("image_notes"))
+                # 群发预览**原样**带上（模型转述十条例文必走样）。
+                answer = with_broadcast_preview(
+                    answer, run_state.get("broadcast_preview", ""))
             else:
                 answer = llm.chat(system, history + [{"role": "user", "content": prompt}])
                 changed = False
@@ -1626,6 +1817,26 @@ def main():
         if fired:
             print(f"[bot] 定时任务已触发：{'、'.join(fired)}")
 
+        # 后台读文件的结果：**由主线程发**（worker 只碰磁盘和模型 HTTP，绝不碰 hook）。
+        # 挂在轮询空档里，和定时任务是同一个姿势 —— 不新增线程碰微信。
+        try:
+            for r in read_worker.drain():
+                label = str(r.get("label") or "那份文件")
+                if r.get("err"):
+                    body = (f"读不了：{r['err']}\n"
+                            f"（要在本机再试一次就说「重新读一下 {label}」）")
+                    head = f"⚠️ 刚才那份「{label}」没读成。"
+                else:
+                    body = (r.get("text") or "（读出来是空的）")
+                    head = f"📄 刚才那份「{label}」读完了："
+                tail = ""
+                if r.get("slow"):
+                    tail = (f"\n\n（这次读得比预期久：用了 {r.get('seconds', 0):.0f} 秒；"
+                            f"如果这已经超过 read.job_timeout，可以在 config.yaml 调大）")
+                send(head + "\n" + body + tail, r["chat"])
+        except Exception:
+            traceback.print_exc()
+
     def make_source():
         """建收消息的迭代器。
 
@@ -1640,6 +1851,23 @@ def main():
     # 「重启补齐」：只提示一次，别每条都发
     _catchup_announced = False
     _catchup_total = 0
+
+    # 上次有读取没读完（助手重启过）→ **如实说一句**，别假装读过
+    try:
+        _left = read_worker.startup_note()
+        if _left:
+            send(_left, control_chat)
+    except Exception:
+        traceback.print_exc()
+
+    # 三处临时目录的兜底清理（正常路径用完就删；这里防上次被强杀留下的残渣）。
+    # 每次都只 listdir + 按时间删，**删了什么各自会打日志**（静默丢弃不允许）。
+    for _mod_name in ("image_read", "video_read", "archive_read", "mail_read"):
+        try:
+            _mod = __import__(_mod_name)
+            _mod.sweep_tmp()
+        except Exception as e:
+            print(f"[bot] ⚠️ {_mod_name}.sweep_tmp 失败（不影响启动）：{e}")
 
     source = make_source()
 
@@ -1841,6 +2069,14 @@ def main():
                                  f"（**不是**「ok」，本地执行只认「确认/确定/确认发送」），"
                                  f"不跑请回「不发」。\n命令原文：{head.get('cmd') or ''}", sender)
                             continue
+                        # 群发**两道确认**：范围那一步和内容那一步都只认明确的中文
+                        # 确认词。理由同类：群发一口气发给 N 个人、内容还不是用户写的，
+                        # 在控制会话里随口一句「ok」就发出去太危险（真机踩过手滑）。
+                        if head.get("kind") in ("broadcast_scope", "broadcast") \
+                                and not is_strict_confirm(query):
+                            send("这条是群发确认。要继续请回「确认」（**不是**「ok」），"
+                                 "不发了请回「不发」。", sender)
+                            continue
                         # 既没点号、也不是确认词（例如一句带数字的闲聊）：不当成确认
                         if want is None and not is_confirm(query):
                             pending_sel = None
@@ -1849,6 +2085,33 @@ def main():
                             # 队列已经变了就**立刻**落盘：否则「这条已经执行了」
                             # 和「盘上还记着它」之间有窗口，崩溃重启会把它恢复出来。
                             save_pending(pending_chats, cfg)
+                    if item and item.get("kind") == "broadcast_scope":
+                        # 第一道确认（范围）已过 -> 现在才**生成内容**并分流。
+                        # 这一段不过模型：范围是用户亲自确认的，剩下只是照做。
+                        report, berr = agent_tools.finish_broadcast(
+                            wcf, sender, item, llm, cfg)
+                        if berr:
+                            send(f"群发没有进行：{berr}", sender)
+                            continue
+                        send(report, sender)
+                        print(f"[bot] 群发范围已确认 -> {len(item.get('items') or [])} 人")
+                        continue
+                    if item and item.get("kind") == "broadcast":
+                        # 第二道确认（内容）已过 -> 逐条发出。**逐字发预览里那一条**。
+                        batch = list(item.get("items") or [])
+                        try:
+                            interval = max(0.0, float(
+                                (cfg.get("agent") or {}).get("send_interval", 1.5)))
+                        except (TypeError, ValueError):
+                            interval = 1.5
+                        n, err = agent_tools.send_pending(wcf, item, interval)
+                        if err is not None:
+                            print(f"[bot] 群发失败（已发 {n}/{len(batch)}）: {err}")
+                            send(f"群发只发出了 {n}/{len(batch)} 条。{err}", sender)
+                        else:
+                            print(f"[bot] 群发完成 {n} 条")
+                            send(f"群发 {n} 条已发出（逐条按上面那段原文发的）。", sender)
+                        continue
                     if item and item.get("kind") == "shell":
                         # 本地执行：用户回「确认」才真跑。shell 没有收件人——绝不走
                         # send_pending、也绝不发给 item["to_wxid"]（它是空的），
@@ -1929,6 +2192,11 @@ def main():
                         # 固定追一句真话。**别删**——真机上就是这么骗到用户的。
                         answer = with_shell_truth_note(
                             answer, run_state.get("shell_queued", False))
+                        # 图片那边的如实说明（比如"这一轮已经给了 3 张，这张没给"）
+                        answer = with_image_notes(answer, run_state.get("image_notes"))
+                        # 群发预览**原样**带上（模型转述十条例文必走样）。
+                        answer = with_broadcast_preview(
+                            answer, run_state.get("broadcast_preview", ""))
                     else:
                         answer = llm.chat(system,
                                           history + [{"role": "user", "content": prompt}])

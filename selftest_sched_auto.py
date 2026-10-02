@@ -21,6 +21,7 @@ if _HERE not in sys.path:
 
 import auto_reply          # noqa: E402
 import agent_tools         # noqa: E402
+import groups              # noqa: E402
 import scheduler           # noqa: E402
 import settings            # noqa: E402
 import watch               # noqa: E402
@@ -416,13 +417,16 @@ def t8_usage_matches_impl():
     chk("开|关 —— 总开关" in scheduler._USAGE and "编号|all" not in scheduler._USAGE,
         "定时文案不再承诺 /定时 开|关 <编号|all>")
     # 文案里承诺的每个子命令，都要在 handle_command 里真的有人接
-    for frag in ("/auto on | off", "add", "del", "mode", "review", "ctx"):
+    for frag in ("/auto on | off", "add", "del", "mode", "persona", "address",
+                 "学习", "review", "ctx"):
         chk(frag in auto_reply._USAGE, f"auto 文案里有 {frag!r}")
     # 更硬的一条：文案里的子命令必须真的被 handle_command 认（走一遍）
     with TempSettings({"auto_reply": {"chats": [{"wxid": "wxid_z", "name": "张三"}]}}):
         cfg = settings.effective({})
         client = FakeClient(_CONTACTS)
-        for arg in ("status", "review on", "review off", "ctx 25", "mode 张三 self"):
+        for arg in ("status", "review on", "review off", "ctx 25", "mode 张三 self",
+                    "persona 张三 随便点", "persona 全局 正式一点", "persona 张三 学习",
+                    "address 张三 老张", "address 张三", "address 张三 学习"):
             out, _ch = auto_reply.handle_command(arg, cfg, client)
             chk("用法：" not in out,
                 f"/auto {arg} 有实现、不该回用法（实际 {out[:40]!r}）")
@@ -439,7 +443,7 @@ def t8_usage_matches_impl():
         chk(not ch_del and "没有编号" in out_del, "/定时 删 <编号> 有实现")
 
 
-def _auto_tool_stub():
+def _auto_tool_stub(llm_factory=None):
     """只借 `ToolBox.t_auto_reply` 这一个方法，把它的依赖喂进来。
 
     这样测的是**真的工具层代码**（含范围校验），而不是另写一份等价逻辑。
@@ -447,16 +451,27 @@ def _auto_tool_stub():
 
     class _Stub:
         t_auto_reply = agent_tools.ToolBox.t_auto_reply
+        t_group = agent_tools.ToolBox.t_group
 
         def __init__(self):
             self.cfg = {}
             self.cfg_changed = False
             self.client = None
+            self.llm_factory = llm_factory
             # 每次实时读临时 settings，改动立刻可见（和生产里 cfg_provider 一致）
             self.cfg_provider = lambda: settings.effective({})
 
         def _resolve(self, who):
             return [{"wxid": "wxid_z", "name": "张三", "remark": ""}]
+
+        def _one(self, who):
+            """和真的 ToolBox._one 同形状：重名不静默取第一个。"""
+            cands = self._resolve(who)
+            if not cands:
+                return None, f"没找到「{who}」。"
+            if len(cands) > 1:
+                return None, f"「{who}」匹配到多个人：请用全名。"
+            return cands[0], None
 
     return _Stub()
 
@@ -464,7 +479,7 @@ def _auto_tool_stub():
 def t9_review_scope_is_explicit():
     """审核的范围必须**显式**：每会话一份，全局只是默认值。
 
-    真机踩过（2026-10-01）：用户说「给李同学加上自动回复，不用我同意内容」，
+    真机踩过（2026-10-01）：用户说「给李四加上自动回复，不用我同意内容」，
     模型调 `review` + `review=false` **没带 who** → 按 `/auto review` 的定义改了
     **全局默认**，于是**所有**自动回复会话的审核都被关了。
     根因不是模型撒谎（它其实补了一句「注意：审核是全局开关」），而是
@@ -516,7 +531,7 @@ def t9_review_scope_is_explicit():
 def t10_relative_time():
     """相对时间：「10分钟后 / 半小时后 / 2小时后 / 3天后」= **只触发一次**。
 
-    真机踩过（2026-10-01）：用户说「10分钟后给李同学发你好」，`parse_when` 里没有
+    真机踩过（2026-10-01）：用户说「10分钟后给李四发你好」，`parse_when` 里没有
     相对分支 → 掉到最下面的 `_hhmm()` 兜底 → `int("10分钟后")` 抛错 →
     工具回「时间「10分钟后」没看懂。例：9:00、09:30」，于是让用户改说具体时刻。
     **是缺分支，不是有意拒绝**（代码里连一条相关测试都没有）。
@@ -573,6 +588,569 @@ def t10_relative_time():
         "回归：「每周一 9:00」仍是每周")
 
 
+# ---------------- T11：每个人一份人设（/auto persona） ----------------
+
+class _CaptureLLM:
+    """把 system prompt 抓下来——用来验证「自定义人设真的进了提示词」。"""
+
+    def __init__(self, raw="好"):
+        self.raw = raw
+        self.system = None
+
+    def chat(self, system, messages):
+        self.system = system
+        return self.raw
+
+
+def t11_per_person_persona():
+    """每个人一套语气：/auto persona 单人 / 全局 / 清空 / 范围保护。
+
+    2026-10-01 用户提的：「回复每个人的时候都有一个不同的人设」。
+    生成那一半（`persona_for` / `make_reply`）本来就存在，缺的是**能改**的那一半——
+    /auto 没有 persona 子命令、工具也没有这个动作，只能手编 config.yaml。
+    这一条同时钉死两件事：
+      * 单人 / 全局 / 清空 三条路都真的落盘，且**整体替换**语义不变；
+      * mode（self/assistant）改叫**身份**、persona 才叫**人设**——
+        以前两个都叫「人设」，用户一定会改错东西。
+    """
+    print("T11. 每个人一份人设：单人 / 全局 / 清空 / 范围保护")
+    init = {"auto_reply": {"enabled": True, "chats": [
+        {"wxid": "wxid_z", "name": "张三", "mode": "self", "review": None, "persona": ""},
+        {"wxid": "wxid_zf", "name": "张三丰", "mode": "self", "review": None, "persona": ""},
+    ]}}
+    with TempSettings(init) as tmp:
+        client = FakeClient(_CONTACTS)
+
+        # 每条命令都**重新读一次配置**再跑：生产里 bot 就是这么做的
+        # （bot.handle_command 的 /auto 分支、工具的 cfg_provider 都是实时读）。
+        # 拿旧快照当基准会把上一条命令的改动写回去丢掉——`_save` 的注释里
+        # 专门写了这一点，测试也得按真实用法走。
+        def run(arg):
+            return auto_reply.handle_command(arg, settings.effective({}), client)
+
+        # 1) 单人：设 → 落盘在**那个人的条目**里（不是另造一个键）
+        out, ch = run("persona 张三 跟张三别那么正式，随便点")
+        chk(ch and "随便点" in out, "单人设人设有回执")
+        rec_z = [r for r in tmp.read()["auto_reply"]["chats"]
+                 if r["wxid"] == "wxid_z"][0]
+        chk(rec_z["persona"] == "跟张三别那么正式，随便点", "人设落盘到那个人的条目里")
+
+        # 2) 最长前缀：名单里同时有「张三」和「张三丰」时不许认错人
+        run("persona 张三丰 对张三丰要用敬语")
+        chats = auto_reply.chats(settings.effective({}))
+        chk("敬语" in chats["wxid_zf"]["persona"] and
+            "敬语" not in chats["wxid_z"]["persona"],
+            "「张三丰」认到张三丰，没被「张三」前缀吃掉")
+
+        # 3) 不带描述 = 查看（不改配置）
+        out, ch = run("persona 张三")
+        chk(not ch and "随便点" in out, "不带描述 = 看当前人设，不改配置")
+
+        # 4) 名单外的人：拒绝，**绝不顺手 add**
+        #    （顺手加人 = 替用户决定要不要自动回复这个人，正是要堵的「静默扩大影响面」）
+        before = len(auto_reply.chat_list(settings.effective({})))
+        out, ch = run("persona 李四 客气点")
+        chk(not ch and "名单里没有" in out and "add" in out,
+            f"名单外的人被拒并给出下一步（实际 {out[:40]!r}）")
+        chk(len(auto_reply.chat_list(settings.effective({}))) == before,
+            "拒绝时**没有**偷偷把人加进自动回复名单")
+
+        # 5) 裸 /auto persona → 用法（别拿空串去查名单）
+        out, ch = run("persona")
+        chk(not ch and "用法：" in out, "裸 /auto persona 回用法，不崩")
+
+        # 6) 全局：写进 settings.json 的 persona_self，**不碰** assistant
+        run("persona 全局 你回所有人时简短直接一点")
+        s = settings.load()["auto_reply"]
+        chk("简短直接" in s.get("persona_self", ""), "全局 self 人设落盘")
+        chk("persona_assistant" not in s, "没说要 assistant 就不动它（不静默扩大范围）")
+        run("persona 全局 assistant 你是我的助理，礼貌简洁")
+        chk("助理" in settings.load()["auto_reply"]["persona_assistant"],
+            "全局 assistant 人设可以单独设")
+
+        # 7) 分层：单人**整体替换**全局；没单独设的人吃全局
+        c = settings.effective({})
+        own = auto_reply.persona_for(auto_reply.chats(c)["wxid_z"], auto_reply.section(c))
+        chk(own.startswith("跟张三别那么正式") and "简短直接" not in own,
+            "单人是整体替换（全局那句不参与拼接）")
+        chk("简短直接" in auto_reply.persona_for({"mode": "self"}, auto_reply.section(c)),
+            "没单独设的人吃全局默认")
+
+        # 8) 真的进了 system prompt（不然前面全是自说自话）
+        llm = _CaptureLLM()
+        auto_reply.make_reply(
+            llm, {"wxid": "wxid_z", "mode": "self", "persona": "跟张三别那么正式，随便点"},
+            [{"content": "在吗", "is_self": 0, "sender": "wxid_z", "time": "10-01 08:00"}],
+            {}, c)
+        chk("随便点" in (llm.system or ""), "自定义人设真的进了 system prompt")
+
+        # 9) 全局「清空」= **删键**。写空串会盖住 config.yaml 那份，
+        #    于是「恢复默认」反而变成「config.yaml 也不生效、只剩代码兜底」。
+        run("persona 全局 self 清空")
+        s = settings.load()["auto_reply"]
+        chk("persona_self" not in s and "persona_assistant" in s,
+            "清空全局 self = 删掉那个键（assistant 那份留着）")
+        chk(auto_reply.section(settings.effective(
+            {"auto_reply": {"persona_self": "config 里的"}})).get("persona_self") == "config 里的",
+            "删键之后 config.yaml 那份重新生效")
+
+        # 10) 单人「清空」= 回到默认那一份
+        run("persona 张三 清空")
+        chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == "",
+            "单人清空后记录里是空串（走回默认）")
+
+        # 11) 太长**如实拒绝**，不静默截断（截断可能正好切掉「不确定别编」）
+        out, ch = run("persona 张三 " + "很" * 400)
+        chk(not ch and "太长" in out, "超长如实拒绝")
+        chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == "",
+            "拒绝时没留下半截人设")
+
+    # 12) 工具层：漏 who 不许静默改全局（和 T9 的审核同一条规矩）
+    init2 = {"auto_reply": {"enabled": True, "chats": [
+        {"wxid": "wxid_z", "name": "张三", "mode": "self", "review": None, "persona": ""}]}}
+    with TempSettings(init2):
+        tb = _auto_tool_stub()
+        out = tb.t_auto_reply({"action": "persona", "persona": "随便点"})
+        chk("范围" in out, f"persona 不带 who → 要求先说范围（实际 {out[:40]!r}）")
+        chk("persona_self" not in settings.load().get("auto_reply", {}),
+            "漏 who 时全局人设**没被动**")
+
+        out = tb.t_auto_reply({"action": "persona", "who": "张三",
+                               "persona": "用第一人称、别暴露你是 AI、口语简短"})
+        chk(tb.cfg_changed, "工具带 who 时真的改了配置")
+        chk("第一人称" in auto_reply.chats(settings.effective({}))["wxid_z"]["persona"],
+            "工具把人设写到了那个人身上")
+        chk("张三" in out, "回执里点名了这个人（模型能如实复述）")
+
+        tb.t_auto_reply({"action": "persona", "who": "全局",
+                         "persona": "回所有人时都客气一点"})
+        chk("客气一点" in settings.load()["auto_reply"].get("persona_self", ""),
+            "只有显式 who=全局 才改全局默认")
+
+
+# ---------------- T12：从历史对话里学语气 ----------------
+
+class _HistoryStub:
+    """替掉 `live_history.query_contact_history`：喂固定历史，并记录调用参数。
+
+    这里只替**这一个库调用**（本用例要测的是学习逻辑，不是 SQL）；
+    顺带把「只查一次、查的是那个人的会话、limit 用配置值」这几条契约钉住。
+    """
+
+    def __init__(self, msgs):
+        self.msgs = list(msgs)
+        self.calls = []
+
+    def __call__(self, client, talker, limit=50, keyword=None):
+        self.calls.append((talker, limit))
+        return list(self.msgs)
+
+
+class _LearnLLM:
+    """假模型：把 system / prompt 抓下来，供断言「送出去的到底是谁的话」。"""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.system = None
+        self.prompt = None
+        self.calls = 0
+
+    def chat(self, system, messages):
+        self.calls += 1
+        self.system = system
+        self.prompt = messages[0]["content"]
+        return self.raw
+
+
+def _hist(n_mine=8, n_theirs=8, extra=()):
+    """一段混合历史：我说的话 + 对方的话（+ 可选的别的类型）。"""
+    msgs = []
+    for i in range(max(n_mine, n_theirs)):
+        if i < n_mine:
+            msgs.append({"content": f"我说的话{i}", "is_self": 1, "local_type": 1,
+                         "time": f"10-01 09:{i:02d}"})
+        if i < n_theirs:
+            msgs.append({"content": f"对方的话{i}", "is_self": 0, "local_type": 1,
+                         "time": f"10-01 09:{i:02d}"})
+    msgs.extend(extra)
+    return msgs
+
+
+_LEARNED = ("你正在代替我本人回复消息。用第一人称、口语简短、不要暴露你是 AI，"
+            "不确定的事别编。对这个人说话很随意，爱开玩笑，常用「行」「哈哈」。")
+
+
+def t12_learn_persona_from_history():
+    """「开启自动回复之后，AI 能从历史对话学出对这个人的语气」。
+
+    2026-10-01 用户提的。几条要害：
+      * **只送我自己发出去的话**给模型（要复制的是我对这个人怎么说话；
+        对方的话没信息量，还白多送一份隐私出去）；
+      * 加进名单时自动学一次，但**绝不许盖掉已经设过的人设**——
+        用户明说「重新学习」才覆盖；
+      * 学不成（没 key / 没历史 / 读库出错）**如实说**，绝不假装学好了，
+        而且**不影响加人**（人照样进名单，先用默认人设）。
+    """
+    print("T12. 学语气：只用我自己的话 / 不覆盖已有 / 学不成如实说")
+    real_qch = auto_reply.live_history.query_contact_history
+    try:
+        stub = _HistoryStub(_hist(extra=[{"content": "[图片]", "is_self": 1,
+                                          "local_type": 3, "time": "10-01 10:00"}]))
+        auto_reply.live_history.query_contact_history = stub
+
+        init = {"auto_reply": {"enabled": True, "chats": [
+            {"wxid": "wxid_l", "name": "李四", "mode": "self", "review": None,
+             "persona": ""}]}}
+        with TempSettings(init) as tmp:
+            client = FakeClient(_CONTACTS)
+            llm = _LearnLLM(_LEARNED)
+
+            # 1) /auto add 新的人 → 自动学一次
+            out, changed = auto_reply.handle_command(
+                "add 张三", settings.effective({}), client,
+                llm_factory=lambda: llm)
+            chk(changed and "已加入自动回复" in out, "加人本身成功")
+            rec = auto_reply.chats(settings.effective({}))["wxid_z"]
+            chk(rec["persona"] == _LEARNED, "加进来时就学到了人设")
+            chk(rec["persona_source"] == "learned" and rec["persona_n"] == 8,
+                f"来源和样本数记对了（source={rec.get('persona_source')!r}, "
+                f"n={rec.get('persona_n')!r}）：图片那条不算语气样本")
+            chk(len(stub.calls) == 1 and stub.calls[0][0] == "wxid_z",
+                f"只读了一次库、且查的是那个人的会话（实际 {stub.calls}）")
+            chk(stub.calls[0][1] == auto_reply.LEARN_SAMPLE,
+                f"limit 用默认样本数（实际 {stub.calls[0][1]}）")
+
+            # 2) **只把我自己的话送出去**
+            chk("我说的话0" in (llm.prompt or ""), "样本里有我自己发的话")
+            chk("对方的话0" not in (llm.prompt or ""),
+                "对方的话**一个都没有**送出去（学的是我的语气，也少送一份隐私）")
+            chk("第一人称" in (llm.system or "") and "不要暴露自己是 AI" in (llm.system or ""),
+                "学习提示词里要求把底线一并写进人设（整体替换会连底线一起换掉）")
+
+            # 3) 再 add 一次：已有学来的人设 → **不动**，也不该多花一次模型调用
+            calls_before = llm.calls
+            out, _ch = auto_reply.handle_command(
+                "add 张三", settings.effective({}), client, llm_factory=lambda: llm)
+            chk(llm.calls == calls_before, "已有人设时不再学（不白花模型调用）")
+            chk("人设没动" in out, f"并且明说人设没动（实际 {out[-60:]!r}）")
+
+            # 4) 手写的人设更不许被盖
+            auto_reply.handle_command("persona 张三 我手写的语气", settings.effective({}),
+                                      client)
+            rec = auto_reply.chats(settings.effective({}))["wxid_z"]
+            chk(rec["persona"] == "我手写的语气" and rec["persona_source"] == "manual",
+                "手写的人设记成 manual")
+            auto_reply.handle_command("add 张三", settings.effective({}), client,
+                                      llm_factory=lambda: llm)
+            chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == "我手写的语气",
+                "手写的人设**没被**自动学习盖掉")
+
+            # 5) 用户明说「重新学习」才覆盖
+            llm.raw = "你正在代替我本人回复。第一人称、口语简短、别暴露你是 AI。很正式。"
+            out, changed = auto_reply.handle_command(
+                "persona 张三 重新学习", settings.effective({}), client,
+                llm_factory=lambda: llm)
+            rec = auto_reply.chats(settings.effective({}))["wxid_z"]
+            chk(changed and rec["persona"].startswith("你正在代替我本人回复。第一人称"),
+                "明说重新学习才覆盖")
+            chk(rec["persona_source"] == "learned", "覆盖后来源改回 learned")
+
+            # 6) 学不成要如实说，绝不假装学好
+            few = _HistoryStub(_hist(n_mine=2, n_theirs=3))
+            auto_reply.live_history.query_contact_history = few
+            auto_reply.handle_command("persona 张三 清空", settings.effective({}), client)
+            before = auto_reply.chats(settings.effective({}))["wxid_z"]["persona"]
+            out, changed = auto_reply.handle_command(
+                "persona 张三 学习", settings.effective({}), client,
+                llm_factory=lambda: llm)
+            chk(not changed and "学不出语气" in out,
+                f"样本不够时如实说学不出（实际 {out[:50]!r}）")
+            chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == before,
+                "学不成时人设一个字都没动")
+
+            # 7) 没有模型能力：明说学不了，不是静默成功
+            out, changed = auto_reply.handle_command(
+                "persona 张三 学习", settings.effective({}), client, llm_factory=None)
+            chk(not changed and ("学不了" in out or "没接模型" in out),
+                f"没接模型时如实说（实际 {out[:50]!r}）")
+
+            # 8) 全局没有可学的历史：拦住，别把「学习」俩字当人设正文存进去
+            out, changed = auto_reply.handle_command(
+                "persona 全局 学习", settings.effective({}), client,
+                llm_factory=lambda: llm)
+            chk(not changed and "没法从历史里学" in out,
+                f"全局「学习」被拦住（实际 {out[:40]!r}）")
+            chk("persona_self" not in settings.load()["auto_reply"],
+                "没有把「学习」两个字当成全局人设存下来")
+
+            # 9) 学出来的太长：按句末截断，并且**说出来**
+            auto_reply.live_history.query_contact_history = stub
+            llm.raw = "语气随意。" * 100          # 600 字，远超 PERSONA_MAX
+            out, changed = auto_reply.handle_command(
+                "persona 张三 重新学习", settings.effective({}), client,
+                llm_factory=lambda: llm)
+            rec = auto_reply.chats(settings.effective({}))["wxid_z"]
+            chk(changed and len(rec["persona"]) <= auto_reply.PERSONA_MAX,
+                f"超长被压到上限内（实际 {len(rec['persona'])} 字）")
+            chk("太长" in out, "压过之后明确告诉用户（不许静默改内容）")
+            _ = tmp
+
+        # 10) 工具层：学语气必须点名是谁；带 who 时走真的工具代码
+        stub2 = _HistoryStub(_hist())
+        auto_reply.live_history.query_contact_history = stub2
+        init2 = {"auto_reply": {"enabled": True, "chats": [
+            {"wxid": "wxid_z", "name": "张三", "mode": "self", "review": None,
+             "persona": ""}]}}
+        with TempSettings(init2):
+            tb = _auto_tool_stub(llm_factory=lambda: _LearnLLM(_LEARNED))
+            tb.client = FakeClient(_CONTACTS)
+            out = tb.t_auto_reply({"action": "learn"})
+            chk("是谁" in out, f"learn 不带 who 被拦住（实际 {out[:40]!r}）")
+            chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == "",
+                "拦住时没有乱学")
+
+            out = tb.t_auto_reply({"action": "learn", "who": "张三"})
+            chk(tb.cfg_changed, "带 who 的 learn 真的改了配置")
+            chk(auto_reply.chats(settings.effective({}))["wxid_z"]["persona"] == _LEARNED,
+                "工具层学到了人设（走的是 handle_command 同一条实现）")
+            chk("学到" in out or "学出" in out, "回执里说了是学到的（模型能如实复述）")
+    finally:
+        auto_reply.live_history.query_contact_history = real_qch
+
+
+def t13_address_from_history():
+    """从聊天记录识别「我平时怎么称呼他」，并且拿它当别名解析联系人。
+
+    2026-10-01 用户提的。要害：
+      * 称呼和人设**分开存、分开注入**——用户重写/手写人设时，称呼不该跟着丢；
+      * `/auto address 谁 学习` **一个字都不动人设**（连 persona_source 都不许动，
+        否则用户以后分不清哪段是自己写的）；
+      * 模型没按 JSON 走（老格式/散文）时，**人设照学、称呼一个都不许猜**——
+        猜错会让「给老张发消息」发错人；
+      * 称呼当别名时，**和库里的精确匹配合并**：万一另一个人备注真叫「老张」，
+        必须交给重名保护去问，绝不能静默挑一个。
+    """
+    print("T13. 称呼：从历史识别 / 独立于人设 / 当别名解析")
+    real_qch = auto_reply.live_history.query_contact_history
+    try:
+        stub = _HistoryStub(_hist())
+        auto_reply.live_history.query_contact_history = stub
+
+        init = {"auto_reply": {"enabled": True, "chats": [
+            {"wxid": "wxid_z", "name": "张三", "mode": "self", "review": None,
+             "persona": ""}]}}
+        with TempSettings(init) as tmp:
+            client = FakeClient(_CONTACTS)
+
+            def run(arg, llm_factory=None):
+                return auto_reply.handle_command(arg, settings.effective({}), client,
+                                                 llm_factory=llm_factory)
+
+            def rec_z():
+                return auto_reply.chats(settings.effective({}))["wxid_z"]
+
+            # 1) 模型按 JSON 给两样 → 称呼和人设**一起**学到
+            llm = _LearnLLM('{"address": "老张", "persona": '
+                            '"你正在代替我本人回复。第一人称、简短、别暴露你是 AI。"}')
+            out, changed = run("persona 张三 学习", llm_factory=lambda: llm)
+            chk(changed and rec_z()["address"] == "老张", "学到了称呼")
+            chk(rec_z()["address_source"] == "learned", "称呼来源记成 learned")
+            chk(rec_z()["persona"].startswith("你正在代替我本人回复"), "人设也学到了")
+            chk("老张" in out, "回执里说出了称呼（模型能如实复述）")
+
+            # 2) 回复时**独立注入**：手写人设也不会把称呼弄丢
+            msgs = [{"content": "在吗", "is_self": 0, "sender": "wxid_z",
+                     "time": "10-01 08:00"}]
+            cap = _CaptureLLM()
+            auto_reply.make_reply(cap, rec_z(), msgs, {}, settings.effective({}))
+            chk("老张" in (cap.system or ""), "回复提示词里带上了称呼")
+            hand = {"wxid": "wxid_z", "mode": "self", "address": "老张",
+                    "persona": "我手写的人设：第一人称、别暴露你是 AI、简短。"}
+            cap2 = _CaptureLLM()
+            auto_reply.make_reply(cap2, hand, msgs, {}, settings.effective({}))
+            chk("老张" in (cap2.system or ""), "手写人设时称呼照样注入（独立于 persona）")
+
+            # 3) `/auto address 谁 学习`：只学称呼，**人设和它的来源都不许动**
+            before_persona = rec_z()["persona"]
+            before_src = rec_z()["persona_source"]
+            before_n = rec_z()["persona_n"]
+            llm.raw = ('{"address": "张哥", "persona": "这段人设一个字都不该被写进去"}')
+            out, changed = run("address 张三 学习", llm_factory=lambda: llm)
+            chk(changed and rec_z()["address"] == "张哥", "只学称呼时称呼确实更新了")
+            chk(rec_z()["persona"] == before_persona, "人设正文一个字没动")
+            chk(rec_z()["persona_source"] == before_src and rec_z()["persona_n"] == before_n,
+                "人设的**来源**也没被改成 learned（否则用户分不清哪段是自己写的）")
+
+            # 4) 模型没按 JSON 走：人设照学，称呼**不许猜**、保持原样
+            llm.raw = "你正在代替我本人回复。第一人称、口语简短、别暴露你是 AI。"
+            out, _ch = run("persona 张三 重新学习", llm_factory=lambda: llm)
+            chk(rec_z()["persona"].startswith("你正在代替我本人回复"), "散文格式照样学人设")
+            chk(rec_z()["address"] == "张哥", "没按 JSON 走时**不猜称呼**，原来那个保持不动")
+
+            # 5) 模型说「没有固定称呼」= 有效的学习结果（空串，不是 None）
+            llm.raw = '{"address": "", "persona": "你正在代替我本人回复。第一人称、简短。"}'
+            run("persona 张三 重新学习", llm_factory=lambda: llm)
+            chk(rec_z()["address"] == "", "空串 = 模型明确说没固定称呼，照实存下来")
+            cap3 = _CaptureLLM()
+            auto_reply.make_reply(cap3, rec_z(), msgs, {}, settings.effective({}))
+            chk("怎么称呼对方" not in (cap3.system or ""), "没称呼时提示词里不提称呼")
+
+            # 6) 模型给的称呼太长 → 当没有处理（并说出来），**不许截一半存**
+            llm.raw = ('{"address": "' + "老" * 30 + '", '
+                       '"persona": "你正在代替我本人回复。第一人称、简短。"}')
+            out, _ch = run("persona 张三 重新学习", llm_factory=lambda: llm)
+            chk(rec_z()["address"] == "", "超长称呼按「没有称呼」处理，没存半截")
+            chk("太长" in out, "并且明确告诉了用户")
+
+            # 7) 手写称呼 + 清空
+            out, changed = run("address 张三 老张")
+            chk(changed and rec_z()["address"] == "老张", "手写称呼落盘")
+            chk(rec_z()["address_source"] == "manual", "手写来源记成 manual")
+            bad, _ch = run("address 张三 " + "老" * 30)
+            chk("太长" in bad, "手写超长称呼如实拒绝")
+            chk(rec_z()["address"] == "老张", "拒绝时没写进去")
+
+            st = auto_reply.status_text(settings.effective({}))
+            chk("称呼=你设的:老张" in st, f"状态里能看到称呼（实际 {st.splitlines()[-1]!r}）")
+
+            run("address 张三 清空")
+            chk(rec_z()["address"] == "", "清空后不再套称呼")
+
+            # 8) 用**称呼**当名字操作（用户心里他就叫老张）
+            run("address 张三 老张")
+            out, changed = run("address 老张")          # 用称呼反查这个人
+            chk(not changed and "老张" in out and "张三" in out,
+                f"能用称呼查这个人（实际 {out[:40]!r}）")
+            out, changed = run("review off 老张")
+            chk(changed and rec_z()["review"] is False, "「/auto review … 老张」认得出是谁")
+
+            # 9) 称呼当**别名**：联系人解析能认（「给老张发消息」）
+            aliases = auto_reply.address_aliases(settings.effective({}))
+            chk(aliases.get("老张"), f"称呼表里有老张（实际 {aliases}）")
+            cands = agent_tools.resolve_contacts(_CONTACTS, "老张", aliases=aliases)
+            chk(len(cands) == 1 and cands[0]["wxid"] == "wxid_z",
+                f"「老张」解析到张三（实际 {cands}）")
+            chk("张三" in str(cands[0].get("remark") or cands[0].get("name")),
+                "用的是联系人表里的完整记录（备注是真的）")
+
+            # 10) **别人备注真叫「老张」时不许静默挑一个**
+            clash = list(_CONTACTS) + [{"wxid": "wxid_o", "name": "老王", "remark": "老张"}]
+            cands2 = agent_tools.resolve_contacts(clash, "老张", aliases=aliases)
+            chk(len(cands2) == 2, f"称呼和备注撞了 → 两个候选都摆出来（实际 {cands2}）")
+            one, err = agent_tools.resolve_one(clash, "老张", aliases=aliases)
+            chk(one is None and err and "多个人" in err,
+                f"这种情况必须问用户，不能猜（实际 {err!r}）")
+
+            # 11) 工具层：action=address
+            tb = _auto_tool_stub()
+            tb.client = client
+            out = tb.t_auto_reply({"action": "address"})
+            chk("是谁" in out, f"address 不带 who 被拦住（实际 {out[:40]!r}）")
+            out = tb.t_auto_reply({"action": "address", "who": "全局", "address": "老张"})
+            chk("按人" in out, f"address 不接受「全局」（实际 {out[:40]!r}）")
+            out = tb.t_auto_reply({"action": "address", "who": "张三", "address": "张哥"})
+            chk(tb.cfg_changed and rec_z()["address"] == "张哥",
+                "工具层成功设了称呼（走的是 handle_command 同一条实现）")
+            _ = tmp
+    finally:
+        auto_reply.live_history.query_contact_history = real_qch
+
+
+def t14_groups():
+    """分组：自己维护的名单，群发按组发。
+
+    分组本身**不发消息、不碰库**（纯配置），所以这里只管两件事：
+      * 增删改查真的落到 settings.json 的 groups 段、和 config.yaml 合并得上；
+      * 一个名字对不上时**整批拒绝**——只加一半、剩下的悄悄算了，
+        用户以后按组群发时才发现少了人，而那时消息已经发出去了。
+    """
+    print("T14. 分组：建 / 加 / 移 / 删 + 整批拒绝")
+    with TempSettings({"groups": {}}) as tmp:
+        client = FakeClient(_CONTACTS)
+
+        def run(arg):
+            return groups.handle_command(arg, settings.effective({}), _resolve_one)
+
+        def names_of(g):
+            return [m["name"] for m in groups.members(settings.effective({}), g)]
+
+        # 1) 建组：人解析成 wxid 存下来（不是存昵称）
+        out, ch = run("建 大学同学 张三、李四")
+        chk(ch and "已建分组" in out, f"建组成功（实际 {out[:40]!r}）")
+        disk = tmp.read()["groups"]
+        chk([m["wxid"] for m in disk["大学同学"]] == ["wxid_z", "wxid_l"],
+            f"落盘的是 wxid（实际 {disk}）")
+        chk(names_of("大学同学") == ["张三", "李四"], "显示名也存了（不用再查库）")
+
+        # 2) 加人：组不存在就建（「把王五加进『老同事』」不该逼用户先建组）
+        out, ch = run("加 老同事 老同学群")
+        chk(ch and "已建分组" in out and names_of("老同事") == ["老同学群"],
+            f"往不存在的组加人会顺手建组（实际 {out[:40]!r}）")
+
+        # 3) 重复加不叠人
+        out, ch = run("加 大学同学 张三")
+        chk(not ch and "本来就有" in out, f"重复加不重复落（实际 {out[:40]!r}）")
+        chk(names_of("大学同学") == ["张三", "李四"], "人数没变")
+
+        # 4) 一个名字对不上 -> **整批拒绝**，一个人都不许进去
+        before = names_of("大学同学")
+        out, ch = run("加 大学同学 李四、查无此人")
+        chk(not ch and "一个人都没动" in out and "查无此人" in out,
+            f"有人对不上就整批拒绝（实际 {out[:60]!r}）")
+        chk(names_of("大学同学") == before, "拒绝时组里一个人都没多")
+        chk("没找到「查无此人」" in out and "「查无此人」没找到「查无此人」" not in out,
+            f"错误文案不套两层人名（实际 {out[:50]!r}）")
+        _ = client
+
+        # 5) 组名带空格：要给**针对性**的提示，不能只回一句「没找到」
+        out, ch = run("建 大学 同学 张三")
+        chk(not ch and "组名不能带空格" in out, f"组名带空格有针对性提示（实际 {out[:50]!r}）")
+
+        # 6) 移人；移空了就把组删掉（留个空组只会在群发时撞「没有收件人」）
+        out, ch = run("移 老同事 老同学群")
+        chk(ch and "已经把组删掉" in out and groups.members(settings.effective({}), "老同事") is None,
+            f"移空后组被删掉（实际 {out[:50]!r}）")
+
+        out, ch = run("移 大学同学 张三")
+        chk(ch and names_of("大学同学") == ["李四"], "移人只动那一个")
+        out, ch = run("移 大学同学 李四")
+        chk(ch and groups.members(settings.effective({}), "大学同学") is None, "移空了同样删组")
+
+        # 7) 删组：人本身不动
+        run("建 家人 张三")
+        out, ch = run("删 家人")
+        chk(ch and "人本身没动" in out and "家人" not in tmp.read()["groups"],
+            f"删组只删组（实际 {out[:40]!r}）")
+        out, ch = run("删 没这个组")
+        chk(not ch and "没有" in out, "删不存在的组如实说")
+
+        # 8) 状态：空组有引导语；有组时列出成员
+        out, _ch = run("删 大学同学")
+        chk("还没有任何分组" in run("")[0], "空分组时给建组引导")
+        run("建 大学同学 张三、李四")
+        st = run("")[0]
+        chk("大学同学（2 人）" in st and "张三、李四" in st, f"状态列出组和成员（实际 {st[:60]!r}）")
+        chk(groups.summary_line(settings.effective({})).startswith("分组（1）"),
+            "摘要行给 agent 工具复述用")
+
+        # 9) build_arg：工具和命令走同一条实现
+        chk(groups.build_arg("add", group="大学同学", who="张三") == "建 大学同学 张三",
+            groups.build_arg("add", group="大学同学", who="张三"))
+        chk(groups.build_arg("remove", group="大学同学", who="张三") == "移 大学同学 张三",
+            "build_arg: remove -> 移")
+        chk(groups.build_arg("del", group="大学同学") == "删 大学同学",
+            "build_arg: del -> 删")
+        chk(groups.build_arg("status") == "", "status 走空参 = 看列表")
+        # 工具层：建组；action 不认时如实报
+        tb = _auto_tool_stub()
+        tb.client = FakeClient(_CONTACTS)
+        out = tb.t_group({"action": "add", "group": "测试组", "who": "张三"})
+        chk(tb.cfg_changed and "测试组" in settings.load().get("groups", {}),
+            f"工具层建组真的落盘（实际 {out[:40]!r}）")
+        chk(groups.build_arg("不存在的动作") == "不存在的动作", "不认识的动作原样透传（命令里会回用法）")
+    return True
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -584,7 +1162,9 @@ def main():
                t3_bad_at_only_skips_itself, t4_mutual_exclusion,
                t5_group_reply_parsing, t6_transcript_speakers,
                t7_id_not_reused, t8_usage_matches_impl,
-               t9_review_scope_is_explicit, t10_relative_time):
+               t9_review_scope_is_explicit, t10_relative_time,
+               t11_per_person_persona, t12_learn_persona_from_history,
+               t13_address_from_history, t14_groups):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

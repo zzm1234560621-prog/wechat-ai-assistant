@@ -237,7 +237,17 @@ def _pick(row, key, idx):
 
 def _fmt_time(ts):
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+        v = int(ts)
+    except (TypeError, ValueError):
+        return str(ts)
+    # 库里**真有** create_time = 0 的脏行（2026-10-01 实测：张三那条会话的
+    # Msg_ 表里就有）。照原样格式化会输出 `1970-01-01 08:00:00`，模型会把它
+    # 当成「最早的一条消息」——问「最近 N 天说了什么」就可能以一条 1970 年的
+    # 记录开头。**时间不知道就说不知道，不许编一个时间出来。**
+    if v <= 0:
+        return "时间未知"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v))
     except Exception:
         return str(ts)
 
@@ -422,7 +432,7 @@ def _v3_contact_rows(client, where="", limit=20000):
     return out
 
 
-def _v3_query_history(client, talker, limit=50, keyword=None):
+def _v3_query_history(client, talker, limit=50, keyword=None, since=None, until=None):
     rows = []
     t = _q(talker)
     for db in _v3_msg_dbs(client):
@@ -432,6 +442,16 @@ def _v3_query_history(client, talker, limit=50, keyword=None):
         )
         if keyword:
             sql += f" AND {_like('StrContent', keyword)}"
+        # since / until = 只看这两个时刻之间（含端点）的消息，None = 那一侧不限。
+        # 过滤写在排序前面，行集先被缩小，所以便宜。
+        # ⚠️ **只给 since 是翻不到更早的**：它永远锚在「现在」，返回的永远是
+        # 最近 limit 条；要往更早看必须同时给 until（`read_history` 的往更早一批
+        # 就是这么做的）。2026-10-01 实测踩过：只给 days，days=10 和 days=30
+        # 返回的完全是同一批。
+        if since:
+            sql += f" AND CreateTime >= {int(since)}"
+        if until:
+            sql += f" AND CreateTime <= {int(until)}"
         sql += f" ORDER BY CreateTime DESC LIMIT {int(limit)}"
         try:
             for r in _query(client, db, sql):
@@ -441,6 +461,10 @@ def _v3_query_history(client, talker, limit=50, keyword=None):
                     "is_self": int(_pick(r, "IsSender", 2) or 0),
                     "time": _fmt_time(_pick(r, "CreateTime", 3)),
                     "_ts": int(_pick(r, "CreateTime", 3) or 0),
+                    # 这条 SQL 的 WHERE 里已经写死 `Type = 1`，所以返回的**全是文本**。
+                    # 显式给 1，好让 v3/v4 两条路的返回形状一致（下游按 local_type
+                    # 挑文本时不必再分后端）。
+                    "local_type": 1,
                 })
         except Exception:
             continue
@@ -655,7 +679,8 @@ def _v4_fts_session_id(client, talker):
     return None
 
 
-def _v4_history_from_fts(client, talker, limit=50, keyword=None):
+def _v4_history_from_fts(client, talker, limit=50, keyword=None, since=None,
+                         until=None):
     """从全文索引取某会话的历史。
 
     按 session_id 过滤是**便宜**的：过滤先把行集缩小到这个会话自己的消息，
@@ -663,6 +688,14 @@ def _v4_history_from_fts(client, talker, limit=50, keyword=None):
     直接 `WHERE local_type=1 ORDER BY create_time` —— 那要排全表。
 
     这条路径不依赖 message_0.db（实测它常常解析不出句柄）。
+
+    ⚠️ **`first_hit=True`（只查命中的那一个分片）是核对过的**，别再怀疑它：
+    2026-10-01 真机实测，**一个会话的消息只会落在某一个分片里**——
+    张三（session_id=2）的 6486 行全在 `message_fts_v4_1`，
+    李四（session_id=326）的 5997 行全在 `message_fts_v4_0`，其余分片都是 0 行。
+    而且这条路的返回确实是「该会话最新的 limit 条」（同一次实测：limit=30 拿到
+    30 条、limit=50 拿到 50 条），**它没有偷偷截断**。以前怀疑过这里，
+    真凶其实是「窗口按条数、不按时间」+ 上层把窗口跨度说成了用户问的时间范围。
     """
     if not _uses_fts(client):
         return []
@@ -670,6 +703,12 @@ def _v4_history_from_fts(client, talker, limit=50, keyword=None):
     if sid is None:
         return []
     where = f"session_id = {sid}"
+    # since / until = 只看这两个时刻之间（含端点）的消息，None = 那一侧不限。
+    # 会话过滤在前，所以加这两条不改变「快查询」这个性质（实测 0.2~0.3 秒）。
+    if since:
+        where += f" AND create_time >= {int(since)}"
+    if until:
+        where += f" AND create_time <= {int(until)}"
     if keyword:
         # 关键词检索只在文本里找——MATCH 打在非文本的摘要上没意义
         where += f" AND local_type = 1 AND acontent MATCH '{_q(keyword)}'"
@@ -677,14 +716,16 @@ def _v4_history_from_fts(client, talker, limit=50, keyword=None):
     return _v4_fts_rows(client, where, limit, {sid: talker}, self_id, first_hit=True)
 
 
-def _v4_query_history(client, talker, limit=50, keyword=None):
-    hits = _v4_history_from_fts(client, talker, limit, keyword)
+def _v4_query_history(client, talker, limit=50, keyword=None, since=None,
+                      until=None):
+    hits = _v4_history_from_fts(client, talker, limit, keyword, since, until)
     if hits:
         return hits
-    return _v4_history_from_tables(client, talker, limit, keyword)
+    return _v4_history_from_tables(client, talker, limit, keyword, since, until)
 
 
-def _v4_history_from_tables(client, talker, limit=50, keyword=None):
+def _v4_history_from_tables(client, talker, limit=50, keyword=None, since=None,
+                            until=None):
     """查该会话的 Msg_ 表。
 
     按 **local_id 倒序**（它是这张表的主键）——走 PK 索引，很便宜。
@@ -707,8 +748,23 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None):
             f"FROM {table}"
         )
         # 关键词检索只在文本里找（非文本那列是压缩十六进制，LIKE 没意义）
+        conds = []
         if keyword:
-            sql += f" WHERE local_type = 1 AND {_like('message_content', keyword)}"
+            conds.append(f"local_type = 1 AND {_like('message_content', keyword)}")
+        # since 过滤的不是索引列（create_time 在这张表里没索引），但过滤写进
+        # WHERE 之后 SQLite 可以沿 local_id 倒序边走边筛、凑够 limit 条就停；
+        # 最坏也就是把这张**会话自己的**表扫一遍（实测该表 COUNT/MIN/MAX
+        # 一次全扫 0.04 秒）。不违反 CLAUDE.md 铁律第 2 条——那条禁的是
+        # 「不带选择性过滤还排序」，这里过滤和排序都在会话表内。
+        if since:
+            conds.append(f"create_time >= {int(since)}")
+        # until = 只看这个时刻（含）以前的。**往更早翻页就靠它**：只给 since 的话
+        # 锚点永远是「现在」，返回的永远是最近 limit 条（实测 days=10 与 days=30
+        # 拿到的是同一批）。
+        if until:
+            conds.append(f"create_time <= {int(until)}")
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
         sql += f" ORDER BY local_id DESC LIMIT {int(limit)}"
         try:
             found = _query(client, db, sql)
@@ -1153,6 +1209,12 @@ def _v4_fts_rows(client, where, limit, smap, self_id, first_hit=False):
             "sender": name_map.get(sender, ""),
             "time": _fmt_time(_pick(r, "create_time", 3)),
             "_ts": _as_int(_pick(r, "create_time", 3)),
+            # 新加的字段（老调用方读 content/is_self/time/_ts 的行为一个字没变）。
+            # **必须带上**：fts 那条路上面已经把非文本渲染成 `[图片]` 这类标签了，
+            # 而 `content` 看上去和真文本没区别——下游（比如「从历史学语气」要挑出
+            # 用户自己发的**文本**）没有它就分不清「一句话」和「一张图的标签」。
+            # 走表那条路（_v4_history_from_tables）早就带了这个字段。
+            "local_type": lt,
         })
     out.sort(key=lambda m: m["_ts"])
     return out[-limit:]
@@ -1446,6 +1508,110 @@ def group_members(client, talker, owner=""):
     return []
 
 
+_SEARCH_KEY_SEP = "\x08"
+
+
+def labels_of_search_key(key):
+    """`contact_fts.db` 里 contact_fts_v5.search_key -> 这个人的**标签名**列表。
+
+    ⚠️ 2026-10-01 对着真实数据反解确认的结构（和 remark/nick/alias 逐行对拍过）。
+    整串固定 7 段、`\\x08` 分隔：
+
+        0 = 备注   1 = ''（实测恒空）  2 = 昵称
+        3 = **标签**（多个用英文逗号连，没有标签就是空串）
+        4 = 微信号(alias)   5 = 地区   6 = ''（实测恒空）
+
+    样本（右侧是 contact.db 里同一个人，用来对拍）：
+        ['王小明','','小桐 王小明','亲人','lww00000000','某市 某区','']
+            -> remark='王小明' nick='小桐 王小明' alias='lww00000000'
+        ['赵六  小学同学','','六哥','','zhangsan_002','某国 某市 ','']
+            -> 第 4 段是空的 = 这个人**没有**标签
+
+    段数不足 4 就返回空（**不猜**：布局对不上时宁可说「读不到标签」）。
+    """
+    parts = str(key or "").split(_SEARCH_KEY_SEP)
+    if len(parts) < 4:
+        return []
+    return [x.strip() for x in parts[3].split(",") if x.strip()]
+
+
+def _is4_quiet(client):
+    """`is_wechat4()` 的**不抛版本**：判不出来就当 False（=「读不到」）。
+
+    标签那两条查询要在**读不到时说「读不到」**，而不是把异常丢给上层——上层拿到
+    异常只能回一句「失败：…」，用户分不清是「你没有标签」还是「库没读上」。
+    连不上 hook 时 `is_wechat4` 自己会抛（它要探库），所以这里必须兜住。
+    """
+    try:
+        return bool(is_wechat4(client))
+    except Exception:
+        return False
+
+
+def label_names(client):
+    """微信自带的标签名 `[{"id","name"}]`（contact.db.contact_label，一次查询）。
+
+    **读不到就返回 `None`**，和「一个标签都没有」的 `[]` 分开：前者只能如实说
+    「读不到」（并提示可能是查库出问题），后者才能说「你还没建过标签」。
+    把两者混成一个空列表，用户会以为自己的标签丢了。
+
+    ⚠️ 这张表**只有标签本身**（id / 名字 / 排序），**没有成员**——所以
+    「谁在标签里」必须走 `contacts_in_label()`（成员藏在 contact_fts 的
+    search_key 第 4 段）。2026-10-01 把 22 个库的表名/列名全过了一遍，
+    只有这张表带 label，所以别再去找第二张表了。
+    """
+    if not _is4_quiet(client):
+        return None
+    try:
+        rows = _query(client, "contact.db",
+                      "SELECT label_id_, label_name_ FROM contact_label "
+                      "ORDER BY sort_order_, label_id_")
+    except Exception:
+        return None
+    out = []
+    for r in rows:
+        name = str(_pick(r, "label_name_", 1) or "").strip()
+        if name:
+            out.append({"id": str(_pick(r, "label_id_", 0) or ""), "name": name})
+    return out
+
+
+def contacts_in_label(client, label, limit=1000):
+    """微信某个标签下的人（wxid 列表）。**读不到返回 `None`**（和「没人」的 `[]` 分开）。
+
+    **两步，缺一不可**：
+      1. 用 `search_key LIKE %标签名%` 把候选缩小（一次 JOIN，见下）；
+      2. 再用 `labels_of_search_key()` **精确核对第 4 段**。
+
+    第 2 步不是保险，是必须的：实测标签「1」LIKE 命中 **412** 行，真成员只有
+    **1** 个——`gzh001` 这种微信号里的数字会把 LIKE 骗过去。少了一步就会把
+    412 个人当成「标签 1 的成员」，而群发是**不可逆**的。
+
+    JOIN 用 contact_fts.db 自己的 name2id（它的 rowid 就是 fts 的 rowid），
+    所以一条 SQL 就拿到 wxid，不用再解一层。
+    """
+    name = str(label or "").strip()
+    if not name or not _is4_quiet(client):
+        return None
+    sql = ("SELECT n.username AS u, f.search_key AS k FROM contact_fts_v5 f "
+           "JOIN name2id n ON n.rowid = f.rowid "
+           f"WHERE {_like('f.search_key', name)}")
+    try:
+        rows = _query(client, "contact_fts.db", sql)
+    except Exception:
+        return None
+    out = []
+    for r in rows:
+        if name not in labels_of_search_key(_pick(r, "k", 1)):
+            continue
+        u = str(_pick(r, "u", 0) or "").strip()
+        if u and u not in out:
+            out.append(u)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def pending_replies(client, limit=20):
     """「谁在等我回」：unread_count > 0 的会话。
 
@@ -1487,11 +1653,329 @@ def message_xml(client, talker, local_id):
     return _fetch_message_xml(client, talker, local_id)
 
 
-def query_contact_history(client, talker, limit=50, keyword=None):
-    """查某个会话的文本历史，时间升序，最多 limit 条。"""
+def query_contact_history(client, talker, limit=50, keyword=None, since=None,
+                          until=None):
+    """查某个会话的文本历史，时间升序，最多 limit 条。
+
+    `since` / `until`（epoch 秒，可选）= 只看这两个时刻之间（含端点）的消息。
+    **这是「最近 N 天」唯一能被真正回答的入口**：不传它们时返回的是「最新的
+    limit 条」，那是个**按条数**的窗口，跨度可长可短（2026-10-01 真机实测：
+    张三那条会话 30 条只覆盖 1.4 天、50 条只覆盖 3 天；李四 50 条只覆盖
+    20 小时）。所以上层（`agent_tools.t_read_history`）必须把「这次实际覆盖到
+    什么时候」如实告诉模型——**不说，模型就会把窗口跨度当成用户问的时间范围**
+    （真机踩过：用户问「最近 10 天」，模型答「最近 10 天（9/30–10/1）」，而它
+    手里其实只有 30 条、1.4 天）。
+
+    ⚠️ **`since` 单独给是翻不到更早的**：它锚在「现在」，返回的永远是最近
+    limit 条——实测 `days=10` 与 `days=30` 拿到的是同一批。要往更早看必须
+    同时给 `until`（= 把上一批最早那条的时间当上界，一批一批往回走）。
+    """
     if is_wechat4(client):
-        return _v4_query_history(client, talker, limit, keyword)
-    return _v3_query_history(client, talker, limit, keyword)
+        return _v4_query_history(client, talker, limit, keyword, since, until)
+    return _v3_query_history(client, talker, limit, keyword, since, until)
+
+
+# ---------- 「这段时间里有多少条」 ----------
+#
+# 只为「如实告诉模型规模」存在：用户问「9 月我们都聊了什么」时，光给最新的 50 条
+# 而不给总数，模型就不知道自己手里是 50/1400——那正是「静默失效」的同一族。
+# 纯 COUNT/MIN/MAX，带会话过滤、不排序，所以不碰 hook 铁律第 2 条。
+
+def _v4_history_count(client, talker, since=None, until=None, keyword=None):
+    """4.x：某会话在某时间范围内有多少条。
+
+    走 fts 分片（和 `_v4_history_from_fts` **同一数据源**，数字才和能翻到的行对得上），
+    复用「命中就停」那套——实测一个会话的消息只落在一个分片里。
+    分片一个都没命中就退回 Msg_ 表数一次（那条路也是收消息的兜底）。
+    """
+    if _uses_fts(client):
+        sid = _v4_fts_session_id(client, talker)
+        if sid is not None:
+            where = f"session_id = {sid}"
+            if since:
+                where += f" AND create_time >= {int(since)}"
+            if until:
+                where += f" AND create_time <= {int(until)}"
+            if keyword:
+                where += f" AND local_type = 1 AND acontent MATCH '{_q(keyword)}'"
+            for t in _v4_fts_tables(client):
+                try:
+                    rows = _query(
+                        client, "message_fts.db",
+                        f"SELECT COUNT(*) AS c, MIN(create_time) AS mn, "
+                        f"MAX(create_time) AS mx FROM {t} WHERE {where}")
+                except Exception:
+                    continue
+                r = rows[0] if rows else {}
+                c = _as_int(_pick(r, "c", 0)) or 0
+                if c:
+                    return {"count": c,
+                            "first": _as_int(_pick(r, "mn", 1)),
+                            "last": _as_int(_pick(r, "mx", 2)),
+                            "source": "fts"}
+    table = _v4_table_for(talker)
+    conds = []
+    if keyword:
+        conds.append(_like("message_content", keyword))
+    if since:
+        conds.append(f"create_time >= {int(since)}")
+    if until:
+        conds.append(f"create_time <= {int(until)}")
+    tail = (" WHERE " + " AND ".join(conds)) if conds else ""
+    for db in _v4_msg_dbs(client):
+        try:
+            rows = _query(
+                client, db,
+                f"SELECT COUNT(*) AS c, MIN(create_time) AS mn, "
+                f"MAX(create_time) AS mx FROM {table}{tail}")
+        except Exception:
+            continue
+        r = rows[0] if rows else {}
+        c = _as_int(_pick(r, "c", 0)) or 0
+        if c:
+            return {"count": c,
+                    "first": _as_int(_pick(r, "mn", 1)),
+                    "last": _as_int(_pick(r, "mx", 2)),
+                    "source": "table"}
+    return {"count": 0, "first": 0, "last": 0, "source": ""}
+
+
+def _v3_history_count(client, talker, since=None, until=None, keyword=None):
+    """3.9.x：同上，按 MSG 分片求和。"""
+    t = _q(talker)
+    out = {"count": 0, "first": 0, "last": 0, "source": "table"}
+    for db in _v3_msg_dbs(client):
+        sql = ("SELECT COUNT(*) AS c, MIN(CreateTime) AS mn, MAX(CreateTime) AS mx "
+               f"FROM MSG WHERE StrTalker = '{t}' AND Type = 1")
+        if keyword:
+            sql += f" AND {_like('StrContent', keyword)}"
+        if since:
+            sql += f" AND CreateTime >= {int(since)}"
+        if until:
+            sql += f" AND CreateTime <= {int(until)}"
+        try:
+            rows = _query(client, db, sql)
+        except Exception:
+            continue
+        for r in rows:
+            out["count"] += _as_int(_pick(r, "c", 0)) or 0
+            mn = _as_int(_pick(r, "mn", 1))
+            mx = _as_int(_pick(r, "mx", 2))
+            if mn and (not out["first"] or mn < out["first"]):
+                out["first"] = mn
+            if mx and mx > out["last"]:
+                out["last"] = mx
+    return out
+
+
+def count_history(client, talker, since=None, until=None, keyword=None):
+    """某个会话在某个时间范围内有多少条（`{"count","first","last","source"}`）。
+
+    **只用来把规模如实说给模型听**——「9 月一共 1400 条，这里只给你最新的 50 条」
+    和「只给 50 条」是完全不同的两句话。查不到就是 `count=0`，不抛异常。
+    """
+    if is_wechat4(client):
+        return _v4_history_count(client, talker, since, until, keyword)
+    return _v3_history_count(client, talker, since, until, keyword)
+
+
+# ---------- 「那天所有聊天」：跨会话按时间取 ----------
+#
+# 这两条是**没有 session_id 过滤**的按时间查询——CLAUDE.md 铁律第 2 条最警惕的形状。
+# 2026-10-01 真机实测（停 bot、只读）之后才敢加：
+#   `WHERE create_time >= ? AND create_time <= ?` 的 COUNT / GROUP BY，每个分片
+#   0.05~0.11 秒；全天 4 个分片合计 0.29~0.40 秒，**一次慢查询都没有**。
+#   铁律警告的是「不带过滤**还排序**」（`WHERE local_type=1 ORDER BY create_time DESC`
+#   0.3s 起、劣化到 6s）；按时间过滤 + 聚合实测是快的。
+# 仍然只在用户**明确问「那天发生了什么」**时走这条路，绝不进轮询、绝不进预取。
+
+def day_overview(client, since, until, limit=200):
+    """某时间段里**每个会话**各有多少条（跨所有会话，按条数降序）。
+
+    `talker` 是 wxid / roomid —— **显示名由上层查联系人表**，这里不编名字。
+    拿不到名字的会话 `talker` 为空串：**照实回出来**，不许悄悄丢
+    （丢掉就等于「那天我跟某些人聊过」这件事本身被隐瞒了）。
+    """
+    since, until = int(since or 0), int(until or 0)
+    if is_wechat4(client):
+        if not _uses_fts(client):
+            return []
+        smap = _v4_fts_session_map(client)
+        agg = {}
+        for t in _v4_fts_tables(client):
+            try:
+                rows = _query(
+                    client, "message_fts.db",
+                    f"SELECT session_id, COUNT(*) AS c, MIN(create_time) AS mn, "
+                    f"MAX(create_time) AS mx FROM {t} "
+                    f"WHERE create_time >= {since} AND create_time <= {until} "
+                    f"GROUP BY session_id")
+            except Exception:
+                continue
+            for r in rows:
+                sid = _as_int(_pick(r, "session_id", 0))
+                c = _as_int(_pick(r, "c", 1)) or 0
+                if not c:
+                    continue
+                cur = agg.setdefault(sid, {"count": 0, "first": 0, "last": 0})
+                cur["count"] += c
+                mn = _as_int(_pick(r, "mn", 2))
+                mx = _as_int(_pick(r, "mx", 3))
+                if mn and (not cur["first"] or mn < cur["first"]):
+                    cur["first"] = mn
+                if mx > cur["last"]:
+                    cur["last"] = mx
+        out = [{"talker": smap.get(sid, ""), "count": v["count"],
+                "first": v["first"], "last": v["last"]}
+               for sid, v in agg.items()]
+        out.sort(key=lambda m: -m["count"])
+        return out[:int(limit)]
+
+    # 3.9.x：MSG 表没有会话索引，但这是「按时间过滤 + 分组」，与 v4 同形状。
+    # ⚠️ **本机没有 3.9.x 可验，这条未在真机核实**（照 v4 对等实现）。
+    agg = {}
+    for db in _v3_msg_dbs(client):
+        try:
+            rows = _query(
+                client, db,
+                f"SELECT StrTalker, COUNT(*) AS c, MIN(CreateTime) AS mn, "
+                f"MAX(CreateTime) AS mx FROM MSG WHERE Type = 1 "
+                f"AND CreateTime >= {since} AND CreateTime <= {until} "
+                f"GROUP BY StrTalker")
+        except Exception:
+            continue
+        for r in rows:
+            who = str(_pick(r, "StrTalker", 0) or "")
+            c = _as_int(_pick(r, "c", 1)) or 0
+            if not c:
+                continue
+            cur = agg.setdefault(who, {"count": 0, "first": 0, "last": 0})
+            cur["count"] += c
+            mn = _as_int(_pick(r, "mn", 2))
+            mx = _as_int(_pick(r, "mx", 3))
+            if mn and (not cur["first"] or mn < cur["first"]):
+                cur["first"] = mn
+            if mx > cur["last"]:
+                cur["last"] = mx
+    out = [{"talker": k, "count": v["count"], "first": v["first"],
+            "last": v["last"]} for k, v in agg.items()]
+    out.sort(key=lambda m: -m["count"])
+    return out[:int(limit)]
+
+
+def range_messages(client, since, until, max_total=20000, page=800, talker=None):
+    """某时间段里**所有会话**的消息，时间升序（跨会话）。
+
+    给了 `talker` 就只取**那一个会话**——会话过滤更窄，所以只会更便宜。
+    「导出某个人的一整个月」走的就是这条路（那条会话自己的记录全给，不受
+    工具返回的上下文闸限制）。
+
+    **为什么翻页用 fts 的 rowid 而不是 create_time**：按时间翻页（`until=最早那条`）
+    在「同一秒里有很多条」时会**丢消息或重复**——2026-10-01 实测过，548 条里多出 2 条
+    重复。rowid 唯一且索引有序，翻页精确。
+
+    正文只取 fts 里的 `acontent`，非文本渲染成 `[图片]` 这类标签；
+    **appmsg 不回头去捞原始 XML**——那是一条消息一次查库，导出一整天的量会把
+    hook 压死。代价是引用/链接只留下摘要，这一点会写进导出文件的开头。
+    """
+    since, until = int(since or 0), int(until or 0)
+    max_total, page = int(max_total), max(int(page), 1)
+    out = []
+    if is_wechat4(client):
+        if not _uses_fts(client):
+            return []
+        smap = _v4_fts_session_map(client)
+        self_id = _v4_fts_self_id(client)
+        only_sid = _v4_fts_session_id(client, talker) if talker else None
+        cols = ("rowid AS rid, acontent, session_id, sender_id, create_time, "
+                "local_type, message_local_id")
+        for t in _v4_fts_tables(client):
+            floor = None
+            while len(out) < max_total:
+                where = f"create_time >= {since} AND create_time <= {until}"
+                if only_sid is not None:
+                    where += f" AND session_id = {only_sid}"
+                if floor is not None:
+                    where += f" AND rowid < {int(floor)}"
+                try:
+                    rows = _query(client, "message_fts.db",
+                                  f"SELECT {cols} FROM {t} WHERE {where} "
+                                  f"ORDER BY rowid DESC LIMIT {page}")
+                except Exception:
+                    break
+                if not rows:
+                    break
+                lids = []
+                for r in rows:
+                    rid = _as_int(_pick(r, "rid", 0))
+                    if rid:
+                        lids.append(rid)
+                    sid = _as_int(_pick(r, "session_id", 2))
+                    sender = _as_int(_pick(r, "sender_id", 3))
+                    lt = _as_int(_pick(r, "local_type", 5))
+                    text = str(_pick(r, "acontent", 1) or "")
+                    if lt != 1:
+                        text = _render_nontext(lt, text)
+                    out.append({
+                        "talker": talker if talker else smap.get(sid, ""),
+                        "local_id": str(_pick(r, "message_local_id", 6) or ""),
+                        "local_type": lt,
+                        "content": text,
+                        "sender": smap.get(sender, ""),
+                        "is_self": 1 if (self_id is not None
+                                         and sender == self_id) else 0,
+                        "time": _fmt_time(_pick(r, "create_time", 4)),
+                        "_ts": _as_int(_pick(r, "create_time", 4)),
+                    })
+                if not lids:
+                    break
+                floor = min(lids)
+                if len(rows) < page:
+                    break
+        out.sort(key=lambda m: (m["_ts"], m["talker"], m["local_id"]))
+        return out[:max_total]
+
+    # 3.9.x：MSG 表用 rowid 翻页（SQLite 自带的隐含主键），形状与 v4 对等。
+    # ⚠️ **本机没有 3.9.x 可验，这条未在真机核实**。
+    for db in _v3_msg_dbs(client):
+        floor = None
+        while len(out) < max_total:
+            cond = (f"Type = 1 AND CreateTime >= {since} AND CreateTime <= {until}")
+            if talker:
+                cond += f" AND StrTalker = '{_q(talker)}'"
+            if floor is not None:
+                cond += f" AND rowid < {int(floor)}"
+            try:
+                rows = _query(client, db,
+                              f"SELECT rowid AS rid, StrTalker, StrContent, IsSender, "
+                              f"CreateTime FROM MSG WHERE {cond} "
+                              f"ORDER BY rowid DESC LIMIT {page}")
+            except Exception:
+                break
+            if not rows:
+                break
+            lids = []
+            for r in rows:
+                rid = _as_int(_pick(r, "rid", 0))
+                if rid:
+                    lids.append(rid)
+                out.append({
+                    "talker": talker or str(_pick(r, "StrTalker", 1) or ""),
+                    "local_id": str(rid or ""),
+                    "local_type": 1,
+                    "content": str(_pick(r, "StrContent", 2) or ""),
+                    "sender": "",
+                    "is_self": int(_pick(r, "IsSender", 3) or 0),
+                    "time": _fmt_time(_pick(r, "CreateTime", 4)),
+                    "_ts": _as_int(_pick(r, "CreateTime", 4)),
+                })
+            if not lids:
+                break
+            floor = min(lids)
+            if len(rows) < page:
+                break
+    out.sort(key=lambda m: (m["_ts"], m["talker"], m["local_id"]))
+    return out[:max_total]
 
 
 def search_history(client, keyword, limit=30):

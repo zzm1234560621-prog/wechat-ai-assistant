@@ -17,8 +17,10 @@
 3. **不许编造价格**。`price_of()` 只放**有把握**的官方公开价（见下面的表），
    表里没有的模型一律返回 `None`，`summarize()` 就**明说「这个模型没有价目表，
    只报 token 不算钱」**。绝不按"差不多的模型"套一个价——那是在报假账。
-   注意：这是**估算**，不是账单。DeepSeek 有夜间优惠时段（北京时间 00:30~08:30
-   折扣），本地估算会**偏高**；中转/代理站的价格也和官方表无关。
+   注意：这是**估算**，不是账单。DeepSeek 现行价是**高峰/空闲两档**（北京时间周一至
+   周五 9:00-12:00、14:00-18:00 为高峰，法定节假日除外；其余时段为空闲，价=高峰的一半），
+   本表按**高峰价**填，也没有按"缓存命中"那档（更便宜）算 —— 所以估算**只会偏高**；
+   中转/代理站的价格和官方表无关，别拿这张表当真。
 4. **损坏的行不许崩**。`usage.jsonl` 是追加写的，断电/半行写入都可能留下
    半截 JSON。读的时候坏行**跳过并计数**（`bad_lines`），照常出统计。
 
@@ -46,19 +48,25 @@ USAGE_PATH = os.path.join(PROJECT_DIR, "data", "usage.jsonl")
 # 这里只放**官方文档公开、且本站确认过**的条目；拿不准的**宁可空着**——
 # 空着 = summarize() 里明说"没有价目表"，那是诚实的；瞎填 = 报假账。
 #
-# 本站有把握的只有 DeepSeek 官方（deepseek-chat / deepseek-reasoner，
-# 按"输入未命中缓存 / 输出"计价）：
-#   deepseek-chat      输入 2 元/百万，输出 8 元/百万
-#   deepseek-reasoner  输入 4 元/百万，输出 16 元/百万
+# 本站有把握的只有 DeepSeek 官方。**2026-10-02 从官方定价页核过**
+# （https://api-docs.deepseek.com/zh-cn/quick_start/pricing），按
+# 「输入未命中缓存 / 输出」的**高峰价**填：
+#   deepseek-flash     （V4.1-Flash，**支持图像理解**）输入 2 元/百万，输出 8 元/百万
+#   deepseek-v4-pro    输入 9 元/百万，输出 27 元/百万（不支持图像理解）
+#   deepseek-chat      输入 2 元/百万，输出 8 元/百万   ← 旧模型名，价格页已不再列，
+#   deepseek-reasoner  输入 4 元/百万，输出 16 元/百万  ← 别的 key 上可能还能用，留档
 #
 # 明确**没有**收录的（不是忘了，是查不到可信公开价 / 会随版本变）：
 #   Claude 各档、通义千问、Kimi、智谱 GLM、OpenAI —— 这些走 unpriced 分支，
 #   只报 token。用户要算钱，请自己按服务商价目表加进下面这张表。
 #
-# 夜间优惠提醒：DeepSeek 在北京时间 00:30~08:30 有折扣价，本表按标准价算，
-# 所以估算**只会偏高、不会偏低**。
+# 两处**会让估算偏高**的地方（诚实写在这儿，别当成 bug）：
+#   ① 按高峰价填，空闲时段（含周末/节假日）实际只要一半；
+#   ② 没建"缓存命中"那一档（比未命中便宜几十倍），命中部分会被按未命中价算。
 PRICE_TABLE = {
     # model（小写）: (输入单价, 输出单价)，元/百万 token
+    "deepseek-flash": (2.0, 8.0),
+    "deepseek-v4-pro": (9.0, 27.0),
     "deepseek-chat": (2.0, 8.0),
     "deepseek-reasoner": (4.0, 16.0),
 }
@@ -368,6 +376,8 @@ if __name__ == "__main__":
     try:
         assert summary(7)["calls"] == 0, "空账本应当是 0 次"
         assert price_of("deepseek-chat") == (2.0, 8.0), "价目表读取"
+        assert price_of("deepseek-flash") == (2.0, 8.0), "flash 价目表（2026-10-02 官方价）"
+        assert price_of("deepseek-v4-pro") == (9.0, 27.0), "v4-pro 价目表"
         assert price_of("no-such-model-xyz") is None, "未知模型不许有价目表"
         record("openai", "deepseek-chat", 1000, 500)
         s = summary(7)
