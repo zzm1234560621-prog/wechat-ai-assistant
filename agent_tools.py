@@ -32,6 +32,7 @@ import image_cache
 import live_history
 import read_worker
 import scheduler
+import semantic
 import watch
 import web_read
 
@@ -1084,6 +1085,27 @@ TOOLS = [
                 "limit": {"type": "integer", "description": "默认 10"},
             },
             "required": ["contact", "keyword"],
+        },
+    },
+    {
+        "name": "semantic_search",
+        "description": (
+            "按**意思**在用户自己的聊天记录里找（本地语义检索），补 search_in_chat 的短板：\n"
+            "  用户问「上次聊到的那个并发问题」，而原话写的是「hook 不能同时查」"
+            "——关键词对不上，语义能对上。\n"
+            "用户说「意思上像的」「换个说法也想找」时用这个；确定关键词时用 search_in_chat。\n"
+            "⚠️ 它**只能用已经建好的本地索引**，而且**绝不会偷偷退回关键词搜索**。\n"
+            "返回里如果说「还没有语义索引」/「模型没下」/「索引坏了」，**照实转告用户**，"
+            "并把返回里那条命令原样给他（要他在**命令行**上跑，不是在这里跑）——"
+            "**不要**改用 search_in_chat 假装是同一个东西，也**不要**自己编内容。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "用一句自然语言描述要找什么（不是关键词列表）"},
+            },
+            "required": ["query"],
         },
     },
     {
@@ -3740,6 +3762,49 @@ class ToolBox:
         return (f"「{nm}」不在自动发送名单里，**一张都还没发**。"
                 f"请告诉用户：准备把「{folder}」里的 {len(picked)} 张图发给 {nm}，"
                 f"让他回复「确认」后我再发。{trunc}")
+
+    def t_semantic_search(self, args):
+        """本地语义检索。**不查库**（所以不扣 `agent.max_queries`，和 web_search 同理）。
+
+        ⚠️ 索引没建 / 模型没下 / 索引坏了时，**把 semantic.search 的错误原样带回去**，
+        并明确要求照实转告用户——**绝不用关键词搜索顶替**。悄悄退化是最坏的一种失效：
+        用户以为自己用的是语义检索，然后奇怪为什么「换个说法就搜不到了」。
+        """
+        args = args or {}
+        q = str(args.get("query") or args.get("q") or "").strip()
+        if not q:
+            return "需要 query：用一句自然语言描述要找什么。"
+
+        cfg = self.cfg_provider()
+        if semantic.cfg_of(cfg).get("enabled") is not True:
+            return ("**语义检索没开**（`semantic.enabled` 是 false），所以这次没有用它。\n"
+                    "要用得让**用户自己**在 config.yaml 里把 `semantic.enabled` 改成 true，"
+                    "并且先下模型、建索引（`python semantic.py --setup` / `--build`）。\n"
+                    "**照实告诉用户这些**，不要改用 search_in_chat 假装是语义检索"
+                    "——那样换个说法就搜不到了，用户却不知道原因。")
+
+        hits, err = semantic.search(q, cfg)
+        if err:
+            return ("语义检索现在用不了，**请照实告诉用户**（不要改用关键词搜索顶上）：\n"
+                    + err)
+        if not hits:
+            return (f"语义检索**没有找到**（没有 ≥ `semantic.min_score` 的结果，"
+                    f"索引是好的）。\n可以让用户把 min_score 调低一点，或换个说法再试。\n"
+                    f"（这**不是**「记录里没有」——它只表示「没有足够像的」，别替用户下结论。）")
+
+        lines = [f"语义检索「{q}」命中 {len(hits)} 条"
+                 f"（按相似度排序，**不是**关键词匹配）："]
+        for h in hits:
+            when = ""
+            try:
+                when = time.strftime("%m-%d %H:%M", time.localtime(int(h.get("time") or 0)))
+            except (TypeError, ValueError, OSError):
+                when = "时间读不出"
+            who = "我" if h.get("is_self") else (h.get("who") or "对方")
+            lines.append(f"  · {float(h.get('score') or 0):.3f}　{when}　{who}："
+                         f"{h.get('text')}")
+        lines.append("（分数是余弦相似度，0~1；只表明「像不像」，不代表事实。）")
+        return "\n".join(lines)
 
     def t_send_file(self, args):
         """给某人发一个普通文件。

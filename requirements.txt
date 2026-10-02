@@ -79,3 +79,13 @@ pypdf>=4.0
 # olefile：老 .doc 的**最后一级兜底**（粗略抽取，质量不保证，会如实标注）。
 # 不装就只有前四级；都没有就如实说读不了。.msg 邮件以后也会用它。
 #     .venv\Scripts\python.exe -m pip install olefile
+#
+# sentence-transformers：**本地语义检索**（semantic_search 工具 / semantic.py）用。
+# 不装则那个工具**如实报「没装依赖」并给出安装命令**，其余一切照常——
+# 它**不会**退化成关键词搜索（那是明令禁止的，见 semantic.py 的模块注释）。
+# 它还会拖进 torch，是这个清单里最重的一个，所以**绝不随主程序安装**。
+#     .venv\Scripts\python.exe -m pip install sentence-transformers
+# 装完还要显式下一次模型（**只此一条下载路径**，走 hf-mirror 镜像）：
+#     .venv\Scripts\python.exe semantic.py --setup
+# 再建索引（**要先把 bot 停掉**——遍历历史是重活，不能挂在轮询线程上）：
+#     .venv\Scripts\python.exe semantic.py --build --days 90

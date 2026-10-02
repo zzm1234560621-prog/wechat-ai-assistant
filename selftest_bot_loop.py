@@ -1094,6 +1094,19 @@ def t_export(tmp):
         _r3, m3 = bot.live_history.collect_contact_history(None, "wxid_a", page=3)
         chk(m3["pages"] <= 3, f"时间戳全是 0 时必须停（翻了 {m3['pages']} 页）")
 
+        # ⚠️ `since` 必须**真的传下去**：以前这个参数被接住却从没传给查询层，
+        #    于是「只导最近 N 天」这个用法**静默失效**（返回的是全量）——自测抓出来的。
+        seen_since = []
+
+        def _spy(client, talker, limit=50, keyword=None, since=None, until=None):
+            seen_since.append(since)
+            return []
+
+        bot.live_history.query_contact_history = _spy
+        bot.live_history.collect_contact_history(None, "wxid_a", page=3, since=12345)
+        chk(seen_since and all(s == 12345 for s in seen_since),
+            f"`since` 传到了查询层（实际：{seen_since}）")
+
         bot.live_history.query_contact_history = fake_q
         rows4, meta4 = bot.live_history.collect_contact_history(None, "wxid_a", page=99)
         text = bot.render_conversation(rows4, "张三", meta4, {"wxid_zhangsan": "张三"})

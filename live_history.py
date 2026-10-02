@@ -1704,7 +1704,7 @@ def collect_contact_history(client, talker, page=200, max_items=0, since=None,
 
     while True:
         batch = query_contact_history(client, talker, limit=page,
-                                      since=None, until=cur_until)
+                                      since=since, until=cur_until)
         pages += 1
         if not batch:
             break
