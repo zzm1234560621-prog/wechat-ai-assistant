@@ -27,6 +27,7 @@
   * 性能：4 万字符的"全是反例"文本必须毫秒级跑完（正则没有灾难性回溯）
 """
 import json
+import json
 import os
 import shutil
 import sys
@@ -477,7 +478,87 @@ chk(_names.index("身份证") < _names.index("银行卡"),
 
 
 # ==========================================================================
-sec("【11】没污染仓库的 data/usage.jsonl")
+sec("【11】消费预算闸（/预算）——到上限拒绝调用，算不准就说不准")
+
+_budget_dir = tempfile.mkdtemp(prefix="selftest_usage_budget_")
+_budget_path = os.path.join(_budget_dir, "budget_usage.jsonl")
+usage.USAGE_PATH = _budget_path
+
+
+def _brow(model, p, c):
+    with open(_budget_path, "a", encoding="utf-8") as _fh:
+        _fh.write(json.dumps({"ts": int(time.time()), "provider": "openai",
+                              "model": model, "prompt_tokens": p,
+                              "completion_tokens": c, "kind": "chat"}) + "\n")
+
+
+# 默认（daily_cost=0）不许拦，也不许多说一个字——默认行为必须和以前一模一样
+chk(usage.daily_limit({}) == 0.0, "默认上限是 0（不限）")
+chk(usage.budget_block_text({}) is None, "没开闸 → 不拦")
+chk(usage.budget_block_text({"budget": {"daily_cost": 0}}) is None, "显式 0 → 不拦")
+
+# 写一笔可计价的账（deepseek-chat 在价目表里）
+open(_budget_path, "w").close()
+_brow("deepseek-chat", 1000000, 0)
+_s = usage.summary(days=1)
+chk(_s["est_cost"] is not None and _s["est_cost"] > 0,
+    f"有价目表的模型 → 算得出花费（{_s['est_cost']}）")
+
+chk(usage.budget_block_text({"budget": {"daily_cost": _s["est_cost"] * 10}}) is None,
+    "没到上限 → 不拦")
+
+_big = usage.budget_block_text({"budget": {"daily_cost": _s["est_cost"] / 2}})
+chk(_big is not None, "超过上限 → 拦")
+chk("没有调用模型" in _big, f"拦的文案要说清「这次没调模型」：{_big[:40]!r}")
+chk("最近 24 小时" in _big, "要说清窗口是「最近 24 小时」（不许写成「今天」）")
+chk("budget.daily_cost" in _big, "要点出是哪个配置键在拦，用户才知道去哪儿改")
+
+# 写歪的上限：一律按「不限」，但绝不静默（daily_limit 会打印告警）
+chk(usage.daily_limit({"budget": {"daily_cost": "二十块"}}) == 0.0, "非数字 → 按不限")
+chk(usage.daily_limit({"budget": {"daily_cost": float("nan")}}) == 0.0, "NaN → 按不限")
+chk(usage.daily_limit({"budget": {"daily_cost": float("inf")}}) == 0.0, "inf → 按不限")
+chk(usage.daily_limit({"budget": {"daily_cost": -5}}) == 0.0, "负数 → 按不限")
+chk(usage.daily_limit({"budget": "这不是字典"}) == 0.0, "budget 段不是字典 → 按不限")
+
+# 全是没价目表的模型 → 算不出花费 → **不拦**，但必须如实说算不出
+open(_budget_path, "w").close()
+_brow("某厂-自建模型", 500, 500)
+_lim = {"budget": {"daily_cost": 0.0001}}
+_lim_v, _spent, _blocked, _note = usage.budget_status(_lim)
+chk(_lim_v > 0, "上限读出来了")
+chk(_spent is None, "窗口内全是没价目表的模型 → spent 是 None（不是 0）")
+chk(_blocked is False, "算不出花费时**不拦**（拦错了就等于整台机器没法用）")
+chk("算不出" in (_note or ""), f"但要如实说明算不出：{_note!r}")
+chk(usage.budget_block_text(_lim) is None, "算不出 → 不拦（且文案为空）")
+
+# 有价目的表 + 有没价目表的混在一起：能算的部分照拦，但要说清少算了
+open(_budget_path, "w").close()
+_brow("deepseek-chat", 1000000, 0)
+_brow("某厂-自建模型", 500, 500)
+_v2, _sp2, _bl2, _nt2 = usage.budget_status({"budget": {"daily_cost": 0.00001}})
+chk(_sp2 is not None and _bl2 is True, "能算的部分超了 → 拦")
+chk("没算进去" in (_nt2 or ""), f"要明说有一部分没算进去：{_nt2!r}")
+
+# 账本根本不存在 → 不拦、不抛
+usage.USAGE_PATH = os.path.join(_budget_dir, "no_such_dir", "none.jsonl")
+try:
+    chk(usage.budget_block_text(_lim) is None, "账本不存在 → 不拦、不抛")
+except Exception as _e:
+    chk(False, f"账本不存在时不该抛：{_e!r}")
+
+# /预算 的展示文案：关着和开着都要能读
+usage.USAGE_PATH = _budget_path
+_txt_off = usage.budget_text({"budget": {"daily_cost": 0}})
+chk("没开" in _txt_off and "/预算" in _txt_off, f"关着时告诉你怎么开：{_txt_off[:50]!r}")
+_txt_on = usage.budget_text({"budget": {"daily_cost": 0.00001}})
+chk("已用" in _txt_on, f"开着时报已用多少：{_txt_on[:60]!r}")
+
+usage.USAGE_PATH = _repo_path
+shutil.rmtree(_budget_dir, ignore_errors=True)
+
+
+# ==========================================================================
+sec("【12】没污染仓库的 data/usage.jsonl")
 
 _new_stat = None
 try:

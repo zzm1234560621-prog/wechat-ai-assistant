@@ -166,6 +166,9 @@ HELP_TEXT = (
     "/delchat <wxid> 移除聊天\n"
     "/status         查看当前配置 + 运行健康（轮询 / 分片错误 / 登录态）\n"
     "/用量 [天数]     看 token 用量和估算费用（默认最近 7 天）\n"
+    "/预算            看消费闸状态（最近 24 小时花了多少 / 上限多少）\n"
+    "/预算 <金额>     设上限：超了就**拒绝调用模型**并说明原因，不偷偷降级\n"
+    "/预算 关         关掉消费闸\n"
     "/help           显示本帮助\n"
     "\n"
     "—— 自动回复（让 AI 代替我本人回某个人）——\n"
@@ -394,6 +397,36 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
             # 统计坏了也得如实说，不许回一句「暂无记录」糊过去
             traceback.print_exc()
             return f"用量统计失败：{e}", False
+
+    if cmd in ("/预算", "/budget", "/花费上限"):
+        if usage is None:
+            return "这个版本没带上 usage.py，消费闸不可用（安装不完整）。", False
+        fresh = settings.effective(load_config())
+        a = arg.strip()
+        if not a:
+            try:
+                return usage.budget_text(fresh), False
+            except Exception as e:
+                traceback.print_exc()
+                return f"预算状态读不出来：{e}", False
+        low = a.lower()
+        if low in ("关", "关闭", "off", "0", "不限", "none", "清空"):
+            settings.set_value("budget", {"daily_cost": 0})
+            return ("消费闸已关闭（`budget.daily_cost = 0`），模型调用不再受它限制。"
+                    "\n（`/用量` 照样能看花了多少。）"), True
+        try:
+            v = float(a)
+        except (TypeError, ValueError):
+            return ("用法：`/预算` 看状态；`/预算 20` 设上限（元 / 最近 24 小时）；"
+                    "`/预算 关` 关闭。"), False
+        if not (v > 0):                      # 含 NaN / inf / 负数
+            return ("上限要是一个正数，例如 `/预算 20`；要关掉就发 `/预算 关`。"), False
+        settings.set_value("budget", {"daily_cost": v})
+        return (f"消费闸已开：**最近 24 小时**最多花 {v:g}（`budget.daily_cost`）。\n"
+                f"到上限时会**拒绝调用模型**并告诉你是哪条在拦；"
+                f"不会偷偷换个便宜模型，也不会静默降级。\n"
+                f"（窗口是滚动的 24 小时，不是自然日——账本里只有时间戳，"
+                f"按自然日算要说清时区，容易讲错。）"), True
 
     if cmd in ("/auto", "/自动回复"):
         # 重新读一次配置再处理：连着发几条 /auto 时，传进来的 cfg 还是上一条
@@ -1330,6 +1363,20 @@ def do_auto_reply(wcf, llm, cfg, chat, rec, contacts, control_chat, send):
     if llm is None:
         print("[bot] 自动回复跳过：还没设置 API Key。")
         return False
+
+    # 消费闸：自动回复也是一次真实的模型调用。到上限就别再花钱了——
+    # 但**必须告诉用户**（在控制会话里说），绝不静默地不回人家。
+    if usage is not None:
+        blocked_text = usage.budget_block_text(cfg)
+        if blocked_text:
+            label0 = str(rec.get("name") or chat)
+            print(f"[bot] 自动回复跳过（消费闸）：{label0}")
+            try:
+                send(f"⚠️ 自动回复**没有生成**（消费闸拦住了）——{label0} 这条消息"
+                     f"我不会替你回。\n{blocked_text}", control_chat)
+            except Exception:
+                traceback.print_exc()
+            return False
 
     ar = cfg.get("auto_reply") or {}
     group = auto_reply.is_group(chat)
@@ -2340,6 +2387,17 @@ def main():
                 if llm is None:
                     send("还没设置 API Key。发 /api sk-ant-xxx 设置（或告诉我接本地模型）。", sender)
                     continue
+
+                # 消费闸（/预算）：到上限就**不调模型**，并说清为什么。
+                # 放在这里是因为**两条路都要过**——带工具的 agent 和纯 chat 都是一次
+                # 真实的模型调用。算不准的情况（没价目表 / 账本读不出来）它自己会说，
+                # 不会假装拦住了。
+                if usage is not None:
+                    blocked_text = usage.budget_block_text(cfg)
+                    if blocked_text:
+                        print(f"[bot] 消费闸拦住一次调用（{sender}）")
+                        send(blocked_text, sender)
+                        continue
 
                 try:
                     prompt = build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok)

@@ -328,6 +328,102 @@ def summarize(days=7):
 
 
 # ============================================================
+#  消费预算闸（/预算）
+# ============================================================
+#
+# 为什么需要：`/用量` 只是**事后报账**——用户是看到账单才知道超了。定时任务里
+# 放一个 `action: ask`、或者一次群发式的多轮问答，都可能一口气花掉不少钱，
+# 而「花了多少」在聊天里是看不见的。这道闸把它变成**事前**的：到上限就拒绝调用，
+# 并明确告诉用户「这次没调模型、因为什么」。
+#
+# 三条规矩（和项目其它地方一致）：
+#   1. **算不准就说不准**：账本里只要有没价目表的模型，就必须讲明这部分没算进去，
+#      绝不给一个看起来精确的数字；
+#   2. **读不出账本不拦**（拦错了会让用户完全没法用），但要在回复里说清闸没生效；
+#   3. `daily_cost <= 0` = 不限，此时**一个字都不多说**（默认行为不变）。
+
+def daily_limit(cfg=None):
+    """每日费用上限。`0`/负数/写错 = 不限（写错要告警，不静默当成一个数）。"""
+    sec = (cfg or {}).get("budget")
+    if not isinstance(sec, dict):
+        return 0.0
+    raw = sec.get("daily_cost", 0)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        print(f"⚠️ budget.daily_cost 不是数字（{raw!r}），这道闸按「不限」处理")
+        return 0.0
+    if v != v or v in (float("inf"), float("-inf")):     # NaN / inf
+        print(f"⚠️ budget.daily_cost 不是有效数字（{raw!r}），这道闸按「不限」处理")
+        return 0.0
+    return v if v > 0 else 0.0
+
+
+def budget_status(cfg=None):
+    """返回 `(limit, spent, blocked, note)`。
+
+    ⚠️ 窗口是**最近 24 小时滚动**，不是自然日：账本里只有时间戳，按自然日算要处理
+    时区与跨天边界，而滚动窗口语义更容易说清。所以配置项和所有回复文案里
+    一律写「最近 24 小时」，**不写「今天」**——写「今天」就是在骗用户。
+
+    `spent` 为 `None` 表示算不出（账本读不出来 / 窗口内没有可计价的模型）。
+    """
+    limit = daily_limit(cfg)
+    if limit <= 0:
+        return 0.0, None, False, ""
+    try:
+        s = summary(days=1)
+    except Exception as e:                                # 保底：summary 自己也不抛
+        return limit, None, False, f"（用量账本读不出来，这道闸这次**没生效**：{e}）"
+
+    spent = s.get("est_cost")
+    unpriced = list(s.get("unpriced") or [])
+    if spent is None:
+        who = "、".join(unpriced[:3]) or "（没记到模型名）"
+        return limit, None, False, (
+            f"（最近 24 小时的调用**都没有价目表，算不出花费**，所以这道闸判断不了。"
+            f"涉及的模型：{who}）")
+    note = ""
+    if unpriced:
+        note = (f"⚠️ 其中 {len(unpriced)} 个模型没有价目表，那部分**没算进去**，"
+                f"实际可能更高。")
+    return limit, spent, spent >= limit, note
+
+
+def budget_block_text(cfg=None):
+    """该不该拦这次模型调用：该拦返回一段能直接发出去的话，否则返回 `None`。"""
+    limit, spent, blocked, note = budget_status(cfg)
+    if not blocked:
+        return None
+    return (f"这次**没有调用模型**：最近 24 小时已经花了约 {_fmt_cost(spent)}，"
+            f"到了你设的上限 {_fmt_cost(limit)}（`budget.daily_cost`）。\n"
+            f"{note}\n"
+            f"（这道闸只挡**模型调用**——查历史、发消息、定时这些不花钱的功能照旧。"
+            f"要放开就发 `/预算 <金额>`，或 `/预算 关`。）")
+
+
+def budget_text(cfg=None):
+    """`/预算` 命令的输出。"""
+    limit, spent, blocked, note = budget_status(cfg)
+    if limit <= 0:
+        s = summary(days=1)
+        cur = s.get("est_cost")
+        tail = (f"最近 24 小时估算花费：{_fmt_cost(cur)}"
+                if cur is not None else "最近 24 小时的调用算不出花费（没价目表）")
+        return (f"💰 消费闸：**没开**（`budget.daily_cost` 是 0）。\n"
+                f"{tail}。\n"
+                f"要开就发：`/预算 20`（意思是最近 24 小时最多花 20 元；单位同 /用量）。")
+    head = (f"💰 消费闸：上限 {_fmt_cost(limit)}（最近 24 小时），"
+            f"已用约 {_fmt_cost(spent)}"
+            + ("　→ **已到上限，正在拦模型调用**" if blocked else "　→ 还没到"))
+    lines = [head]
+    if note:
+        lines.append(note)
+    lines.append("改：`/预算 <金额>`；关：`/预算 关`。")
+    return "\n".join(lines)
+
+
+# ============================================================
 #  从各家响应里取 usage
 # ============================================================
 
