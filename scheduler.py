@@ -530,17 +530,18 @@ def _is_self(who):
     return _norm(who) in _SELF_WORDS
 
 
-def _strip_self_lead(text):
-    """「我 喝水」/「提醒我 喝水」→「喝水」：只削掉开头那个自称词。"""
-    s = str(text or "").strip()
-    for w in sorted(_SELF_WORDS, key=len, reverse=True):
-        if s == w:
-            return ""
-        if s.startswith(w):
-            rest = s[len(w):].lstrip("，,、:： ").strip()
-            if rest:
-                return rest
-    return s
+def _drop_self_token(words):
+    """去掉「<对象> 位置上那个**整词**自称」，返回剩下的正文。
+
+    ⚠️ **只在词这一级判断。** 以前这里是按「正文开头有没有『我』这个字」削的
+    （`_strip_self_lead`），真机自测抓出来：`/定时 加提醒 2分钟之后 我是部署自检…`
+    被削成「是部署自检…」—— **用户自己写的话被吃掉一个字**。
+    自称只有**单独一个词**站在对象位时才算对象，正文里的「我」一个字都不许动。
+    """
+    ws = list(words)
+    if ws and _is_self(ws[0]):
+        ws = ws[1:]
+    return " ".join(ws).strip()
 
 
 def build_arg(action, when="", who="", text="", target="", mode="text"):
@@ -635,9 +636,9 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None)
             who = " ".join(tail).strip()
             text = ""
         elif want_remind:
-            # 提醒我：整段剩下的话就是提醒内容。开头那个自称词要削掉
-            #（「加提醒 10分钟之后 提醒我 喝水」这种也要能认）。
-            text = _strip_self_lead(" ".join(tail))
+            # 提醒我：整段剩下的话就是提醒内容。只把**对象位上那个整词自称**去掉
+            #（「加提醒 10分钟之后 我 喝水」），正文里的字一个都不动。
+            text = _drop_self_token(tail)
             who = ""
             if not text:
                 return "要说清楚提醒什么。例：/定时 加提醒 10分钟之后 喝水", False
@@ -655,9 +656,10 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None)
             if _is_self(who):
                 # 「10分钟之后提醒我喝水」走的就是这条路：<对象> 位置写的是「我」，
                 # 意思是**提醒我自己**（发到控制会话），不是去找一个叫「我」的人。
+                # 注意正文**就是从 tail[1:] 来的**，那个「我」已经被当成对象吃掉了，
+                # 所以**不要**再去削正文开头（否则「我是自检」会被削成「是自检」）。
                 want_remind = True
                 who = ""
-                text = _strip_self_lead(" ".join(tail))
             if not text:
                 return f"要发的内容不能空。{_USAGE}", False
 
@@ -883,6 +885,16 @@ if __name__ == "__main__":
         tk = saved.get("tasks", [{}])[-1]
         chk(ch and tk.get("action") == "remind" and tk.get("text") == "喝水"
             and not tk.get("to"), f"加提醒：不用填对象（实际 {tk}）")
+
+        # 回归（2026-10-04 真机自测抓出来的）：正文开头的「我」**不许**被当成对象削掉
+        out, ch = _cmd("加提醒 明天9:00 我是自检：原文一个字都别动")
+        tk = saved.get("tasks", [{}])[-1]
+        chk(ch and tk.get("text") == "我是自检：原文一个字都别动",
+            f"正文开头的「我」不许被削（实际 {tk.get('text')!r}）")
+        out, ch = _cmd("加 明天9:00 我 我自己写的正文")
+        tk = saved.get("tasks", [{}])[-1]
+        chk(ch and tk.get("action") == "remind" and tk.get("text") == "我自己写的正文",
+            f"对象位那个「我」被吃掉后，正文照原样（实际 {tk.get('text')!r}）")
 
         out, ch = _cmd("加 10分钟之后 我 吃药")
         tk = saved.get("tasks", [{}])[-1]

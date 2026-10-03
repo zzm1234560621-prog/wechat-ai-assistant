@@ -164,7 +164,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   自测：`.venv/Scripts/python.exe executor.py`（另有两份：`executor_selftest.py` 纯逻辑、`selftest_executor_chain.py` 确认闸门链路）。
 - `scheduler.py` — 定时任务（到点给对方发文本 / 到点提醒我 / 到点让助手答一句话）。任务存在 `settings.json` 的 `schedule` 段，命令 `/定时` 维护；**必须跑在收消息那条线程上**，见下面「改代码时的约定」。
   - `action` 有四种：`text` 给 `to` 发固定内容 / `remind` **到点提醒我**（`text` 原样发控制会话，`to` 留空，不跑模型）/ `ask` 到点把 `text` 当提问跑一遍 agent、答案回控制会话 / `call` 打电话（**能力已下线**、代码保留，到点仍如实报错）。
-  - **`remind` 与时间**：三条入口都通 —— `/定时 加提醒 <时间> <内容>`、`/定时 加 <时间> 我 <内容>`（「我/自己/本人」= 提醒自己，`_is_self` / `_strip_self_lead`，**绝不拿去查联系人**）、工具 `mode=remind`；它只走 `run_due` 的 `notify`，**不碰 `send_text`**（提醒不能发给别人、也不能让模型复述）。`handle_command(..., now=None)` **只给自测注入时间用**（不注入的话自测隔一天红一次）。细节与「别改回去什么」见 `docs/features-2026-10-notes.md` 的 T18；回归 `selftest_sched_auto.t17_remind_me`。
+  - **`remind` 与时间**：三条入口都通 —— `/定时 加提醒 <时间> <内容>`、`/定时 加 <时间> 我 <内容>`（「我/自己/本人」= 提醒自己，`_is_self` / `_drop_self_token`，**绝不拿去查联系人**）、工具 `mode=remind`；它只走 `run_due` 的 `notify`，**不碰 `send_text`**（提醒不能发给别人、也不能让模型复述）。⚠️ 自称**只在对象位是个整词时**才算对象，**正文里的「我」一个字都不许削**（旧实现按开头字符削，把「我是自检」吃成「是自检」，2026-10-04 部署后真机自测抓出来的）。`handle_command(..., now=None)` **只给自测注入时间用**（不注入的话自测隔一天红一次）。细节与「别改回去什么」见 `docs/features-2026-10-notes.md` 的 T18；回归 `selftest_sched_auto.t17_remind_me`。
   - **时间写法**（`scheduler.parse_when`）认：`9:00`=每天、`明天9:00`/`10-02 9:00`=只一次、
     `每周一 9:00`、`每30分钟`、`9点半`，以及**相对一次性** `10分钟后` / `10分钟之后` /
     `半小时后` / `2小时后` / `3天后`（换算成 `date`+`at` 的绝对时刻，**向上取整到分钟**——宁可晚十几秒，

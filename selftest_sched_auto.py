@@ -1331,6 +1331,20 @@ def t17_remind_me():
                 f"「… {who} 吃药」= 提醒我自己（实际 action={t.get('action')} "
                 f"to={t.get('to')!r} text={t.get('text')!r}）")
 
+        # 2b) 回归（2026-10-04 真机自测抓出来的）：**正文开头的「我」不许被削**。
+        # 旧实现按「正文开头有没有『我』这个字」削，`加提醒 2分钟之后 我是部署自检…`
+        # 被削成「是部署自检…」——用户自己写的话被吃掉一个字。
+        for arg, want in (
+            ("加提醒 10分钟之后 我是部署自检：原文别动", "我是部署自检：原文别动"),
+            ("加提醒 10分钟之后 我 我是自己写的", "我是自己写的"),
+            ("加 10分钟之后 我 我自己写的正文", "我自己写的正文"),
+            ("加 10分钟之后 我 本人不在", "本人不在"),
+        ):
+            scheduler.handle_command(arg, settings.effective({}), _resolve_one, now=now)
+            t = tmp.read()["schedule"]["tasks"][-1]
+            chk(t.get("action") == "remind" and t.get("text") == want,
+                f"「{arg}」→ 正文一个字不动（实际 {t.get('text')!r}）")
+
         # 3) 反向：真人不能被抢走（否则「提醒张三」会变成提醒我）
         scheduler.handle_command("加 10分钟之后 张三 开会", settings.effective({}),
                                  _resolve_one, now=now)
