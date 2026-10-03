@@ -130,6 +130,11 @@ void Route_QueryDB(httplib::Server& svr)
         json resp;
         resp["IsLogin"] = g_IsLogin;
         resp["hWeixin"] = (uint64_t)g_hWeixinDll;
+        // 「登录就绪」判据的**可读诊断**（空串 = 正常）。
+        // 为什么要有它：数据被搬到别的盘之后，判据会**永远不成立**，IsLogin 恒为 0、
+        // 所有查询回 "get database handle ... failed"，而表面上不报任何错。
+        // 把原因摆在这儿，用户/上层一眼就能看到，不用猜是不是「掉登录」了。
+        resp["LoginGate"] = LoginGateNote();
         res.set_content(resp.dump(4, ' ', false), "application/json");
         });
 

@@ -33,7 +33,19 @@ HISTORY = OUT / "history.jsonl"
 def find_wechat_dirs():
     """定位微信数据目录（兼容 3.x 的 WeChat Files 和 4.x 的 xwechat_files）。"""
     hits = []
-    roots = [
+    roots = []
+    # ⚠️ 4.x 这一条**先问微信自己记在哪儿**，别写死 ~/Documents ——
+    # 用户把数据搬到别的盘之后，写死的路径只会返回「找不到」而**不报错**。
+    # 检测逻辑只有一份，在 image_cache.data_root()（见那里的注释）。
+    try:
+        import image_cache
+        r = image_cache.data_root()
+        if r:
+            roots.append(Path(r))            # ...\xwechat_files
+            roots.append(Path(r).parent)     # 它上一级，以防布局不同
+    except Exception:
+        pass
+    roots += [
         HOME / "Documents" / "WeChat Files",
         HOME / "Documents" / "xwechat_files",
         HOME / "Documents",

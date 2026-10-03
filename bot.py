@@ -24,6 +24,7 @@ import yaml
 import agent_tools
 import assets
 import auto_reply
+import callgate
 import executor
 import file_read
 import groups
@@ -32,6 +33,8 @@ import settings
 import providers
 import read_worker
 import scheduler
+import recall
+import voice_mem
 import watch
 from llm import ChatLLM
 from history import HistoryStore
@@ -366,6 +369,8 @@ def bot_dashboard(cfg, contacts=None):
     n_k = len(safe(lambda: watch.keywords(c), []) or [])
     L.append(f"盯着　　{_yn(safe(lambda: watch.enabled(c), False))}"
              f"　· {n_w} 人　· 关键词 {n_k} 条　→ `/bot 盯着 开|关`")
+
+    L.append(safe(lambda: recall.status_line(c), "撤回回显　（读不出来）"))
 
     L.append(f"定时　　{len(safe(lambda: scheduler.tasks(c), []) or [])} 个任务"
              f"　→ `/bot 定时`")
@@ -1165,7 +1170,7 @@ def restore_pending(chats, cfg):
 
 
 def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
-              cfg_provider=None, history=None, state=None):
+              cfg_provider=None, history=None, state=None, user_query=""):
     """带工具的问答循环。返回 (最终要回复的文本, 工具是否改动了配置)。
 
     hook 不能并发查询，所以工具是**串行**执行的；查询次数由
@@ -1186,7 +1191,7 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
     # 「hook 不能并发、已被并发查询搞崩 6 次」。光靠注释劝人「别放开」不算闸门。
     max_rounds = max(1, min(10, int(agent_cfg.get("max_rounds", 3))))
     box = agent_tools.ToolBox(wcf, cfg, contacts, self_wxid, chat, cfg_provider,
-                              llm_factory=lambda: llm)
+                              llm_factory=lambda: llm, user_query=user_query or prompt)
 
     messages = list(history or []) + [{"role": "user", "content": prompt}]
     last_text = ""
@@ -2002,6 +2007,123 @@ def _msg_ts(msg):
         return 0
 
 
+# 语音转写后的渲染形态：`[语音] 你好。` / `[语音 1"] 你好。`
+# ⚠️ 正则**必须**只认 `[语音]` / `[语音 时长]`，不能认 `[语音条（…）]` ——
+# 后者是「读不到内容」的标签，把标签后面那个时长当成识别结果就闹笑话了。
+_VOICE_TAG_RE = re.compile(r"^\[语音(?:\s+[^\]]*)?\]\s*(?P<txt>.+)$", re.S)
+
+
+# 后台读完的文件，**发给用户**时正文的体量闸（字）。
+# 和 `executor.WECHAT_MAX_CHARS` 是同一个思路：微信消息不该有几万字。
+# 超了就只发前 N 字 + 如实说"一共多少字、完整内容导出在哪儿"。
+# 2026-10-03 真机：一份 A.zip 读完 27074 字**整段**发出去，聊天被刷好几屏。
+_READ_BODY_MAX = 1500
+
+# 单条**发出去**的消息上限（字）。微信会**直接拒收**过长的消息：
+# 2026-10-03 真机，一条 27074 字的回复被挡下，用户那边什么都看不到，
+# 只在会话里留下一条系统消息「Messge exceeds character limit. Unable to send.」。
+# hook 的 `send_text` 对这种拒收**照回 ret:0**（它不知道微信内部拒了），
+# 所以只能**发之前**自己截断，并把"截了"如实说出来 —— 绝不静默丢件。
+_SEND_MAX_CHARS = 4000
+
+# 「只有类型标签、没有真内容」的渲染形态：`[系统消息]`、`[表情]`、`[通话]`…
+# ⚠️ 标签名长度上限 **10**：真实标签最长是 `好友申请` / `系统消息`（5 个字），
+# 而 `[语音条（**读不到内容**：音频不在本机磁盘上）]` 那种带解释的**不是标签**
+# —— 上限放松到 24 就会把它也吞掉（自测当场抓到），语音的失败提示就永远进不了模型。
+_LABEL_ONLY_RE = re.compile(r"^\[[^\[\]]{1,10}\](\s*\d+\"?)?$")
+
+
+def is_label_only(content):
+    """这条内容是不是**只有一个类型标签**（没有真内容）。
+
+    非文本消息（图片/语音/系统消息/表情…）会被渲染成 `[系统消息]` 这样一行标签，
+    好让模型**知道有这么个东西**。但**标签不是用户说的话**：拿它去问模型，
+    模型只能回一句「我看不到内容」—— 那就是**对着空气回话**。
+    2026-10-03 真机：文件传输助手连着来了两条空 `[系统消息]`，bot 每条都郑重回一段
+    解释，用户看到的就是「我没说话它却回了好几条」。
+    """
+    s = str(content or "").strip()
+    if not s:
+        return False
+    return bool(_LABEL_ONLY_RE.match(s))
+
+
+def voice_already_transcribed(content):
+    """消息渲染里**已经带着**微信的「转文字」结果？是就返回那段文字，否则 ""。
+
+    这条是零成本路径：`live_history._render_nontext()` 在渲染时就把
+    `packed_info_data` 里的转写拼成了 `[语音] 你好。`（见 `voice_transcript`）。
+    """
+    m = _VOICE_TAG_RE.match(str(content or "").strip())
+    if not m:
+        return ""
+    txt = m.group("txt").strip()
+    return "" if "读不到内容" in txt else txt
+
+
+def read_voice_message(client, cfg, msg):
+    """语音条 → 文字。返回 `(文本, 一句说明)`；读不出来时文本为空、说明是人话。
+
+    **三级优先，便宜的先来**：
+
+      1. **微信自己的「转文字」**（消息渲染里已经带着）—— 用户点过一次就有，
+         **零成本**、不用扫内存、不用转写；
+      2. **趁热扫微信进程内存**拿明文 SILK → `pilk` 解码 → 本地 whisper 转写
+         （`voice_mem.py`）。实测：手机发来的语音 7.5 秒出文字。
+         前提是**趁热**：内存里同长度的语音很多，晚了就认不出是哪条
+         （实测同一条语音 20 分钟后，内存里站着 12 条别人的同长度语音）；
+      3. 读不出来 → **如实说**，绝不拿别的语音顶上。
+
+    ⚠️ 第 2 条是**同步**的（实测 5~8 秒），跑在收消息那条线程上，这段时间
+    轮询会停 —— 和 `run_command` / 群发同一档代价。所以有 `voice.auto_read`
+    开关和 `voice.max_seconds` 上限。
+    """
+    tag = voice_already_transcribed(getattr(msg, "content", ""))
+    if tag:
+        return tag, "微信已转文字"
+    vcfg = (cfg or {}).get("voice") or {}
+    if not isinstance(vcfg, dict):
+        vcfg = {}
+    if not bool(vcfg.get("auto_read", True)):
+        return "", ""
+    if not voice_mem.available()[0]:
+        return "", voice_mem.available()[1]
+
+    talker = getattr(msg, "roomid", "") or getattr(msg, "sender", "") \
+        or getattr(msg, "talker", "")
+    lid = str(getattr(msg, "local_id", "") or "")
+    if not lid:
+        # fts 那条路不带 local_id；语音本来也不进 fts，所以正常轮询不会走到这里
+        return "", "这条语音没带 local_id，认不出是哪一条"
+    info = live_history.voice_info(client, talker, lid)
+    ms = int(info.get("duration_ms") or 0)
+    if ms <= 0:
+        return "", "拿不到这条语音的时长（XML 里没有 voicelength），认不出是哪一段"
+    try:
+        cap = int(vcfg.get("max_seconds") or 60)
+    except (TypeError, ValueError):
+        cap = 60
+    if ms / 1000.0 > cap:
+        return "", (f"这条语音 {ms / 1000:.0f} 秒，超过 voice.max_seconds={cap} 秒，"
+                    f"没试着转（想放宽就改 config.yaml）")
+    # ⚠️ `cfg` **必须传**：不传就永远是本地 whisper-small ——
+    # `audio.backend: cloud`（实测 1~2 秒）和 `audio.model: tiny` 全都不会生效，
+    # 用户以为换了快的，其实还在本地跑 small。
+    #
+    # `target_bytes` = 消息 XML 里的 `length`：内存里那条 SILK 的真实长度和它精确对应
+    # （自己发出的样本实测 8/8 差 −1）。**这是唯一能分开"同时长的两条语音"的信号** ——
+    # 以前只按时长，撞上就得靠 whisper 置信度硬分、分不出来就拒答（真机多次）。
+    # 解析早就有（`voice_info` 的 `length_bytes`），只是一直没往下传。
+    texts, err = voice_mem.read(ms, cfg=cfg,
+                                target_bytes=int(info.get("length_bytes") or 0) or None)
+    if err:
+        return "", err
+    if len(texts) == 1:
+        return texts[0], "内存里的语音 + 本地转写"
+    # 多条不同的识别结果：**不替用户挑**，第一条照用，但把别的也说出来
+    return texts[0], ("（另外还有相近的识别结果：" + "／".join(texts[1:4]) + "）")
+
+
 def stash_control_media(wcf, cfg, talker, msg, send):
     """控制会话来了图片/表情/视频 -> 暂存进素材区并回执。返回 True = 已处理。
 
@@ -2343,6 +2465,10 @@ def main():
     # 盯着：只通知我，不回对方
     watch_on = watch.enabled(cfg)
     watch_recs = watch.chats(cfg)
+    # 撤回原文回显：把最近见过的消息留在内存里，收到「撤回」系统提示时回显原文。
+    # 为什么不靠 hook 的防撤回字节补丁 —— 见 recall.py 的文件头注释。
+    recall_on = recall.enabled(cfg)
+    recall_ring = recall.Ring(recall.buffer_seconds(cfg), recall.buffer_max(cfg))
     # 审核模式把草稿往哪儿发：第一个控制会话（默认文件传输助手）
     control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
     # 待确认项总是登记在**控制会话**上（工具层的 self.chat / 审核草稿都发这儿）。
@@ -2392,6 +2518,13 @@ def main():
         无法确认，重试就可能给对方发两条。宁可如实说「没发出去」。
         """
         try:
+            # 发之前先截断（原因见 _SEND_MAX_CHARS 的注释：微信会**直接拒收**过长的
+            # 消息，而 hook 对这种拒收照回 ret:0 —— 只能自己先挡。）
+            _t = str(text or "")
+            if len(_t) > _SEND_MAX_CHARS:
+                text = (_t[:_SEND_MAX_CHARS] +
+                        f"\n\n…（这条回复一共 {len(_t)} 字，一条微信消息装不下，"
+                        f"上面只发了前 {_SEND_MAX_CHARS} 字）")
             wcf.send_text(text, to)
         except Exception as e:
             print(f"[bot] ⚠️ 发送失败（未重试）→ {to}：{e}")
@@ -2424,7 +2557,8 @@ def main():
     else:
         print("[bot] 自动回复：未配置（在微信里发 /auto add <昵称> 添加）")
     print("[bot] 在微信里发 /help 查看可用的配置命令。Ctrl+C 退出。")
-    print(f"[bot] {scheduler.summary_line(cfg)}  |  {watch.summary_line(cfg)}")
+    print(f"[bot] {scheduler.summary_line(cfg)}  |  {watch.summary_line(cfg)}"
+          f"  |  {recall.summary_line(cfg)}")
 
     # 只读状态页（默认关闭，见 config.yaml 的 status 段）。
     # **只渲染内存快照、绝不查库**，所以它不违反「hook 不支持并发」那条铁律。
@@ -2456,6 +2590,7 @@ def main():
         """
         nonlocal cfg, llm, targets, system, auto_on, auto_recs, control_chat
         nonlocal watch_on, watch_recs
+        nonlocal recall_on, recall_ring
         cfg = settings.effective(base_cfg)
         llm = make_llm(cfg)
         targets = set(cfg.get("target_chats", []))
@@ -2464,6 +2599,10 @@ def main():
         auto_recs = auto_reply.chats(cfg)
         watch_on = watch.enabled(cfg)
         watch_recs = watch.chats(cfg)
+        # 撤回回显：**就地改**缓冲配置，不重建 Ring —— 重建会把刚攒的原文丢光，
+        # 于是「改完配置之后那几条撤回」捞不到原文（只在改配置后出现，最难查）。
+        recall_on = recall.enabled(cfg)
+        recall_ring.configure(recall.buffer_seconds(cfg), recall.buffer_max(cfg))
         control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
 
     def run_scheduled():
@@ -2492,7 +2631,7 @@ def main():
                 answer, changed = run_agent(
                     llm, system, prompt, wcf, contacts, cfg, control_chat, self_wxid,
                     cfg_provider=lambda: settings.effective(base_cfg),
-                    history=history, state=run_state)
+                    history=history, state=run_state, user_query=query)
                 # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
                 # 本轮其实没登记时，同样要追一句真话（否则用户回「确认」白等）。
                 answer = with_shell_truth_note(answer, run_state.get("shell_queued", False))
@@ -2511,11 +2650,39 @@ def main():
                 reload_cfg()
             return answer
 
+        def call_task(wxid, name):
+            """定时打电话（`scheduler.run_due` 的 call 回调）。
+
+            **定时任务不能绕过用户设的闸**：到点了也照样先判能力闸 / 免打扰 /
+            每天上限——否则用户设的「23:00-07:00 别打」会被一个定时任务绕过去，
+            而那正是他最不想要电话的时候。判不过就**返回失败原因**，
+            `run_due` 会如实报给控制会话，**绝不降级成发文本**（那是在骗人）。
+
+            返回 None = 成功；返回字符串 = 失败原因（scheduler 的约定）。
+            """
+            ok, why = callgate.check(cfg)
+            if not ok:
+                return why
+            fn = getattr(wcf, "call_voip", None)
+            if fn is None:
+                return ("这套 hook 没有 `/CallVoip` 端点（通话能力只在探针版里），"
+                        "所以打不出去。")
+            try:
+                res = fn(wxid, self_wxid)
+            except Exception as e:
+                return f"拨号请求发不出去：{e}"
+            if isinstance(res, dict) and res.get("error"):
+                return f"hook 拒绝了这次拨号：{res['error']}"
+            # **真发出去了才记账**（提前记会把额度白吃掉）。
+            callgate.record(wxid, name)
+            return None
+
         fired = scheduler.run_due(
             cfg, datetime.now(),
             send_text=lambda to, text: send(text, to),
             notify=lambda text: send(text, control_chat),
             ask=ask_task,
+            call=call_task,
         )
         if fired:
             print(f"[bot] 定时任务已触发：{'、'.join(fired)}")
@@ -2530,7 +2697,20 @@ def main():
                             f"（要在本机再试一次就说「重新读一下 {label}」）")
                     head = f"⚠️ 刚才那份「{label}」没读成。"
                 else:
-                    body = (r.get("text") or "（读出来是空的）")
+                    full = str(r.get("text") or "（读出来是空的）")
+                    body = full
+                    if len(full) > _READ_BODY_MAX:
+                        # ⚠️ **绝不能把几万字原文倒进微信**（2026-10-03 真机踩过：
+                        # 一份 A.zip 读完 27074 字整段发出去，聊天被刷好几屏，
+                        # 而且同样内容被重复发了 4 次）。裁了要**明说裁了**，
+                        # 并把「全文在哪」告诉用户 ——
+                        # 和 `executor.WECHAT_MAX_CHARS` 是同一个「微信消息体量闸」思路。
+                        m = re.search(r"全文也已导出到本机：(\S+)", full)
+                        where = f"；**完整内容已导出到** `{m.group(1)}`" if m else ""
+                        body = (full[:_READ_BODY_MAX] +
+                                f"\n\n…（这份一共 {len(full)} 字，上面只发了前 "
+                                f"{_READ_BODY_MAX} 字{where}。要看后面就说「继续」，"
+                                f"或者说清要看哪一段）")
                     head = f"📄 刚才那份「{label}」读完了："
                 tail = ""
                 if r.get("slow"):
@@ -2636,6 +2816,16 @@ def main():
                 if not query:
                     continue
 
+                # ⚠️ 「只有一个类型标签」的检查**必须排在语音处理之后**（2026-10-03 真机踩到）：
+                # 语音条的渲染形态就是「一个标签 + 一个时长」，而**标签文字是跟着微信界面
+                # 语言走的** —— 中文界面是 `[语音条（…）]`，英文界面是**字面的 `[Audio] 8"`**
+                # （`SessionTable.summary` 原样拼进来）。`_LABEL_ONLY_RE` 只认「1~10 字的标签
+                # + 可选时长」，于是 `[Audio] 8"` **命中**，语音在走到下面那段转写之前
+                # 就被 `continue` 掉了 —— 用户看到的是「发了语音，bot 完全没反应」，
+                # 而且**连一句失败提示都没有**（静默丢弃，正是本文件最忌讳的那种失效）。
+                # 所以判据不能只看渲染出来的文字（会随界面语言变），要让**结构性的
+                # `local_type == 34`** 先说话。下面语音那段处理完会自己 `continue`。
+
                 # 「重启补齐」判定：比 stale_after 秒还旧、**且早于本进程启动**的消息，
                 # 只可能是从落盘游标续上来的那一批。按年龄判、不按「第几轮」判，
                 # 所以停机期间积压多少条都不会漏判、也不会把正常消息误判成补齐。
@@ -2660,10 +2850,17 @@ def main():
                 # （图片不在 fts 里，是靠 live_history 的非文本补漏捞回来的，见那边
                 # 的 docstring），不能当成新消息再答一遍。文本有 is_own_reply 兜着，
                 # 图片没有，所以这里用「会话 + 时间窗」认（agent_tools 那组簿记）。
-                if getattr(msg, "local_type", 1) != 1 \
-                        and agent_tools.is_own_image(sender, _msg_ts):
-                    print(f"[bot] 跳过（这是自己刚发出的图片）: {sender}")
-                    continue
+                if getattr(msg, "local_type", 1) != 1:
+                    if agent_tools.is_own_image(sender, _msg_ts):
+                        print(f"[bot] 跳过（这是自己刚发出的图片）: {sender}")
+                        continue
+                    # 文件同理，而且这一条是 2026-10-03 真机踩出来的：把文件发出去之后，
+                    # 那条文件消息会被当成「用户让我发这个文件」再处理一轮 → 又登记一条
+                    # 待确认 → 用户每回一次「确认」就多收一条（「为什么会重复发」）。
+                    # 判据还是「会话 + 时间窗」，见 agent_tools.is_own_file。
+                    if agent_tools.is_own_file(sender, _msg_ts):
+                        print(f"[bot] 跳过（这是自己刚发出的文件）: {sender}")
+                        continue
 
                 if msg.from_self():
                     # 自己发的消息默认忽略（否则会回复自己）。
@@ -2681,6 +2878,60 @@ def main():
                         print(f"[bot] 跳过（自己发的消息，respond_to_self=false）: {query[:30]}")
                         continue
                     print(f"[bot] 自聊模式，处理自己的消息: {query[:30]}")
+
+                # 语音条：**自动转成文字**，转出来就当作用户说的那句话。
+                # 为什么在这里同步做、而不是丢给 read_worker：转写出来的文字必须
+                # 成为**这一轮的 query** —— 后面的命令解析、待确认队列、agent 全都按
+                # 「用户说了这句话」处理；丢到后台再回注，等于把那一整套逻辑复制一遍
+                # （并可能走样）。代价是同步 5~8 秒，见 read_voice_message 的注释。
+                if not catchup and (getattr(msg, "local_type", 1) & 0xFFFFFFFF) == 34:
+                    try:
+                        _vtxt, _vwhy = read_voice_message(wcf, cfg, msg)
+                    except Exception:
+                        traceback.print_exc()
+                        _vtxt, _vwhy = "", "语音识别时出错（见 bot.log）"
+                    if _vtxt:
+                        query = _vtxt
+                        print(f"[bot] 语音 → 文字（{_vwhy or '转写'}）：{_vtxt[:40]}")
+                    elif _vwhy:
+                        print(f"[bot] 语音没读出来：{_vwhy}")
+                        send(f"🎤 收到一条语音，但没能读出来：{_vwhy}", control_chat)
+                        continue
+
+                # 「只有一个类型标签」的消息（空 `[系统消息]`、`[表情]`…）**不进模型**：
+                # 标签**不是用户说的话**，拿它去问模型 = 对着空气回话。真机踩过
+                # （2026-10-03）：filehelper 连着两条空 `[系统消息]`，bot 每条都郑重
+                # 回一段解释，用户看到的就是「我没说话它却回了好几条」。
+                # ⚠️ 位置：**必须在上面语音那段之后**（理由见上面 `query = …` 处的长注释）——
+                # 语音的标签形态（尤其英文界面的 `[Audio] 8"`）本身就命中这个判据。
+                if is_label_only(query):
+                    print(f"[bot] 跳过（只有类型标签、没有内容）: {query[:30]}")
+                    continue
+
+                # 撤回原文回显（见 recall.py）。**必须排在「盯着」之前**：
+                # 否则同一条撤回提示会先生成一条「👀 xx：[系统消息]」的噪音通知。
+                # 判据是**结构**（local_type=10000 系统消息）**加**文本里带「撤回」，
+                # 不是只看文本 —— 否则你正常说一句「他刚撤回了什么」就会被当成
+                # 系统提示，然后我们拿一条不相干的原文回显，那是编。
+                if recall_on and not catchup:
+                    _lt = getattr(msg, "local_type", 1)
+                    if recall.is_recall(_lt, query):
+                        try:
+                            _who = _msg_speaker(msg, auto_reply.contact_names(contacts))
+                        except Exception:
+                            _who = sender
+                        _orig = recall_ring.find(sender, _msg_ts)
+                        send(recall.format_echo(_who, _orig[1] if _orig else ""),
+                             control_chat)
+                        print(f"[bot] 撤回回显 ← {_who}"
+                              f"{'（有原文）' if _orig else '（没留住原文）'}")
+                        continue
+                    if (_lt & 0xFFFFFFFF) == 10000 and recall.note_system(query):
+                        # 没被当成撤回的**系统消息**：同一种形状只打一次日志。
+                        # 判据的第二道（文本里带「撤回」）还没被真机样本验证过，
+                        # 把没见过的形状打出来，「功能没反应」时才查得下去。
+                        print(f"[bot] 系统消息（未按撤回处理）: {query[:60]!r}")
+                    recall_ring.add(sender, query, _msg_ts, local_type=_lt)
 
                 # 盯着：他发消息就通知我，**一个字都不回他**。
                 # 和自动回复一样，这条路不解析命令——对方随口发个「/help」不该触发命令表。
@@ -2880,6 +3131,44 @@ def main():
                         send(shell_command_text(item, cfg), sender)
                         remember_executed(item, cfg)     # 真跑过了才记
                         continue
+                    if item and item.get("kind") == "call":
+                        # 打电话：**确认时再判一次闸**。登记时判过一次，但从登记到
+                        # 用户回「确认」之间隔着时间——配置可能被改回去了，也可能
+                        # 正好跨过了免打扰边界（23:59 登记、00:01 确认）。
+                        ok, why = callgate.check(cfg)
+                        if not ok:
+                            send(f"这通电话**没有拨**：{why}", sender)
+                            continue
+                        fn = getattr(wcf, "call_voip", None)
+                        if fn is None:
+                            send("这套 hook 没有 `/CallVoip` 端点"
+                                 "（通话能力目前只在探针版 DLL 里），**没有拨出去**。",
+                                 sender)
+                            continue
+                        send(f"好的，正在给 {item.get('to_name')} 拨过去…", sender)
+                        try:
+                            res = fn(item.get("to_wxid"), self_wxid)
+                        except Exception as e:
+                            # ⚠️ 发送失败**绝不自动重试**：第一次可能已经拨通了，
+                            # 重试会让对方接到两通电话（和 bot.send 同一条铁律）。
+                            send(f"拨号请求发不出去：{e}\n"
+                                 f"**不确定到底拨没拨出去**，这里不重试"
+                                 f"（重试可能让对方接到两通）。", sender)
+                            remember_executed(item, cfg)
+                            continue
+                        if isinstance(res, dict) and res.get("error"):
+                            send(f"拨号被 hook 拒绝了：{res['error']}\n"
+                                 f"**没有拨出去**。", sender)
+                            remember_executed(item, cfg)
+                            continue
+                        callgate.record(item.get("to_wxid"), item.get("to_name"))
+                        # 只说「邀请已发出」——本地无法确认对方接没接（hook 成功
+                        # 也回不了「对方收到了」，和发图那条同一个道理）。
+                        send(f"通话邀请已经发给 {item.get('to_name')}。"
+                             f"（我只能确认**邀请发出去了**，接没接本地看不到。）",
+                             sender)
+                        remember_executed(item, cfg)
+                        continue
                     if item:
                         agent_cfg = cfg.get("agent") or {}
                         count = max(1, int(item.get("count") or 1))
@@ -2896,7 +3185,8 @@ def main():
                             traceback.print_exc()
                             dirs_now = None
                         n, err = agent_tools.send_pending(wcf, item, interval,
-                                                          allowed_dirs=dirs_now)
+                                                          allowed_dirs=dirs_now,
+                                                          cfg=cfg)
                         is_text = (not item.get("image") and not item.get("xml")
                                    and not item.get("file"))
                         if is_text:

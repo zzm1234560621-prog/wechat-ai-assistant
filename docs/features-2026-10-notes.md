@@ -426,7 +426,24 @@ hook 不支持并发）。所以那边把话塞进队列，主循环每轮开头
 
 ## T9 · 发普通文件（项目侧就绪；hook 侧只写材料）
 
-**先说结论**：**当前 hook 版本上，「发普通文件」和「转发别人的消息」都做不到。**
+> ## ⚠️ 本节的前提**已被推翻**（2026-10-02 当天晚些时候真机实测）
+>
+> 下面这段原本写的是「当前 hook 发普通文件做不到，所以只做项目侧」。**这个结论是错的**：
+> 发普通文件走的就是现成的 `POST /SendImgMsg`——实测 xlsx / zip 都发出成了**文件消息**
+> （`local_type=(6<<32)|49`，XML 里 attachid/cdnattachurl/aeskey/fileuploadtoken 全是
+> 服务端签发的真值，无新崩溃转储）；而叫 `/SendFileMsg` 的路由**根本不存在（404）**。
+> 当时是把「这个名字不存在」误读成了「这个能力不存在」。
+>
+> **因此现在的接线是**：`agent.send_file`（**默认 true**，能力闸）+ `agent.send_file_via`
+> （默认 `imgmsg` → `/SendImgMsg`，写歪回退）→ `aixed_api.AixedClient.send_file(path, wxid, cfg)`。
+> 完整证据与验证办法见 `docs/send-file-hook-notes.md` 与 `_audit/check_file_msg.py`。
+> **下面这张表保留下来只作历史记录**（「当时改了什么」），其中「端点 = `/SendFileMsg`」
+> 和「开关默认 false」两项**已经不是当前行为**。
+>
+> **仍然成立的那半**：「转发别人的消息」确实做不到——`ForwardXMLMsg` 对所有类型
+> 都 `return false`，真机实测放开会**把微信进程带崩**（连 dmp 都不留）。这一点没变。
+
+**先说（当时以为的）结论**：**当前 hook 版本上，「发普通文件」和「转发别人的消息」都做不到。**
 这不是配置问题——已核实 hook 的接口全集（`docs/aixed-api.postman.json`）里没有发文件的，
 而唯一能搬运已有消息的 `ForwardXMLMsg` 在 `wx_send_xml.cpp` 里对**所有**类型都
 `return false`（真机实测它会**把微信进程带崩**，所以作者改成了安全拒绝）。
@@ -436,17 +453,17 @@ DLL 等于拿用户正在用的微信做实验，而那块区域已经崩过一�
 
 ### 项目侧做了什么
 
-| 环节 | 位置 | 说明 |
+| 环节 | 位置 | 说明（⚠️ 标 * 的两行**已不是当前行为**，见上面红框） |
 |---|---|---|
-| 客户端方法 | `aixed_api.AixedClient.send_file` | → `POST /SendFileMsg`；docstring 里写明「当前没有这个接口」 |
+| 客户端方法 | `aixed_api.AixedClient.send_file` * | 当时 → `POST /SendFileMsg`（**现在默认 → `/SendImgMsg`**，由 `send_file_via` 决定） |
 | 工具 | `agent_tools.t_send_file`（`send_file`） | 定位 → 校验 → 确认闸门 → 发 → 如实报 |
 | 文件定位 | 复用 `file_read.pick()` | **只认微信 `msg/file/` 下**、按文件名（含 `(1)` 重名退让）、**多份命中不替用户挑** |
-| 能力开关 | `agent.send_file_hook`（默认 `false`） | `is True` 严格判定；写 `"true"`/`1` 一律当关（fail-safe） |
-| 默认行为 | **当场如实拒绝** | 关键：拒绝发生在**登记待确认项之前**——不让用户白确认一次 |
-| 确认闸门 | `set_pending(kind="file")` | 名单外才登记；`send_pending` 有 `file` 分支 |
+| 能力开关 | `agent.send_file`（**现在默认 `true`**）* | 只有显式 `false`/`0` 才关；写 `"true"`/`1` 一律当关（fail-safe） |
+| 默认行为 * | 当时：**当场拒绝** | 现在：**进待确认队列**；只有开关关掉时才当场拒绝、且不进队列 |
+| 确认闸门 | `set_pending(kind="file")` | 名单外才登记；`send_pending` 有 `file` 分支（并接收 `cfg` 以决定端点） |
 | 发送前二次校验 | `send_pending` 的 file 分支 | 确认之前**再定位一次**，定位不到就「一份都不发」 |
 | 重启恢复 | `bot.restore_pending` | 一起恢复 `file` 字段（少了它会退化成「发一段文字」） |
-| 回归 | `selftest_policy.test_send_file`（19 条） | 含「开关关着时**一次 client 调用都没有**」（`_Boom` 证明） |
+| 回归 | `selftest_policy.test_send_file`（现 25 条） | 含「开关关着时**一次 client 调用都没有**」（`_Boom`/`_Rec` 证明） |
 
 ### 顺手修了一个错
 

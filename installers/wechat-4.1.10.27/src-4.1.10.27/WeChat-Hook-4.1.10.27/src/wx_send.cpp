@@ -499,6 +499,149 @@ namespace WeixinSend
 
 
 
+    // ============================================================
+    // 语音通话邀请（2026-10-03 逆向出来的）
+    // ============================================================
+    //
+    // 怎么得到的：hook 住微信自己的几个函数、真机打了几通语音，抓到了
+    // 「要发出去的那条消息」长什么样：
+    //
+    //   消息对象（虚表 base + 0x81D2458）：
+    //     +0x008        = 0x32（= 50，消息类型）
+    //     +0x018/+0x058 = 己方 wxid
+    //     +0x038        = **对方 wxid**（呼叫目标）
+    //     +0x180        = 邀请 XML（就是下面 kVoipInviteXml）
+    //     +0x1c0        = <msgsource><alnode><fr>1</fr></alnode></msgsource>
+    //
+    // 而邀请 XML 里**全是常量或 0**：roomid/key/status/recvtime/duration = 0、
+    // invite_type = 1、wording_type = 4608(=0x1200)。**没有任何服务端下发的一次性
+    // 数据** —— 服务端下发的 roomid/inviteid/identity/timestamp 只出现在
+    // **挂断之后**的 VoIPBubbleMsg 状态消息里，发起时用不到。
+    // （wording_type=4608 在三个独立来源上互证：真机 XML、探针内嵌对象模板 +0x1bc、
+    //   Weixin.dll 0x867BB28 处的字段名表。）
+    //
+    // ⚠️ 这里**复用文本消息那套 send_message 机制**，只把 type 改成 50、正文换成
+    //    邀请 XML。文本那条路是已经在跑、是稳的；**SendText 一个字节都没改**，
+    //    本函数是新加的。真机"type=50 这样发能不能叫响"**必须实测**，别当成已知。
+    static const char* kVoipInviteXml =
+        "<voipinvitemsg><roomid>0</roomid><key>0</key><status>0</status>"
+        "<invite_type>1</invite_type></voipinvitemsg>"
+        "<voipextinfo><recvtime>0</recvtime></voipextinfo>"
+        "<voiplocalinfo><wording_type>4608</wording_type><duration>0</duration>"
+        "<display_content></display_content></voiplocalinfo>";
+
+    // 和 BuildTextMessage 逐行一样，唯一区别：type 由参数决定。
+    void BuildTypedMessage(uint64_t* ptr, const std::string& text,
+                           const std::string& wxid, uint64_t type)
+    {
+        uintptr_t base = GetWeixinDllBase();
+
+        ptr[0] = base + offset::txt_message_vtbl;
+        ptr[1] = 0x200000005LL;
+
+        WeixinCall init_text_st = (WeixinCall)(base + offset::txt_message_ctr);
+
+        TextMessage* msg = reinterpret_cast<TextMessage*>(ptr + 2);
+        init_text_st(reinterpret_cast<uint64_t>(msg));
+
+        SetWeixinString(&msg->receiver, wxid);
+        SetWeixinString(&msg->content, text);
+        msg->msg_len = text.length();
+        msg->type = type;
+    }
+
+    // 和 SendText 逐行一样，只在构造那一步把 type 传进去。
+    void SendTyped(const std::string& wxidorgid, const std::string& msg, uint64_t type)
+    {
+        uintptr_t base = GetWeixinDllBase();
+
+        uint64_t* msgBuf = HeapAlloc_mb<uint64_t>(0x768);
+        BuildTypedMessage(msgBuf, msg, wxidorgid, type);
+
+        uint64_t* data = HeapAlloc_mb<uint64_t>(0x20);
+        data[0] = (uint64_t)(msgBuf + 2);
+        data[1] = (uint64_t)(msgBuf);
+        data[2] = 0;
+
+        uint64_t* arg1 = HeapAlloc_mb<uint64_t>(0x28);
+        arg1[0] = base + offset::param1_vtable;
+        arg1[1] = reinterpret_cast<uint64_t>(data);
+        arg1[2] = (uint64_t)data + 0x10;
+        arg1[3] = (uint64_t)data + 0x10;
+        arg1[4] = 1;
+
+        uint64_t* arg2 = HeapAlloc_mb<uint64_t>(0xE8);
+        BuildSendParam2_Text(arg2);
+
+        WeixinCall send_message = (WeixinCall)(base + offset::send_message);
+        send_message((uint64_t)arg1, (uint64_t)arg2);
+    }
+
+    void SendVoipInvite(const std::string& peerWxid)
+    {
+        SendTyped(peerWxid, std::string(kVoipInviteXml), 0x32);
+    }
+
+    // ============================================================
+    // 用**微信自己的原语**造一条消息对象并发出去
+    // ============================================================
+    //
+    // 为什么还要有这个：`SendTyped` 用的是 `TextMessage`（虚表 `txt_message_vtbl`
+    // = 0x8279358）。实测（2026-10-03）type=50 走那条路**确实被微信当类型 50 处理了**
+    // （`type_dispatch rdx=0x32` 命中、`payload_ctor` 也跑了），**但没有进入通话状态**：
+    // 不弹呼叫窗、对方不响。
+    //
+    // 对比同一次抓取里"真人手动打的那通"：
+    //   真人：`payload_ctor` ↔ `voipmsg_layer`(0x2319D00) **交替 18 次**，还有
+    //         `serializer`/`type50_handler`；payload 里的 id 是**随机生成**的。
+    //   我们：`payload_ctor` **1 次**，就结束了；payload 里那个 8 位 hex id 是 `00000000`。
+    //   ⇒ 缺的是**通话状态机**，而那东西只在"微信自己发起通话"时才起来。
+    //
+    // 而 `0x173D080`（微信内部造 sysmsg 的地方）揭示了它怎么做的：
+    //   `mov r8d,0x2d8` 开缓冲 → `call 0xA04560`（构造，写虚表 0x81D2458）
+    //   → `call 0xA1B1B0(obj, 类型)`（按类型分发）
+    //   **对象大小 0x2D8、虚表 0x81D2458** —— 和真机通话里那个对象**完全一致**。
+    //
+    // 所以本函数照它来：0x2D8 的通用消息对象 + `0xA04560` + `0xA1B1B0`。
+    // 字段偏移是从真机抓到的那个对象上**量出来的**（不是猜的）：
+    //     +0x018 / +0x058 = 己方 wxid     +0x038 = 对方 wxid
+    //     +0x180 = 正文（邀请 XML）        +0x1c0 = <msgsource>…
+    //
+    // ⚠️ 仍然**必须真机实测**：这能不能真把对方叫响，只有打了才知道。
+    void SendVoipObject(const std::string& selfWxid, const std::string& peerWxid,
+                        const std::string& body, uint64_t type)
+    {
+        uintptr_t base = GetWeixinDllBase();
+        const size_t SZ = 0x2D8;
+
+        uint8_t* obj = (uint8_t*)HeapAlloc_mb<uint8_t>(SZ);
+        if (!obj) return;
+
+        WeixinCall ctor = (WeixinCall)(base + offset::msg_ctor);
+        // 显式给第二个参数 0。`0x173D080` 那里 `rdx` 是紧邻那次 memset 的残留值
+        // （`memset(buf, rdx, 0x2d8)` 的 rdx 是填充字节），所以 `0xA04560` 实际只吃
+        // `rcx = this`（虚表它自己写 0x81D2458）。**别把垃圾传进去**。
+        ctor((uint64_t)obj, (uint64_t)0);
+
+        std::string msgsrc = "<msgsource><alnode><fr>1</fr></alnode></msgsource>";
+
+        SetWeixinString((WeixinString*)(obj + 0x18),  selfWxid);
+        SetWeixinString((WeixinString*)(obj + 0x38),  peerWxid);
+        SetWeixinString((WeixinString*)(obj + 0x58),  selfWxid);
+        SetWeixinString((WeixinString*)(obj + 0x180), body);
+        SetWeixinString((WeixinString*)(obj + 0x1c0), msgsrc);
+
+        WeixinCall dispatch = (WeixinCall)(base + offset::type_dispatch);
+        dispatch((uint64_t)obj, (uint64_t)type);
+    }
+
+    void SendVoipObjectInvite(const std::string& selfWxid, const std::string& peerWxid)
+    {
+        SendVoipObject(selfWxid, peerWxid, std::string(kVoipInviteXml), 0x32);
+    }
+
+
+
     void DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path)
     {
         uintptr_t base = GetWeixinDllBase();

@@ -19,6 +19,7 @@ import agent_tools
 import aixed_api
 import bot
 import live_history
+import voice_mem          # 跨模块契约用例（见语音那段：length_bytes 必须传下去）
 
 SENT = []          # 记录发出去的消息，供断言
 SELF_WXID = "wxid_self_0001"
@@ -275,6 +276,181 @@ def main():
     ok &= check("ping() 可用", c.ping() == (True, SELF_WXID), c.ping())
     ok &= check("db_status()", c.db_status() == {"IsLogin": 1, "hWeixin": 123456})
     ok &= check("is_login()", c.is_login() is True)
+
+    print("\n── 语音条必须**如实说读不到内容**（否则模型会以为自己听过、编一段出来）──")
+    _v34 = live_history._render_nontext(34, '1"')
+    ok &= check("语音条标签写清「读不到内容」", "读不到内容" in _v34, _v34)
+    ok &= check("语音条仍带上摘要（时长）", "1" in str(_v34), _v34)
+    _v1 = live_history._render_nontext(1, "你好")
+    ok &= check("文本渲染不受影响", "读不到" not in _v1 and "你好" in _v1, _v1)
+    _v3 = live_history._render_nontext(3)
+    ok &= check("图片标签不受影响", _v3 == "[图片]", _v3)
+
+    print("\n── 微信「转文字」落库：packed_info_data（2026-10-03 真机取证）──")
+    # 真实取样：文件传输助手一条 1.24 秒语音，local_id=613
+    _before = "080410385800"                                            # 转文字前
+    _after = "080410382A0D08021209E4BDA0E5A5BDE380825800"               # 转文字后
+    ok &= check("转文字后的 packed 解出原文",
+                live_history.voice_transcript(_after) == "你好。",
+                live_history.voice_transcript(_after))
+    ok &= check("还没转文字 -> 空（不许编）",
+                live_history.voice_transcript(_before) == "")
+    for _bad in ("", None, "zz", "0804", "080410"):
+        ok &= check(f"坏输入 {_bad!r} 不抛异常、返回空",
+                    live_history.voice_transcript(_bad) == "")
+    _vr = live_history._render_nontext(34, '1"', _after)
+    ok &= check("有转写 -> 正文就是那句原话", "你好。" in _vr, _vr)
+    ok &= check("有转写 -> 不再说「读不到内容」", "读不到内容" not in _vr, _vr)
+    _vn = live_history._render_nontext(34, '1"', _before)
+    ok &= check("没转写 -> 教用户去点「转文字」", "转文字" in _vn, _vn)
+    ok &= check("没转写 -> 不许出现任何「内容」", "你好" not in _vn, _vn)
+
+    # 单一 owner：本文件里 `_pb_fields` 只能有一份定义。
+    # （2026-10-03 我新写了一份同名的，把既有的那份覆盖掉，
+    #   于是 voice_transcript 拿到 2 元组、当场 unpack 报错。）
+    _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "live_history.py"), encoding="utf-8").read()
+    ok &= check("protobuf 遍历只有一个 owner（_pb_fields 只定义一次）",
+                _src.count("def _pb_fields(buf)") + _src.count("def _pb_fields(d)") == 1,
+                _src.count("def _pb_fields"))
+
+    # ── 「长文本消息也是 zstd 压缩的」这个坑（2026-10-03 真机，很隐蔽）──
+    # 微信对**长文本**同样用 zstd 存 message_content（短消息如「确认」才是明文）。
+    # 以前文本那条路直接 `str(_pick(r, "message_content", 4))` 原样取，后果：
+    #   ① bot 把自己**上一条长回复的压缩串**当成用户新说的话 → 自己回自己
+    #      （用户原话：「我就发了一条音频，它回了我好几个」）；
+    #   ② `is_own_reply()` 拿压缩串跟刚发出去的原文比 → **必然对不上**，
+    #      「自己的回显」这条判据对长回复完全失效（短回复没事，所以极难发现）。
+    # 判据：live_history 里**任何**取 message_content 的地方都必须过 decode_msg_content。
+    print("\n── message_content 必须解压（长文本是 zstd 压缩的）──")
+    _raw = [ln.strip() for ln in _src.splitlines()
+            if 'str(_pick(r, "message_content"' in ln]
+    ok &= check("取 message_content 一律走 decode_msg_content（不许裸 str 取）",
+                not _raw, _raw[:2])
+    ok &= check("……而且真的在用它（不是把用处删了）",
+                _src.count("decode_msg_content(_pick(") >= 4,
+                _src.count("decode_msg_content(_pick("))
+    try:
+        import zstandard as _zstd
+        _long = "长文本消息会被压缩。" * 40
+        _hex = _zstd.ZstdCompressor().compress(_long.encode("utf-8")).hex()
+        _dec = live_history.decode_msg_content(_hex)
+        ok &= check("真造一条 zstd 压缩的长文本 → 解回原文",
+                    _dec == _long, (str(_dec)[:30], len(str(_dec))))
+        ok &= check("……而且明文长这样（`28B52FFD` 开头 = zstd 魔数）",
+                    _hex.upper().startswith("28B52FFD"), _hex[:12])
+        ok &= check("短明文原样返回（不能把明文也弄坏）",
+                    live_history.decode_msg_content("确认") == "确认",
+                    live_history.decode_msg_content("确认"))
+    except ImportError:
+        check("zstandard 没装，跳过真解压（静态守卫已覆盖）", True, "")
+
+    print("\n── 语音条自动转文字（bot.read_voice_message）──")
+    try:
+        import bot as _bot
+
+        class _M:
+            def __init__(self, content, local_id="", talker="filehelper"):
+                self.content = content
+                self.local_id = local_id
+                self.talker = talker
+                self.roomid = ""
+                self.sender = talker
+
+        ok &= check("认出 [语音] 你好。",
+                    _bot.voice_already_transcribed('[语音] 你好。') == "你好。")
+        ok &= check("带时长的  [语音 1\"] 你好。 也认",
+                    _bot.voice_already_transcribed('[语音 1"] 你好。') == "你好。")
+        _bad = ('[语音条（**读不到内容**：音频不在本机磁盘上；'
+                '在微信里点一次「转文字」，我就能读到）] 1"')
+        ok &= check("「读不到内容」的标签**绝不许**被当成转写（否则拿时长冒充内容）",
+                    _bot.voice_already_transcribed(_bad) == "", 
+                    _bot.voice_already_transcribed(_bad))
+        ok &= check("普通文本不受影响", _bot.voice_already_transcribed("你好") == "")
+
+        _t, _w = _bot.read_voice_message(None, {}, _M('[语音] 你好。'))
+        ok &= check("已转文字 -> 直接给文字（零成本，不碰内存）", _t == "你好。", (_t, _w))
+        _t, _w = _bot.read_voice_message(None, {"voice": {"auto_read": False}}, _M(_bad))
+        ok &= check("关掉 auto_read -> 不读、也不报错",
+                    _t == "" and _w == "", (_t, _w))
+        _t, _w = _bot.read_voice_message(None, {}, _M(_bad))
+        ok &= check("没带 local_id -> 如实说认不出是哪一条",
+                    _t == "" and "local_id" in _w, (_t, _w))
+        _orig = live_history.voice_info
+        live_history.voice_info = lambda c, tk, lid: {"duration_ms": 999999}
+        try:
+            _t, _w = _bot.read_voice_message(
+                None, {"voice": {"max_seconds": 60}}, _M(_bad, local_id="614"))
+            ok &= check("超过 max_seconds -> 拒绝并说清（不硬转）",
+                        _t == "" and "max_seconds" in _w, (_t, _w))
+        finally:
+            live_history.voice_info = _orig
+
+        # ⚠️ **跨模块契约**（2026-10-03）：`read_voice_message` 必须把消息 XML 的
+        # `length_bytes` 传给 `voice_mem.read(target_bytes=...)` —— 那是把"同时长的
+        # 两条语音"分开的唯一信号（真实 SILK 长度 = length−1，真机 8/8）。
+        # 为什么必须用用例钉住：这条链路**以前就是断的**（`voice_info` 一直在返回
+        # `length_bytes`，`read_voice_message` 一直没往下传），而且断掉**不报错**、
+        # 只是偶尔读错人 —— 本项目的原话是「测试是绿的、生产是漏的」。
+        _seen = {}
+        _orig_vi, _orig_read = live_history.voice_info, voice_mem.read
+
+        def _fake_vi(c, tk, lid):
+            return {"duration_ms": 1400, "length_bytes": 2804}
+
+        def _fake_read(dur, **kw):
+            _seen.update(kw)
+            _seen["duration_ms"] = dur
+            return [], "（用例桩：不真转写）"
+        live_history.voice_info = _fake_vi
+        voice_mem.read = _fake_read
+        try:
+            _bot.read_voice_message(None, {"voice": {"max_seconds": 60}},
+                                    _M(_bad, local_id="615"))
+            ok &= check("`length_bytes` 真的传到了 voice_mem.read（跨模块契约）",
+                        _seen.get("target_bytes") == 2804, _seen)
+            ok &= check("……时长也照旧传（1400ms）",
+                        _seen.get("duration_ms") == 1400, _seen)
+            ok &= check("……cfg 也照旧传（不传会静默退回本地 whisper-small）",
+                        "cfg" in _seen, sorted(_seen))
+        finally:
+            live_history.voice_info, voice_mem.read = _orig_vi, _orig_read
+
+        print("\n── 只有类型标签的消息**不许进模型**（否则就是对着空气回话）──")
+        for _lab in ("[系统消息]", "[表情]", '[语音] 2"', "[通话]"):
+            ok &= check(f"{_lab!r} 判为纯标签",
+                        _bot.is_label_only(_lab) is True, _bot.is_label_only(_lab))
+        for _real in ("[语音] 你好。",            # 转写出来的真内容
+                      '[图片]（local_id=169；本地已解码缩略图：C:\\x.jpg）',
+                      '[语音条（**读不到内容**：音频不在本机磁盘上）] 2"',
+                      "你好", ""):
+            ok &= check(f"{_real[:22]!r} 不是纯标签（照旧进模型）",
+                        _bot.is_label_only(_real) is False,
+                        _bot.is_label_only(_real))
+
+        # ⚠️ **顺序**用例（2026-10-03 真机踩到，症状是「发语音 bot 完全没反应」）：
+        # 语音条的渲染就是「一个标签 + 时长」，而**标签文字跟着微信界面语言走** ——
+        # 中文界面 `[语音条（…）]`、**英文界面字面的 `[Audio] 8"`**（SessionTable.summary
+        # 原样拼进来）。`_LABEL_ONLY_RE` 会命中 `[Audio] 8"`，于是语音在走到转写之前
+        # 就被 `continue` 掉，**连一句失败提示都没有**（静默丢弃）。
+        # 所以主循环里语音那段**必须排在** is_label_only 之前 —— 这条只能靠源码顺序钉住，
+        # 上面那些「函数行为」用例全绿也发现不了它（它们测的是两个函数各自对不对）。
+        import io as _io
+        import os as _os
+        _bot_src_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)), "bot.py")
+        with _io.open(_bot_src_path, encoding="utf-8") as _fh:
+            _src = _fh.read()
+        _v_call = _src.find("read_voice_message(wcf, cfg, msg)")
+        _l_check = _src.find("if is_label_only(query):")
+        ok &= check("主循环里**语音处理在空标签检查之前**（英文界面 [Audio] 8\" 的语音才能被处理）",
+                    _v_call > 0 and _l_check > 0 and _v_call < _l_check,
+                    (_v_call, _l_check))
+        ok &= check("英文界面的语音标签 `[Audio] 8\"` 确实命中空标签判据（这就是当初被丢的原因）",
+                    _bot.is_label_only('[Audio]  8"') is True,
+                    _bot.is_label_only('[Audio]  8"'))
+    except Exception as e:
+        ok &= check(f"语音接线自测跑得起来（{type(e).__name__}: {e}）", False)
 
     print("\n── 错误返回必须显式报错，不能被当成空结果 ──")
     try:

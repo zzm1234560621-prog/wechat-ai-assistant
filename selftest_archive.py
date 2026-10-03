@@ -163,9 +163,10 @@ def t4_zip_slip_and_tmp_cleanup():
           err is None and "evil.txt" in text and "不该被写到外面去" in text, (text, err))
     check("**没有**在样本目录里新建文件（更没写到上层目录）", after == before, after - before)
     check("上层目录里没有 evil.txt", not os.path.exists(os.path.join(os.path.dirname(TMP), "evil.txt")))
+    _td = archive_read._tmp_dir()
     check("临时目录里没留下成员残留",
-          not [n for n in os.listdir(archive_read._TMP_DIR)] if os.path.isdir(archive_read._TMP_DIR) else True,
-          os.listdir(archive_read._TMP_DIR) if os.path.isdir(archive_read._TMP_DIR) else [])
+          not [n for n in os.listdir(_td)] if os.path.isdir(_td) else True,
+          os.listdir(_td) if os.path.isdir(_td) else [])
 
 
 def t5_optional_backends_honest():
@@ -199,6 +200,14 @@ def t6_real_machine():
 
 
 def main():
+    # 临时根改到系统临时盘（`PROJ_TMP`）：默认的 `<项目>/data/tmp_*` 在受限环境
+    # （只允许写工作区顶层的沙箱）里**建都建不了**，本套件真实解包时会 PermissionError。
+    # 生产默认不受影响 —— 见 `tempdir.py`。
+    try:
+        import tempdir
+        tempdir.use_for_tests()
+    except Exception as _e:            # 改道失败不许拦住跑测试
+        print(f"⚠️ 临时目录改道失败（{type(_e).__name__}: {_e}），继续用默认")
     print("=" * 60)
     print("压缩包递归读回归自测（临时目录：%s）" % TMP)
     print("=" * 60)

@@ -3,8 +3,10 @@
 范围和边界（先看清，别顺手扩）：
   * ✅ 只处理**以文件形式**存在的音频（`msg/file/<月>/xxx.m4a` 这类，
     也就是 `file_read.files_roots()` 允许的目录）。这些人发/自己发的音频是明文的。
-  * ❌ **微信语音条（local_type=34）不在这里**——真机实测拿不到音频字节
-    （82 个 `Rec/` 目录全空、全盘无 `.silk/.amr`），见 `docs/voice-msg-feasibility.md`。
+  * ⚠️ **微信语音条（local_type=34）不从这个入口进来，但已经是能读的**：
+    由 `bot.read_voice_message()` → `voice_mem.py` 从**微信进程内存**里拿明文 SILK
+    → 解码后调本模块转写（见 `docs/voice-msg-feasibility.md` 的 2026-10-03 结论）。
+    本模块只负责"音频字节已经在手上"之后的转写，不负责把语音条捞出来。
   * ❌ 发语音 / 语音通话：hook 做不到，别在这里假装。
 
 三条硬约束（都是不可谈的，理由写在 `docs/voice-input-spec.md`）：
@@ -24,9 +26,12 @@
 """
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+
+import tempdir
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,6 +42,29 @@ AUDIO_EXT = (".m4a", ".mp3", ".wav", ".amr", ".ogg", ".aac", ".flac", ".wma", ".
 DEFAULT_MODEL = "small"
 DEFAULT_MAX_SECONDS = 1800
 HF_MIRROR = "https://hf-mirror.com"
+# 转写语言：**默认 auto（自己判）**。2026-10-03 真机踩到：以前两处 kwargs 写死
+# `language="zh"`，用户说英文 `superboynick`，whisper 被迫用中文词汇表硬凑，转出
+# 「你好,你好,我跟俗文貴你最近聊了什麼…」—— 一段**通顺但完全捏造**的中文，还被当成
+# 用户的原话送进 agent 去执行。这类「静默给错内容」比读不出来严重得多。
+# 留 `zh` 是给「只说自己母语」的人省掉语言探测的：设了就按它走。
+# ⚠️ 白名单校验而非直接下传：whisper 对非法 language 会**抛异常**，把「一个拼错的
+# 配置值」变成「每次转写都失败」；未知值退回 auto 并告警（不静默）。
+KNOWN_LANGS = (
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl",
+    "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk",
+    "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr",
+    "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn",
+    "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne",
+    "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn",
+    "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi",
+    "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my",
+    "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su",
+    "yue",
+)
+DEFAULT_LANGUAGE = "auto"
+# 允许转写哪些语言（`audio.languages`）。默认中英文：探测出别的语言就**如实拒绝**，
+# 不用允许的语言去"凑"——凑出来的正是「通顺但捏造」那种假内容（见 allowed_languages）。
+DEFAULT_LANGUAGES = ["zh", "en"]
 # 云端默认给硅基流动：本机实测可达（api.openai.com 不通），SenseVoice 中文好又便宜。
 DEFAULT_CLOUD_BASE = "https://api.siliconflow.cn/v1"
 DEFAULT_CLOUD_MODEL = "FunAudioLLM/SenseVoiceSmall"
@@ -81,6 +109,100 @@ def max_seconds(cfg):
     except (TypeError, ValueError):
         n = DEFAULT_MAX_SECONDS
     return max(1, min(3600, n))          # 上限 1 小时，拦住乱填
+
+
+def language(cfg):
+    """转写语言：`auto`（默认，自己判）/ 具体两字母代码（`zh`、`en`…）。
+
+    返回 **faster-whisper 该收到的值**：`auto` → `None`（不传 = 让它探测），
+    否则返回归一化后的代码。
+
+    为什么必须有这个（2026-10-03 真机）：以前两处 kwargs 写死 `language="zh"`，
+    英文 `superboynick` 被中文强行音译成「俗文貴」，还顺带编了一整句
+    「你好,你好,我跟…聊了什麼」——**通顺、但完全是捏造的**，然后被当作
+    用户的原话进 `run_agent` 去执行。用户只会说中文时它是"能用"的，
+    一旦说英文/中英混说，它就**静默地给错误内容**。
+
+    非法值**退回 auto 并告警**，不静默下传：whisper 遇到不认识的 language 会抛，
+    那等于把「配置里一个手滑的拼写」变成「每次转写都失败」。
+    """
+    v = str(section(cfg or {}).get("language") or DEFAULT_LANGUAGE).strip().lower()
+    if v in ("", "auto", "none", "detect"):
+        return None
+    if v in KNOWN_LANGS:
+        return v
+    print(f"[audio] ⚠️ audio.language 不认识 {v!r}（要 auto 或两字母代码，如 zh/en），"
+          f"这次按 auto 处理（让它自己探测）", file=sys.stderr, flush=True)
+    return None
+
+
+def allowed_languages(cfg):
+    """`audio.languages`：**允许转写哪些语言**。返回归一化后的 list；空 = 不限制。
+
+    为什么需要（2026-10-03 真机第二次）：`audio.language: auto` 之后，用户说的一句
+    短外语被 whisper 判成了**法语**，转出 `Super poignée comme elle a l'air d'un
+    chemin.` —— **语法通顺、语义不通**。也就是说「不写死语言」只解决了"被迫说中文"，
+    没解决"**选错语言照样捏造**"。而捏造的内容会当作原话进 `run_agent`。
+
+    所以这里的语义是**限制**：探测出的语言不在集合内就**如实拒绝**，
+    绝不用集合内的语言去"凑"那段音频（凑出来的正是通顺的假话）。
+    默认 `["zh", "en"]`（用户要的中英文）；配 `[]` / `auto` 可关掉限制。
+
+    非法项**逐个告警并丢掉**；全非法则退回默认 —— 不静默接受看不懂的配置。
+    """
+    raw = section(cfg or {}).get("languages")
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "auto", "all")):
+        return list(DEFAULT_LANGUAGES)
+    if isinstance(raw, str):
+        raw = [x for x in re.split(r"[,\s]+", raw) if x]
+    if not isinstance(raw, (list, tuple)):
+        print(f"[audio] ⚠️ audio.languages 要是列表（如 [zh, en]），收到 {type(raw).__name__}，"
+              f"退回默认 {DEFAULT_LANGUAGES}", file=sys.stderr, flush=True)
+        return list(DEFAULT_LANGUAGES)
+    if len(raw) == 0:                     # 显式空列表 = 关掉限制
+        return []
+    out, bad = [], []
+    for x in raw:
+        s = str(x or "").strip().lower()
+        if not s or s in ("auto", "all"):
+            continue
+        if s in KNOWN_LANGS:
+            if s not in out:
+                out.append(s)
+        else:
+            bad.append(str(x))
+    if bad:
+        print(f"[audio] ⚠️ audio.languages 里这些不认识、已忽略：{bad}", file=sys.stderr, flush=True)
+    return out or list(DEFAULT_LANGUAGES)
+
+
+def detect_language(path, cfg):
+    """探测音频语言。返回 `(代码, 错误)`；探测不了返回 `(None, 原因)`。
+
+    为什么用 `detect_language` 而不是 `transcribe(language=None)`：后者会直接
+    **用探测到的语言把整段转写完**，等我们看清它猜成法语时，捏造的中文/法文已经成型了。
+    先探、再决定"要不要转"，才能做到「不在允许集合里就**一个字都不给**」。
+
+    任何失败（老版本没这个接口 / 模型报错）都退回 `None`，由调用方按"探测不了"处理
+    ——**绝不因此拒绝**，那会把一个可选功能变成硬故障。
+    """
+    mdir = model_dir(cfg)
+    model = _get_model(mdir)
+    det = getattr(model, "detect_language", None)
+    if det is None:
+        return None, "这个 faster-whisper 版本没有语言探测接口，跳过语言限制"
+    try:
+        lang, prob, all_probs = det(path)
+    except Exception as e:
+        return None, f"语言探测失败：{type(e).__name__}: {str(e)[:80]}"
+    code = str(lang or "").strip().lower()
+    if not code:
+        return None, "语言探测没给出结果"
+    try:
+        p = float(prob)
+    except (TypeError, ValueError):
+        p = 0.0
+    return code, f"探测={code}（把握 {p:.2f}）"
 
 
 def cloud_cfg(cfg):
@@ -202,13 +324,59 @@ def initial_prompt(cfg=None):
     return str(section(cfg or {}).get("initial_prompt") or "").strip()
 
 
+_MODEL_CACHE = {}
+_MODEL_LOCK = None
+
+
+def _get_model(mdir):
+    """进程内复用 `WhisperModel`。**为什么要缓存**：`WhisperModel(...)` 每次构造都要
+    读模型文件、建实例 —— 实测 1.9 秒（冷的时候飘到 14 秒），而一段 1.2 秒音频的
+    转写本身只要 ~5 秒。一条语音重载一次模型等于白花 1/4 的时间；语音条那条路
+    （`voice_mem`）本来就更贵，不能再把这个成本乘上去。
+
+    加锁是因为 worker 线程和主线程都可能调它（一条语音＝一次调用）。
+
+    ⚠️ 缓存里连**类对象**一起存：`WhisperModel` 换了（自测会把
+    `faster_whisper` 整个换成假模块）就必须重建，否则会拿上一次的假模型继续用
+    —— 自测真抓到过（「转出空文本算失败」那条用例拿到的是**上一个**假模型，
+    于是断言全错）。判据用 `is`：实现类变了，缓存就是陈的。
+    """
+    global _MODEL_LOCK
+    import threading
+    if _MODEL_LOCK is None:
+        _MODEL_LOCK = threading.Lock()
+    with _MODEL_LOCK:
+        from faster_whisper import WhisperModel
+        cached = _MODEL_CACHE.get(mdir)
+        if cached is not None and cached[0] is WhisperModel:
+            return cached[1]
+        m = WhisperModel(mdir, device="cpu", compute_type="int8")
+        _MODEL_CACHE[mdir] = (WhisperModel, m)
+        return m
+
+
 def _local(path, cfg):
-    from faster_whisper import WhisperModel
     mdir = model_dir(cfg)
     # 只认本地目录：**推理期结构上不可能联网**（模型不存在时上面 available() 已经拦了）
-    model = WhisperModel(mdir, device="cpu", compute_type="int8")
+    model = _get_model(mdir)
     prompt = initial_prompt(cfg)
-    kw = {"language": "zh", "vad_filter": True}
+    kw = {"vad_filter": True}
+    # ⚠️ 不传 language = 让 whisper 自己探测（`auto`）。**别再写死 "zh"**：
+    #    那会让英文语音被中文词汇表硬凑成一段捏造的中文（见 language() 的注释）。
+    lang = language(cfg)
+    allow = allowed_languages(cfg)
+    if lang:
+        kw["language"] = lang
+    elif allow:
+        # 没写死语言时**先探一次再决定转不转**：探测出的语言不在允许集合里就如实拒绝。
+        # 为什么不能「探到什么就用什么转」：那正是 `Super poignée comme elle a l'air
+        # d'un chemin.` 那次 —— 猜成法语之后照样捏一句通顺的假话，还进了 `run_agent`。
+        det, why = detect_language(path, cfg)
+        if det and det not in allow:
+            return "", (f"这段音频听着像 **{det}**，而 `audio.languages` 只允许 "
+                        f"{'/'.join(allow)}，所以**没有转写**。（{why}）**没有编内容**。"
+                        f"想把 {det} 也放开，就把它加进 `audio.languages`；"
+                        f"确认只说自己要的那两种语言就保持现状。")
     if prompt:
         kw["initial_prompt"] = prompt
     segments, info = model.transcribe(path, **kw)
@@ -242,7 +410,12 @@ def _cloud(path, cfg):
     c = cloud_cfg(cfg)
     with open(path, "rb") as fh:
         data = fh.read()
-    body, ctype = _multipart({"model": c["model"]}, "file",
+    fields = {"model": c["model"]}
+    # 云端同样按配置传语言：`auto` 就**不传**（OpenAI 兼容端点是"不传就自己探测"）
+    lang = language(cfg)
+    if lang:
+        fields["language"] = lang
+    body, ctype = _multipart(fields, "file",
                              os.path.basename(path), data)
     req = urllib.request.Request(
         f"{c['base_url']}/audio/transcriptions", data=body, method="POST",
@@ -270,32 +443,14 @@ def _cloud(path, cfg):
 
 
 def tmp_dir():
-    d = os.path.join(PROJECT_DIR, "data", "tmp_audio")
-    os.makedirs(d, exist_ok=True)
-    return d
+    """切音频的临时目录。**别在这里再硬编码路径**：统一走 `tempdir.get()`，
+    这样受限环境/别的部署形态可以用 `PROJ_TMP` 环境变量改道（见 `tempdir.py`）。"""
+    return tempdir.get("tmp_audio")
 
 
 def sweep_tmp(max_age=86400.0):
-    """清理切音频留下的临时文件（**删了什么要打日志**）。"""
-    import time
-    d = os.path.join(PROJECT_DIR, "data", "tmp_audio")
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return []
-    dead, now = [], time.time()
-    for n in names:
-        p = os.path.join(d, n)
-        try:
-            if now - os.path.getmtime(p) > max_age:
-                os.remove(p)
-                dead.append(n)
-        except OSError:
-            continue
-    if dead:
-        print(f"⚠️ audio_read: 清理了 {len(dead)} 个音频临时文件（>{max_age/3600:.0f} 小时）。",
-              flush=True)
-    return dead
+    """清理切音频留下的临时文件（**删了什么要打日志**，由 `tempdir.sweep` 统一实现）。"""
+    return tempdir.sweep("tmp_audio", max_age, "audio_read")
 
 
 def slice_to_wav(src, out, start=0.0, secs=None, rate=16000):
@@ -385,6 +540,71 @@ def window(path, cfg=None, start=0, max_bytes=None):
     if dur is not None and start + lim < dur - 0.5:
         next_start = start + lim
     return text, next_start, ""
+
+
+def transcribe_scored(path, cfg=None):
+    """像 `transcribe()`，但**多回一个置信度分数**（本地才有；云端返回 None）。
+
+    为什么要它（2026-10-03 真机取证）：语音条那条路要在一堆「时长一模一样」的
+    候选里挑一条，而**唯一能把对的挑出来的信号就是置信度** ——
+
+        local_id=615（用户说「我最近聊了什么」，1600 毫秒）两条候选：
+          1400ms SILK 2730 字节（**更接近**加密字节数 2804）  no_speech 0.17  logprob -0.97  -> 「要饿了吗呢」✗
+          1400ms SILK 2547 字节                              no_speech 0.06  logprob -0.76  -> 「我最近得好了什么」✓
+
+    时长分不出来、SILK 字节数**还会把错的排前面**；没有分数就只能瞎挑 ——
+    而"瞎挑"在这里等于**拿别人的话去执行**，比读不出来严重得多。
+
+    分数 = 平均 `avg_logprob` − 最大 `no_speech_prob`，**越高越好**。
+    这是**经验值**，不是校准过的概率；所以调用方必须允许"分不出来就拒绝"。
+
+    返回 `(文本, 分数, 错误)`；失败时文本 ""、分数 None、错误是人话。
+    """
+    cfg = cfg or {}
+    if backend(cfg) == "cloud":
+        text, err = transcribe(path, cfg)
+        return (text, None, "") if not err else ("", None, err)
+    ok, why = _precheck(path, cfg, None)
+    if not ok:
+        return "", None, why
+    usable, info = available(cfg)
+    if not usable:
+        return "", None, info
+    try:
+        model = _get_model(model_dir(cfg))
+        kw = {"vad_filter": True}
+        # 同 `_local`：语言不写死，默认让 whisper 自己探测（见 language() 注释）；
+        # 没写死时再按 `audio.languages` **限制**——探测出别的语言就如实拒绝（不给文本）。
+        lang = language(cfg)
+        allow = allowed_languages(cfg)
+        if lang:
+            kw["language"] = lang
+        elif allow:
+            det, why = detect_language(path, cfg)
+            if det and det not in allow:
+                return "", None, (f"这段语音听着像 **{det}**，而 `audio.languages` 只允许 "
+                                  f"{'/'.join(allow)}，所以**没有转写**。（{why}）"
+                                  f"**没有编内容**。")
+        prompt = initial_prompt(cfg)
+        if prompt:
+            kw["initial_prompt"] = prompt
+        segments, meta = model.transcribe(path, **kw)
+        segs = list(segments)
+    except Exception as e:
+        return "", None, f"{type(e).__name__}: {str(e)[:150]}"
+    text = "".join(getattr(s, "text", "") or "" for s in segs).strip()
+    if not text:
+        return "", None, (f"转写结果为空（识别到语言={getattr(meta, 'language', '?')}、"
+                          f"时长={getattr(meta, 'duration', 0):.1f} 秒）。"
+                          f"可能是没有人声、音量太小或纯音乐。**没有编内容**。")
+    lps = [getattr(s, "avg_logprob", None) for s in segs]
+    lps = [x for x in lps if isinstance(x, (int, float))]
+    nsps = [getattr(s, "no_speech_prob", None) for s in segs]
+    nsps = [x for x in nsps if isinstance(x, (int, float))]
+    score = None
+    if lps:
+        score = (sum(lps) / len(lps)) - (max(nsps) if nsps else 0.0)
+    return text, score, ""
 
 
 def transcribe(path, cfg=None, max_bytes=None):

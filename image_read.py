@@ -27,6 +27,8 @@ import time
 import urllib.error
 import urllib.request
 
+import tempdir
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _OCR_PS1 = os.path.join(_HERE, "tools", "ocr.ps1")
 _RESIZE_PS1 = os.path.join(_HERE, "tools", "resize.ps1")
@@ -105,7 +107,13 @@ def cache_path(cfg):
 
 
 def tmp_dir():
-    return os.path.join(_HERE, "data", "tmp_img")
+    """缩图的临时目录。统一走 `tempdir.get()` —— 可用 `PROJ_TMP` 改道（见 `tempdir.py`）。"""
+    return tempdir.get("tmp_img")
+
+
+def sweep_tmp(max_age=2 * 86400.0):
+    """清理缩图留下的临时文件（**删了什么要打日志**，由 `tempdir.sweep` 统一实现）。"""
+    return tempdir.sweep("tmp_img", max_age, "image_read")
 
 
 def _too_big(path, cfg, limit=None):
@@ -268,29 +276,6 @@ def resize(path, max_edge, out=None):
     if p.returncode != 0 or not text.startswith("OK:"):
         return False, (text or f"缩图退出码 {p.returncode}")[:200]
     return True, out
-
-
-def sweep_tmp(max_age=2 * 86400.0):
-    """清理缩图留下的临时文件（**删了什么要打日志**：静默丢弃不允许）。"""
-    d = tmp_dir()
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return []
-    dead = []
-    now = time.time()
-    for n in names:
-        p = os.path.join(d, n)
-        try:
-            if now - os.path.getmtime(p) > max_age:
-                os.remove(p)
-                dead.append(n)
-        except OSError:
-            continue
-    if dead:
-        print(f"⚠️ image_read: 清理了 {len(dead)} 个缩图临时文件（>{max_age/86400:.0f} 天）。",
-              flush=True)
-    return dead
 
 
 def handoff(path, cfg, max_bytes=None, collect=None):

@@ -21,6 +21,7 @@
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_tools
@@ -28,7 +29,12 @@ import bot
 
 _FAIL = []
 HERE = os.path.dirname(os.path.abspath(__file__))
-SIDE = os.path.join(HERE, "_selftest_executor_side.txt")
+# 副作用文件写在**系统临时盘**，不写项目目录。
+# 为什么：受限环境（只允许写工作区顶层的沙箱）里项目子目录**建不了文件**，
+# `echo made > "...\项目\_selftest_executor_side.txt"` 必然 exit=1，
+# 于是「命令真的执行了」三条断言**假红**（不是 executor 的问题）。
+# 这条用例验的是"命令有没有真跑"，与写在哪无关。
+SIDE = os.path.join(tempfile.gettempdir(), "_selftest_executor_side.txt")
 
 # 项目根目录当工作目录
 CFG = {"agent": {"confirm_ttl": 300},

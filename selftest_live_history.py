@@ -106,7 +106,26 @@ def _session_alive(db, sql):
     """session.db 恢复正常——用来验证旧错误会被清掉。"""
     if db == "session.db":
         return [{"username": "filehelper", "summary": "兜底恢复了",
-                 "last_timestamp": V4_SESSION_TS, "last_msg_sender": SELF_WXID}]
+                 "last_timestamp": V4_SESSION_TS, "last_msg_sender": SELF_WXID,
+                 "last_msg_type": 1}]
+    _dead_db(db)
+
+
+def _session_voice(db, sql):
+    """最后一道兜底路上来的**语音条**：英文界面 summary 是 `[Audio] 8"`、中文是 `1"`。"""
+    if db == "session.db":
+        return [{"username": "filehelper", "summary": '[Audio] 8"',
+                 "last_timestamp": V4_SESSION_TS, "last_msg_sender": SELF_WXID,
+                 "last_msg_type": 34}]
+    _dead_db(db)
+
+
+def _session_no_type(db, sql):
+    """老库/结构变了：`last_msg_type` 取不到（NULL）——行为必须和以前**完全一致**。"""
+    if db == "session.db":
+        return [{"username": "filehelper", "summary": "老库没有这一列",
+                 "last_timestamp": V4_SESSION_TS, "last_msg_sender": SELF_WXID,
+                 "last_msg_type": None}]
     _dead_db(db)
 
 
@@ -429,6 +448,24 @@ def main():
     ok &= check("session.db 恢复后错误被清掉、消息照常拿到",
                 live_history.poll_errors() == {} and len(msgs2) == 1,
                 (live_history.poll_errors(), msgs2))
+    ok &= check("文本消息的 local_type=1 也带上了（不破坏文本那条路）",
+                len(msgs2) == 1 and msgs2[0].get("local_type") == 1, msgs2)
+
+    # ⚠️ **兜底路必须带 `local_type`**（2026-10-03 晚）：以前这条路的产出没有它，
+    # 于是语音条进不去语音分支 —— 英文界面 summary 是 `[Audio] 8"`，被下游当
+    # "只有类型标签"**静默丢掉**（连一句失败提示都没有）；中文界面 summary 是 `1"`，
+    # 更糟：那串时长会被当成**用户说的话**送进模型。
+    voice = _FakeClient(_session_voice)
+    vm, _ = live_history._v4_new_messages_session(voice, {"__time__": NOW})
+    ok &= check("兜底路上的语音带 local_type=34（下游才进得去语音分支）",
+                len(vm) == 1 and vm[0].get("local_type") == 34, vm)
+    ok &= check("……summary 原样带着（下游据此如实说读不出来，不编）",
+                bool(vm) and "[Audio]" in vm[0].get("content", ""), vm)
+    # 取不到 `last_msg_type` → **不加这个键**，行为与改动前一字不差
+    notype = _FakeClient(_session_no_type)
+    nm, _ = live_history._v4_new_messages_session(notype, {"__time__": NOW})
+    ok &= check("取不到 last_msg_type → **不加 local_type 键**（老库行为不变）",
+                len(nm) == 1 and "local_type" not in nm[0], nm)
 
     # 正常空闲**不许**报故障（否则每 5 秒刷一行吓人的日志）
     _clear_poll_errors()

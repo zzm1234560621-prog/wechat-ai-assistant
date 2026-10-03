@@ -18,6 +18,7 @@ if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
 import voice_msg      # noqa: E402
+import voice_mem      # noqa: E402  # 扫内存的超时保护（见 t8）
 
 _PASS = 0
 _OK = True
@@ -313,6 +314,226 @@ def t7_probe(tmp):
     check("目录不存在 → 不炸", isinstance(text7, str) and bool(text7), res7)
 
 
+def t8_scan_deadline():
+    """扫微信内存**必须有硬时间上限**——否则一次卡住就让整个助手停摆。
+
+    **为什么这条最重要**（2026-10-03 真机踩的）：`voice_mem.read()` 同步跑在
+    **收消息那条线程**上，而 `scan_silk` 在 128TB 地址空间里逐段
+    `VirtualQueryEx` + `ReadProcessMemory`。原先它**没有任何时间上限**，
+    微信让某次读取一卡，`read()` 就永远不返回：日志停在
+    「处理自己的消息: [语音条…]」，之后**再无心跳**、再发语音也没人接。
+
+    正确行为：到点就放弃，**如实说这条没读出来**（并给出调大的配置名），
+    让轮询继续。宁可少读一条语音，也不能让整台助手哑掉。
+    """
+    sec("扫内存的硬时间上限（防止助手卡死）")
+    import time as _time
+    check("有默认上限且不为 0", voice_mem.DEFAULT_SCAN_SECONDS > 0,
+          voice_mem.DEFAULT_SCAN_SECONDS)
+    # ⚠️ 默认预算**必须覆盖实测的完整扫描上界**（2026-10-03 真机 6 次：
+    # 4.0 / 4.9 / 16.0 / 2.1 / 2.3 / 2.0 秒）。以前默认 8 秒正好落在抖动区间里，
+    # 真机开始随机「扫不完就放弃」—— 那是"代码没错、预算不够"，
+    # 当晚 3 条新失败里 2 条就是它。这条断言就是防有人把它改回去。
+    check("默认预算 ≥ 实测完整扫描上界（16 秒），不许改回打进抖动区间的 8",
+          voice_mem.DEFAULT_SCAN_SECONDS >= 16.0, voice_mem.DEFAULT_SCAN_SECONDS)
+
+    # deadline 已过 → 立刻返回 (空的, False)，绝不继续扫
+    t = _time.monotonic()
+    hits, complete = voice_mem.scan_silk(None, deadline=_time.monotonic() - 1)
+    dt = _time.monotonic() - t
+    check("deadline 已过 → 立即返回", dt < 0.5, dt)
+    check("……且标成「没扫完」", hits == [] and complete is False, (hits, complete))
+
+    # 兼容：不传 deadline 仍返回二元组
+    r = voice_mem.scan_silk(None)
+    check("不传 deadline → 仍返回 (hits, complete)", isinstance(r, tuple) and len(r) == 2,
+          type(r).__name__)
+
+    # read() 侧：扫不完 → 空文本 + 如实说明 + 给出配置名（绝不给半截结果）
+    class _H:
+        pass
+
+    _real_proc, _real_k32, _real_scan = (voice_mem.weixin_main_process,
+                                         voice_mem._k32, voice_mem.scan_silk)
+    try:
+        voice_mem.weixin_main_process = lambda: (1234, _H())
+        voice_mem._k32 = lambda: type("K", (), {"CloseHandle": staticmethod(lambda h: None)})()
+        voice_mem.scan_silk = lambda h, deadline=None, **kw: ([], False)
+        texts, why = voice_mem.read(1400, cfg={"voice": {"scan_seconds": 8}})
+        check("扫不完 → 不给文本（绝不拿半截结果当答案）", texts == [], texts)
+        check("……如实说明超时了", "秒还没扫完" in why, why)
+        check("……并告诉用户改哪个配置", "voice.scan_seconds" in why, why)
+        check("……且明说没有编内容", "别编" in why, why)
+
+        # 扫完了、只是没命中 → 仍走原来那句（两种失败不能混）
+        voice_mem.scan_silk = lambda h, deadline=None, **kw: ([], True)
+        texts2, why2 = voice_mem.read(1400, cfg={})
+        check("扫完但没命中 → 走原来的文案（两种失败分开）",
+              texts2 == [] and "没搜到 SILK" in why2 and "秒还没扫完" not in why2, why2)
+        check("配置非法（scan_seconds='abc'）→ 退回默认，不静默",
+              voice_mem._cfg_float({"voice": {"scan_seconds": "abc"}}, "voice",
+                                   "scan_seconds", 8.0) == 8.0)
+    finally:
+        voice_mem.weixin_main_process, voice_mem._k32, voice_mem.scan_silk = (
+            _real_proc, _real_k32, _real_scan)
+
+
+def _mk_silk(frames, payload=8):
+    """造一段**结构合法**的假 SILK：`#!SILK_V3` + 每帧 `[uint16 长度][载荷]`。
+
+    真 SILK 音频没法在自测里合成（那得编码器），但 `frame_ends()` 走的就是这个块结构，
+    而"帧数 → 时长"这条链正是根因所在，所以合成结构足够把 bug 钉死。
+    """
+    body = b"".join(int(payload).to_bytes(2, "little") + b"A" * payload
+                    for _ in range(int(frames)))
+    return voice_mem.MAGIC + body
+
+
+def t9_frame_estimate_gate(tmp):
+    """⚠️ 根因回归：`voicelength` 比真实音频长一点时，**必须照样能裁出来**。
+
+    2026-10-03 真机侦察（`_audit/probe_voice_bytes.py`，8/8 命中）：
+    微信报的 `voicelength` 比内存里那段真实音频**长 20~40 毫秒**，而旧代码
+
+        est = round(voicelength / 20)
+        if est > len(ends): return "", …, "帧数不够，到不了目标时长"   ← 直接扔掉
+
+    于是 `est` 只比真实帧数大 1~2 帧，**内存里明明完整存在**的那条就被丢掉了；
+    上层看到的是"内存里搜到 SILK，但没有一条时长接近 7180 毫秒"
+    （日志里 3720/3400/4440/7180 四次全是这个）。真机那条 7180ms 的语音其实
+    好好躺在内存里：357 帧 = 7140ms，只差 40ms。
+
+    修法是把 `est` **夹到末帧**、让实测时长说话。**关键是不能顺手放松"拒答"**：
+    差得远（1800ms vs 7180ms）时仍须一个字都不给 —— 见下面第二条断言。
+    """
+    sec("帧数估算闸（长语音读不出来的根因）")
+    # 「真解码」替身：帧数 × 20ms（这就是 SILK 的时长定义，扫描时也是这么估的）
+    _real = voice_mem._silk_ms
+    voice_mem._silk_ms = (lambda s: len(voice_mem.frame_ends(s)) * voice_mem.FRAME_MS
+                          if s.startswith(voice_mem.MAGIC) else None)
+    try:
+        # ① 真机那条：7140ms 的真实音频，微信报 7180ms
+        blob = _mk_silk(357)
+        silk, ms, err = voice_mem.silk_for_duration(blob, 7180)
+        check("voicelength 比真实长 40ms → **照样裁得出来**（旧代码在这里扔掉）",
+              bool(silk) and not err and round(ms) == 7140, (len(silk), ms, err))
+        check("……裁出来的是**完整那段**（357 帧全要，不是少一帧）",
+              len(voice_mem.frame_ends(silk)) == 357, len(voice_mem.frame_ends(silk)))
+
+        # ② 不许因为 clamp 就把"差得远"的音频当这条：1800ms vs 7180ms
+        short = _mk_silk(90)
+        silk2, ms2, err2 = voice_mem.silk_for_duration(short, 7180)
+        check("差得远（1800ms 目标 7180ms）→ 仍然**如实拒绝**，不给半截",
+              silk2 == b"" and bool(err2), (len(silk2), ms2, err2))
+
+        # ③ 常规路径没被改坏：目标正好落在末帧
+        exact = _mk_silk(200)
+        silk3, ms3, err3 = voice_mem.silk_for_duration(exact, 4000)
+        check("目标正好等于真实时长 → 正常裁出 4000ms",
+              bool(silk3) and not err3 and round(ms3) == 4000, (len(silk3), ms3, err3))
+
+        # ④ 帧数不够但**在容差内**（差 20ms）也要能出来 —— 真机最常见的形态
+        silk4, ms4, err4 = voice_mem.silk_for_duration(_mk_silk(90), 1820)
+        check("差 20ms（1800 vs 1820）→ 能裁出（真机 8/8 都是这种差）",
+              bool(silk4) and not err4 and round(ms4) == 1800, (len(silk4), ms4, err4))
+
+        # ⑤ ⚠️ **够不着的必须不解码就判死**：clamp 之后如果每个短 blob 都去解码，
+        # 长语音那一轮就是几百次 pilk 解码 —— 同步卡在收消息线程上（真机卡死过的坑）。
+        calls = []
+        voice_mem._silk_ms = (lambda s: (calls.append(1),
+                                         len(voice_mem.frame_ends(s)) * voice_mem.FRAME_MS)[1])
+        silk5, ms5, err5 = voice_mem.silk_for_duration(_mk_silk(50), 7180)   # 1000ms vs 7180ms
+        check("整段都够不着目标 → **一次解码都不做**就拒（不许把轮询线程拖死）",
+              silk5 == b"" and bool(err5) and len(calls) == 0,
+              (len(silk5), ms5, err5, len(calls)))
+
+        # ⑥ 但"刚好够得着"的仍然要真解码，不能靠估算糊弄过去
+        calls[:] = []
+        voice_mem._silk_ms = (lambda s: (calls.append(1),
+                                         len(voice_mem.frame_ends(s)) * voice_mem.FRAME_MS)[1])
+        silk6, ms6, _e6 = voice_mem.silk_for_duration(_mk_silk(90), 1820)
+        check("够得着的那条**必须真解码验证**（不是拿估算当结论）", len(calls) >= 1, len(calls))
+    finally:
+        voice_mem._silk_ms = _real
+
+
+def t10_length_fingerprint(tmp):
+    """⚠️ 回归：用消息自带的 `length` 把**同时长**的两条语音分开。
+
+    2026-10-03 真机侦察：内存里那条 SILK 的真实长度和 XML 的 `length` 精确对应
+    （自己发出的样本 8/8 差 **−1**），而按时长挑出来的错误候选差 200~1900 字节。
+    真实场景是"3 条候选时长一样、置信度也接近"→ 以前只能拒答。
+
+    这里用两段**时长相同、字节数不同**的假 SILK 复现那个撞车，然后验证：
+      * 给了 `target_bytes` ⇒ 只挑长度对得上的那一条；
+      * **不给**（或没有一条对得上）⇒ 一个字节都不放宽，原来的"分不出来就拒答"照旧。
+    """
+    sec("length 指纹（同时长的两条语音怎么分开）")
+    import audio_read
+    import hashlib as _hl
+
+    a_blob, b_blob = _mk_silk(200, 8), _mk_silk(200, 9)      # 都是 4000ms，字节数不同
+    hits = [0x1000, 0x2000]
+    blobs = {0x1000: a_blob, 0x2000: b_blob}
+
+    _saved = (voice_mem._silk_ms, voice_mem._read_mem, voice_mem.available,
+              voice_mem.weixin_main_process, voice_mem._k32, voice_mem.scan_silk,
+              voice_mem.silk_to_wav, audio_read.transcribe_scored)
+    try:
+        voice_mem._silk_ms = (lambda s: len(voice_mem.frame_ends(s)) * voice_mem.FRAME_MS
+                              if s.startswith(voice_mem.MAGIC) else None)
+        voice_mem._read_mem = lambda h, addr, n: blobs.get(addr, b"")[:n]
+        voice_mem.available = lambda: (True, "")
+        voice_mem.weixin_main_process = lambda: (1, object())
+        voice_mem._k32 = lambda: type("K", (), {"CloseHandle": staticmethod(lambda h: None)})()
+        voice_mem.scan_silk = lambda h, deadline=None, **kw: (hits, True)
+        voice_mem.silk_to_wav = lambda silk, wav: (1.0, 24000, "")
+
+        dig = {_hl.sha256(b).hexdigest()[:12]: name for name, b in
+               (("A", a_blob), ("B", b_blob))}
+
+        # 两段文本故意做得**明显不同但都很通顺**（照抄真机那次撞车的样子：
+        # 「帮我看看所有玻璃妮可跟我聊了什么」vs「Вау, это не суперпой, Ники.」）——
+        # 只有真的不同，`_similar()` 才判成"两条不同语音"，tie 拒答才成立。
+        _TALK = {"A": "帮我看看所有玻璃妮可跟我聊了什么",
+                 "B": "Вау, это не суперпой, Ники."}
+
+        def _fake_tr(wav, cfg):
+            # 文件名形如 <digest>_<ms>.wav —— 用它反查是 A 还是 B
+            for d, name in dig.items():
+                if d in os.path.basename(wav):
+                    # 分数故意做得**很接近**（模拟真机那个"置信度也接近"）
+                    return (_TALK[name], -0.80 if name == "A" else -0.90, "")
+            return ("", None, "认不出 wav")
+        audio_read.transcribe_scored = _fake_tr
+
+        # ① 候选要带上 length 指纹差（B 的真实长度 = len(b)+? → 用 len(b)+1 当 length）
+        out = voice_mem.candidates(None, hits, tmp, target_ms=4000, target_bytes=len(b_blob) + 1)
+        deltas = sorted(c["bytes_delta"] for c in out if c.get("bytes_delta") is not None)
+        check("候选带上了 length 指纹差（命中那条 = −1）",
+              deltas == sorted([len(a_blob) - (len(b_blob) + 1), -1]), deltas)
+
+        # ② 有指纹命中 ⇒ 只挑那一条（B），同长度的 A 出局
+        texts, err = voice_mem.read(4000, out_dir=tmp, cfg={},
+                                   target_bytes=len(b_blob) + 1)
+        check("有指纹命中 → **只挑那一条**（B）。同长度的 A 当场出局",
+              texts == [_TALK["B"]] and not err, (texts, err))
+
+        # ③ 指纹对不上任何候选 ⇒ **完全退回**时长逻辑：两条都留，分数太近就拒答
+        texts2, err2 = voice_mem.read(4000, out_dir=tmp, cfg={}, target_bytes=999999)
+        check("没有候选命中指纹 → 不复用指纹、退回时长逻辑（仍然如实拒答）",
+              texts2 == [] and "认不出" in err2, (texts2, err2))
+
+        # ④ 压根不给 target_bytes ⇒ 行为与改动前一致（老调用方不受影响）
+        texts3, err3 = voice_mem.read(4000, out_dir=tmp, cfg={})
+        check("不传 target_bytes → 行为不变（还是拒答，不放宽）",
+              texts3 == [] and "认不出" in err3, (texts3, err3))
+    finally:
+        (voice_mem._silk_ms, voice_mem._read_mem, voice_mem.available,
+         voice_mem.weixin_main_process, voice_mem._k32, voice_mem.scan_silk,
+         voice_mem.silk_to_wav, audio_read.transcribe_scored) = _saved
+
+
 def main():
     print("=" * 60)
     print("语音条逆向工具 voice_msg 回归自测（不联网、不需真实语音、不碰微信）")
@@ -326,6 +547,9 @@ def main():
         t5_find_payload(tmp)
         t6_voice_info()
         t7_probe(tmp)
+        t8_scan_deadline()
+        t9_frame_estimate_gate(tmp)
+        t10_length_fingerprint(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 60)

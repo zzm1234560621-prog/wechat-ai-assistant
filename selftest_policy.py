@@ -28,6 +28,7 @@ import tempfile
 import time
 
 import agent_tools
+import aixed_api
 import file_read
 import groups
 import image_cache
@@ -58,8 +59,9 @@ class _Rec:
     def send_xml(self, xml, wxid):
         self._hit("xml", wxid, xml)
 
-    def send_file(self, path, wxid):
+    def send_file(self, path, wxid, cfg=None):
         self._hit("file", wxid, path)
+        self.last_file_cfg = cfg
 
 
 class _Boom:
@@ -76,6 +78,9 @@ def check(label, cond, extra=""):
 
 def _reset_pending():
     agent_tools._PENDING.clear()
+    # 发文件的回显簿记是模块级 dict（和 _SENT_IMAGE 同一形状）：用例之间必须清掉，
+    # 否则上一个用例「发过文件」会让下一个用例的 is_own_file 串味。
+    agent_tools._SENT_FILE.clear()
 
 
 def _box(cfg=None, contacts=None, client=None, cfg_provider=None):
@@ -362,6 +367,53 @@ def test_image_cache_root():
             print("     （本机没有可用的缩略图样本，跳过「真实图在白名单内」这一条）")
     else:
         print("     （本机没有 xwechat_files，跳过真实目录断言）")
+
+    # ---- 数据目录被搬过盘：必须**问微信自己**，不能写死 ~/Documents
+    # （2026-10-02 真踩过：用户把微信数据从 C 盘搬到 D 盘之后，写死的路径返回 None，
+    #   于是发图白名单空、读文件全找不到、图片缓存全空 —— 而**表面上一切正常**。）
+    import tempfile
+    with tempfile.TemporaryDirectory() as _tmp:
+        root = os.path.join(_tmp, "wechat_root")
+        os.makedirs(os.path.join(root, "xwechat_files", "wxid_x_1", "cache"))
+        cfgdir = os.path.join(_tmp, "appdata", "Tencent", "xwechat", "config")
+        os.makedirs(cfgdir)
+
+        saved_env = os.environ.get("APPDATA")
+        saved_home = image_cache._home
+        try:
+            os.environ["APPDATA"] = os.path.join(_tmp, "appdata")
+            # 让「历史默认位置」也找不到，逼它必须靠自动检测
+            image_cache._home = lambda: os.path.join(_tmp, "nohome")
+            want = os.path.join(root, "xwechat_files")
+
+            # ① 微信记的位置（文件名是哈希、内容是路径）-> 能找到
+            with open(os.path.join(cfgdir, "abc123.ini"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(root)
+            got = image_cache.data_root()
+            ok &= check("数据搬到别的盘：靠微信自己记的位置找得到", got == want, got)
+
+            # ② 同目录下别的 ini（内容是配置不是路径）必须忽略
+            # ③ 指向不存在位置的 ini 也必须忽略
+            with open(os.path.join(cfgdir, "other.ini"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("[General]\nfoo=bar\n")
+            with open(os.path.join(cfgdir, "gone.ini"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(os.path.join(_tmp, "not_there"))
+            got = image_cache.data_root()
+            ok &= check("非路径的 ini / 指向不存在位置的 ini 都被忽略", got == want, got)
+
+            # ④ 哪里都没有 -> None（而**不是**编一个假路径出来）
+            os.remove(os.path.join(cfgdir, "abc123.ini"))
+            got = image_cache.data_root()
+            ok &= check("哪里都找不到 -> 返回 None（不编假路径）", got is None, got)
+        finally:
+            image_cache._home = saved_home
+            if saved_env is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = saved_env
 
     # 兜底路径：推不出缓存目录 → 退回 data_root 且**必须告警**，不许静默
     saved_icd, saved_dr = image_cache.image_cache_dirs, image_cache.data_root
@@ -1429,16 +1481,24 @@ def test_read_file_heavy_goes_background():
 
 
 def test_send_file():
-    """发普通文件：当前 hook 没有这个接口 → **当场如实拒绝，且不进待确认队列**。
+    """发普通文件：**默认可用**（本版 hook 走 /SendImgMsg，真机实测能发）+ 端点可切。
 
-    为什么「不进队列」也要单独断言：如果先登记待确认项、等用户回「确认」才失败，
-    就等于**让用户白确认一次**——而发文件是不可逆动作，用户的确认成本很高。
-    所以拒绝必须发生在**登记之前**。
+    ⚠️ 这一节 2026-10-02 被**整节反过来了**，原因写在前面，别照着旧断言改回去：
+    以前的默认是「当场拒绝」——前提是「hook 没有发文件的接口」。那个前提**是错的**：
+    真机实测 `POST /SendImgMsg` 拿一个 xlsx / zip 路径能发出**文件消息**
+    （`local_type = 25769803825 = (6<<32)|49`，XML 里 attachid/cdnattachurl/aeskey/
+    fileuploadtoken 全是服务端签发的真值，调用前后 IsLogin:1、无新崩溃转储）。
+    所谓「没有发文件的接口」只在 `/SendFileMsg` **这个名字**上成立——那条路由是 404。
 
-    另外这一条守住的是「不许假装发了」：开关关着时**一次 client 调用都不许有**
-    （用 `_Boom` 客户端证明）。
+    所以现在守住的是这几条（都比「能不能发」更重要）：
+      ① 默认**进入待确认队列**（发文件不可逆，永远要用户回「确认」）；
+      ② `agent.send_file: false` 时**当场拒绝、且不产生待确认项**（不让用户白确认一次）；
+      ③ 拒绝时必须**明确禁止绕路 / 禁止假装**（老规矩，一个字都不许松）；
+      ④ fail-safe：开关值写歪（"true"/1）一律按关；
+      ⑤ 端点由 `agent.send_file_via` 决定，且**写歪的值回退到唯一能用的 imgmsg**；
+      ⑥ `send_pending` 的 file 分支：复核不过一份都不发；复核通过才调 client。
     """
-    print("\n── 发普通文件：当前 hook 做不到 → 当场拒绝、不白让用户确认 ──")
+    print("\n── 发普通文件：默认走 /SendImgMsg，但永远要用户确认 ──")
     ok = True
     tmp = tempfile.mkdtemp(prefix="selftest_policy_sendfile_")
     old_roots = file_read.files_roots
@@ -1452,31 +1512,51 @@ def test_send_file():
         with open(good, "wb") as f:
             f.write(b"%PDF-1.4 x")
 
-        # ① 开关默认关 → 如实拒绝
-        out = _box(contacts=contacts).t_send_file({"to": "张三", "name": "合同.pdf"})
-        ok &= check("默认（没写 send_file_hook）→ 如实拒绝「发不了普通文件」",
-                    "发不了普通文件" in out, out)
-        ok &= check("拒绝时说清根因是 hook 没有这个接口",
-                    "hook" in out and "接口" in out, out)
-        ok &= check("拒绝时明确禁止绕路 / 禁止假装",
-                    "不要改用别的方式" in out and "假装" in out, out)
-        ok &= check("**没有产生待确认项**（不让用户白确认一次）",
-                    agent_tools.list_pending(CHAT) == [],
-                    agent_tools.list_pending(CHAT))
+        # ① 默认（没写 send_file）→ 能力**开着**，进待确认队列
+        rec0 = _Rec()
+        box_def = _box(contacts=contacts, client=rec0)
+        out = box_def.t_send_file({"to": "张三", "name": "合同.pdf"})
+        pend = agent_tools.list_pending(CHAT)
+        ok &= check("默认（没写 send_file）→ 进入待确认（等用户回「确认」）",
+                    "确认" in out and len(pend) == 1, f"{out!r} / {pend}")
+        ok &= check("**默认没有直接发**（一次 client 调用都没有）",
+                    rec0.calls == [], rec0.calls)
+        _reset_pending()
 
-        # fail-safe：写歪的开关值一律当关（和 search.enabled / privacy.redact 同一档）
-        for bad in ("true", 1, "1", 0, None):
-            cfg = {"agent": {"send_file_hook": bad}}
-            out_b = _box(cfg=cfg, contacts=contacts).t_send_file(
+        # ② 用户显式关掉 → 当场如实拒绝，且不进队列
+        for bad_cfg, label in (
+            ({"agent": {"send_file": False}}, "send_file=False"),
+            ({"agent": {"send_file": 0}}, "send_file=0"),
+            ({"agent": {"send_file": "true"}}, 'send_file="true"（写歪）'),
+            ({"agent": {"send_file": 1}}, "send_file=1（写歪）"),
+        ):
+            out_b = _box(cfg=bad_cfg, contacts=contacts).t_send_file(
                 {"to": "张三", "name": "合同.pdf"})
-            ok &= check(f"send_file_hook={bad!r} → 仍按关处理（fail-safe）",
+            ok &= check(f"{label} → 如实拒绝「发不了普通文件」",
                         "发不了普通文件" in out_b, out_b)
+            ok &= check(f"{label} → **没有产生待确认项**（不让用户白确认一次）",
+                        agent_tools.list_pending(CHAT) == [],
+                        agent_tools.list_pending(CHAT))
             _reset_pending()
 
-        # ② 开关打开 → 才进入「定位 → 校验 → 待确认」流程
-        cfg_on = {"agent": {"send_file_hook": True}}
-        box = _box(cfg=cfg_on, contacts=contacts)
+        out_b = _box(cfg={"agent": {"send_file": False}},
+                     contacts=contacts).t_send_file({"to": "张三", "name": "合同.pdf"})
+        ok &= check("拒绝时明确禁止绕路 / 禁止假装",
+                    "不要改用别的方式" in out_b and "假装" in out_b, out_b)
 
+        # ③ 端点解析：默认 imgmsg（唯一真能用的那条）；写歪回退 imgmsg；可显式切 filemsg
+        ok &= check("send_file_via 默认 = /SendImgMsg（真机实测能发文件的那条）",
+                    aixed_api.send_file_via(None) == "/SendImgMsg"
+                    and aixed_api.send_file_via({"agent": {}}) == "/SendImgMsg")
+        ok &= check("send_file_via 写歪的值 → 回退 /SendImgMsg（不静默变成「不发」）",
+                    aixed_api.send_file_via({"agent": {"send_file_via": "IMG"}}) == "/SendImgMsg"
+                    and aixed_api.send_file_via({"agent": {"send_file_via": "??"}}) == "/SendImgMsg")
+        ok &= check("send_file_via 可显式切回 /SendFileMsg（给带该接口的 hook 用）",
+                    aixed_api.send_file_via(
+                        {"agent": {"send_file_via": "filemsg"}}) == "/SendFileMsg")
+
+        # ④ 能力开着 → 定位失败 / 多份命中都不进队列
+        box = _box(contacts=contacts)
         out_miss = box.t_send_file({"to": "张三", "name": "根本没有这份.pdf"})
         ok &= check("文件不存在 → 明说没找到、且没进队列",
                     "没找到" in out_miss and agent_tools.list_pending(CHAT) == [],
@@ -1490,9 +1570,10 @@ def test_send_file():
                     "发票A.pdf" in out_multi and "发票B.pdf" in out_multi, out_multi)
         ok &= check("多份命中 → 不进队列", agent_tools.list_pending(CHAT) == [])
 
+        # 交给用户确认的那条：描述里带文件名、**不带本机路径**
         out_ok = box.t_send_file({"to": "张三", "name": "合同.pdf"})
         pend = agent_tools.list_pending(CHAT)
-        ok &= check("开关打开 → 进入待确认（等用户回「确认」）",
+        ok &= check("进入待确认（等用户回「确认」）",
                     "确认" in out_ok and len(pend) == 1, f"{out_ok!r} / {pend}")
         if pend:
             desc = agent_tools.describe_pending(pend[0])
@@ -1502,9 +1583,9 @@ def test_send_file():
                         bool(pend[0].get("file")), list(pend[0]))
             ok &= check("kind 是 file", pend[0].get("kind") == "file",
                         pend[0].get("kind"))
+            _reset_pending()
 
-        # ③ send_pending 的 file 分支：路径复核不过 → 一份都不发
-        _reset_pending()
+        # ⑤ send_pending 的 file 分支：路径复核不过 → 一份都不发
         rec = _Rec()
         n1, err1 = agent_tools.send_pending(
             rec, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
@@ -1514,18 +1595,24 @@ def test_send_file():
                     n1 == 0 and rec.calls == [] and err1 and "复核" in str(err1),
                     f"{n1} / {rec.calls} / {err1}")
 
-        # ④ 复核通过 → 真去调 client.send_file（把 hook 的真实结果带回来）
-        _reset_pending()
+        # ⑥ 复核通过 → 真去调 client.send_file，并把 cfg 带下去（端点由它决定）
         rec2 = _Rec()
+        cfg2 = {"agent": {"send_file_via": "filemsg"}}
         n2, err2 = agent_tools.send_pending(
             rec2, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
-                   "file": good, "text": "x", "ts": time.time()})
+                   "file": good, "text": "x", "ts": time.time()},
+            cfg=cfg2)
         ok &= check("复核通过 → 调了 client.send_file 且记账成功",
                     n2 == 1 and err2 is None and rec2.calls
                     and rec2.calls[0][0] == "file", f"{n2} / {err2} / {rec2.calls}")
+        ok &= check("cfg 被带到 client.send_file（端点选择才不是硬编码）",
+                    getattr(rec2, "last_file_cfg", None) is cfg2,
+                    getattr(rec2, "last_file_cfg", None))
+        ok &= check("发出文件后记下了「刚发过文件」（回显要靠它认）",
+                    "wxid_a" in agent_tools._SENT_FILE,
+                    dict(agent_tools._SENT_FILE))
 
-        # ⑤ client 抛异常（就是当前 hook 的真实行为）→ 如实报，且不许说发了
-        _reset_pending()
+        # ⑦ client 抛异常 → 如实报，不许说发了
         rec3 = _Rec(boom_at=1)
         n3, err3 = agent_tools.send_pending(
             rec3, {"to_wxid": "wxid_a", "to_name": "张三", "kind": "file",
@@ -1536,6 +1623,75 @@ def test_send_file():
         file_read.files_roots = old_roots
         _reset_pending()
         shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
+def test_own_file_echo():
+    """自己刚发出去的文件**回显**时要被认掉——不然会「重复发」（2026-10-03 真机踩的）。
+
+    现场：助手把文件发给「文件传输助手」，那条文件消息又被轮询当成「新消息」，
+    于是又被理解成「用户让我发这个文件」→ 再登记一条待确认；用户每回一次「确认」
+    就多收一条。图片那条路早有 `is_own_image`，**文件这条路一直缺**。
+
+    这里守两条：① 发文件后会记一笔「我刚给这个会话发过文件」；
+    ② 认回显只认「会话 + 时间窗」，而且**取不到时间/超窗一律不当成自己的**——
+    宁可漏判（自聊时多答一句），也绝不误判（那会把**别人真发来的文件**静默丢掉）。
+    """
+    print("\n── 自己发出去的文件回显：要认掉（不然会重复发）──")
+    ok = True
+    _reset_pending()
+    try:
+        now = time.time()
+        ok &= check("没发过文件 → 什么都不认（不误吞对方发来的文件）",
+                    agent_tools.is_own_file("wxid_x", now) is False)
+
+        agent_tools.remember_sent_file("wxid_x")
+        ok &= check("刚好发过、时间落在窗口内 → 认成自己的回显",
+                    agent_tools.is_own_file("wxid_x", now) is True)
+        ok &= check("别的会话不受影响（按会话分开记）",
+                    agent_tools.is_own_file("wxid_y", now) is False)
+        ok &= check("取不到消息时间 → **不当成自己的**（宁可漏判不误判）",
+                    agent_tools.is_own_file("wxid_x", 0) is False
+                    and agent_tools.is_own_file("wxid_x", None) is False
+                    and agent_tools.is_own_file("wxid_x", "坏值") is False)
+        ok &= check("时间差超出 30 秒窗口 → 不认（旧消息不会被吞）",
+                    agent_tools.is_own_file("wxid_x", now - 31) is False)
+        ok &= check("窗口内但时间偏一点点 → 仍认（发出去到轮询捞回有几秒延迟）",
+                    agent_tools.is_own_file("wxid_x", now - 5) is True)
+
+        # 记的是「发的那一刻」，不是「处理回显的那一刻」：簿记里必须是刚才那个时间
+        stamp = agent_tools._SENT_FILE.get("wxid_x")
+        ok &= check("簿记里存的是时间戳（供时间窗比对）",
+                    isinstance(stamp, float) and abs(stamp - time.time()) < 5,
+                    stamp)
+
+        # ── 用户 2026-10-03 定的规则：「发文件就读是好事，但**文件传输助手发的
+        #    不能读，我发的才读**」。要按**文件名**认出"是我发出去的"，
+        #    否则模型后来 `read_file A.zip` 时，30 秒窗口早就过了、拦不住。
+        print("\n── 我自己发出去的文件名 → 拦住「按名字读回显」 ──")
+        ok &= check("没发过的名字 → 不是自己发的",
+                    agent_tools.sent_file_name("B.zip") is False)
+        agent_tools.remember_sent_file(
+            "wxid_x", r"D:\wechat\xwechat_files\msg\file\2026-10\A.zip")
+        ok &= check("刚发过 A.zip → 认出是自己发的（**存的是文件名，不是全路径**）",
+                    agent_tools.sent_file_name("A.zip") is True)
+        ok &= check("……带路径来问也认得（基名比对）",
+                    agent_tools.sent_file_name(r"D:\x\y\A.zip") is True)
+        ok &= check("别的名字不受影响", agent_tools.sent_file_name("C.zip") is False)
+        ok &= check("空名字 → 不当成自己的（不误拦）",
+                    agent_tools.sent_file_name("") is False
+                    and agent_tools.sent_file_name(None) is False)
+
+        print("\n── 意图判据：只在**要内容**时才允许读 ──")
+        for _q in ("找一下 A.zip 发给我", "把 A.zip 发给文件传输助手",
+                   "有没有 A.zip", "刚才那个 A.zip 呢"):
+            ok &= check(f"{_q[:18]!r} → 只要文件，**不算要内容**",
+                        agent_tools._wants_content(_q) is False)
+        for _q in ("A.zip 里写了什么", "读一下 A.zip", "帮我总结这份文件的内容",
+                   "看看里面是什么"):
+            ok &= check(f"{_q[:18]!r} → 要内容", agent_tools._wants_content(_q) is True)
+    finally:
+        _reset_pending()
     return ok
 
 
@@ -1557,6 +1713,7 @@ def main():
     ok &= test_read_file_cursor()
     ok &= test_read_file_heavy_goes_background()
     ok &= test_send_file()
+    ok &= test_own_file_echo()
     _reset_pending()
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")

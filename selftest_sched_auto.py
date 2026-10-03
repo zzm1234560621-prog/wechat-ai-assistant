@@ -1220,6 +1220,70 @@ def t15_watch_keywords():
         chk(watch.build_arg("keyword_del", "发票") == "关键词 删 发票", "删除也拼得对")
 
 
+# ---------------- T16：代回消息时不许替我承诺/约定 ----------------
+
+def t16_no_commitment_on_my_behalf():
+    """「不许替我承诺」这条硬规矩必须**无条件**进 prompt，人设整体替换也盖不掉。
+
+    2026-10-02 真机：给「老师」学过人设之后，助手以用户本人的口吻把饭约了
+    （「老师，SKP米其林可不便宜啊[捂脸] 行，明天就明天…」），再往前还主动加了
+    「修好了我请您吃一顿」。当时 prompt 里只有「不确定的事别编」——那条管的是
+    **事实**，管不住**替我表态**：约时间、答应赴约、承诺请客，全落在缝里。
+
+    这条用例专门钉**加在哪**：人设（`persona_for`）是整体替换的——用户给某人设过或
+    学过人设之后，`_DEFAULT_SELF` 一个字都不进 prompt。规矩只有落在 `_COMMON_RULES`
+    里才对每个人生效，所以下面故意喂一段**不含这条规矩**的「学到的老师人设」，
+    断言它照样出现在真正送出去的 system prompt 上。
+
+    2026-10-02 追加后半条：这条规矩里**不许再出现现成句子**。原来写的是
+    「一律不接，只回一句『我回头确认下』（或『我看下时间哈』）」——强模型当兜底文案，
+    弱模型（本地 Ollama qwen3:14b）直接当**成品答案**照抄：「老师」那一路连着几条
+    自动回复都是「老师，我回头确认下[捂脸]」。现在只留约束、不留文案，
+    下面**反面断言** prompt 里不再有那两句，防止谁好心加回去。
+    """
+    print("T16. 代回消息：不许替我承诺/约定（人设整体替换也盖不掉）")
+    msgs = [{"content": "明天去SKP米其林吃个饭，我请你", "is_self": 0,
+             "sender": "wxid_z", "time": "10-02 20:14"}]
+    # 照真机上那份「学到的」人设的样子写：只有语气，没有任何禁止替我承诺的规矩
+    learned = ("你正在代替我本人回复微信。对方是我老师，称「老师」，用「您」。"
+               "说话口语、简短，像平时打微信，不确定的事别编。")
+    learned_rec = {"wxid": "wxid_z", "mode": "self", "persona": learned}
+
+    cases = [
+        ("单聊·学到的人设", learned_rec, {}, False),
+        ("群聊·学到的人设", learned_rec, {}, True),
+        ("单聊·没单独设人设（走默认）", {"mode": "self"}, {}, False),
+        ("单聊·全局人设（也是整体替换）", {"mode": "self"},
+         {"auto_reply": {"persona_self": "回所有人时简短直接一点"}}, False),
+        ("单聊·身份=助手", {"mode": "assistant"}, {}, False),
+    ]
+    for label, rec, cfg, group in cases:
+        cap = _CaptureLLM()
+        auto_reply.make_reply(cap, rec, msgs, {}, cfg, group=group)
+        sys_p = cap.system or ""
+        for token in ("绝不替我做承诺", "把决定留给我本人"):
+            chk(token in sys_p, f"{label}：system prompt 里有「{token}」")
+        chk("赴约" in sys_p and "请客" in sys_p and "花钱" in sys_p,
+            f"{label}：约时间/赴约/请客花钱都被点到（不只是句空话）")
+        # ⚠️ 反面断言：prompt 里不许再出现**现成句子**。给弱模型一句可直接照抄的
+        #    成品答案，它就不再判断「这条到底算不算要我承诺」，凡拿不准就整句抄。
+        for token in ("我回头确认下", "我看下时间哈"):
+            chk(token not in sys_p,
+                f"{label}：prompt 里不该再有现成句子「{token}」（弱模型会照抄）")
+
+    # 反面证据：上面那段「人设」里**确实没有**这条规矩——所以绿的只能是 _COMMON_RULES
+    chk("绝不替我做承诺" not in learned,
+        "那段人设自身不含这条规矩（规矩不是从人设里来的）")
+    # 而且它就是 _COMMON_RULES 里那一条（唯一的真源，别在别处另写一份）
+    chk("绝不替我做承诺" in auto_reply._COMMON_RULES,
+        "规矩的唯一真源是 auto_reply._COMMON_RULES")
+    # 代码里那两处真源（规则 + 默认人设）也都不许再有现成句子
+    for where, text in (("_COMMON_RULES", auto_reply._COMMON_RULES),
+                        ("_DEFAULT_SELF", auto_reply._DEFAULT_SELF)):
+        chk("我回头确认下" not in text,
+            f"{where} 里不许再有那句现成文案（弱模型会把它当万能回复）")
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -1234,7 +1298,7 @@ def main():
                t9_review_scope_is_explicit, t10_relative_time,
                t11_per_person_persona, t12_learn_persona_from_history,
                t13_address_from_history, t14_groups,
-               t15_watch_keywords):
+               t15_watch_keywords, t16_no_commitment_on_my_behalf):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

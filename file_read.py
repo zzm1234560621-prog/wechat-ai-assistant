@@ -41,6 +41,7 @@ import zipfile
 
 import executor
 import image_cache
+import tempdir          # 临时目录/导出目录的统一入口（可用 PROJ_TMP 改道）
 import archive_read      # 压缩包递归（它只在函数里 import 本模块，所以这里没有循环导入）
 import video_read        # 视频抽音轨/抽帧（同上，只在函数里 import 本模块）
 import mail_read         # .eml / .msg 邮件（附件递归）
@@ -1380,9 +1381,16 @@ _CURSOR_RE = re.compile(r"^([0-9a-f]{16}):(\d+)$")
 
 
 def export_dir(cfg=None):
-    """导出目录（配置里的相对路径按**项目根**解析，不按 CWD）。"""
+    """导出目录（配置里的相对路径按**项目根**解析，不按 CWD）。
+
+    没显式配 `file.export_dir` 时，落到 `tempdir` 的根目录下（默认仍是 `<项目>/data/exports`，
+    但受限环境/别的部署形态可以用 `PROJ_TMP` 改道 —— 见 `tempdir.py`）。
+    ⚠️ **用户显式配了路径就一个字都不动**：那是他的选择，不该被环境变量顶掉。
+    """
     f = ((cfg or {}).get("file") or {})
-    d = str(f.get("export_dir") or "").strip() or os.path.join("data", "exports")
+    d = str(f.get("export_dir") or "").strip()
+    if not d:
+        return tempdir.get("exports")
     if not os.path.isabs(d):
         d = os.path.join(_HERE, d)
     return d

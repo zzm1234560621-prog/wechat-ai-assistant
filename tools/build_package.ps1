@@ -95,32 +95,40 @@ $quickstart = @'
   1. 本工具往微信进程里注入 hook DLL，**违反微信用户协议**，有封号风险。
      建议先拿小号试，风险自担。
   2. hook 是按微信 **4.1.10.27** 这一个版本编译的，微信一升级就失效。
-     装完**别让微信自动更新**（do_hook_install.ps1 会帮你挡住）。
+     装 hook 时会顺手挡住微信自动更新，别自己去升级微信。
 
-■ 第一步：把 hook 装进微信（要管理员权限）
-  1. 确认微信版本是 4.1.10.27（微信里「设置 → 关于微信」看一眼）。
-     不是这个版本，就用 installers\wechat-4.1.10.27\WeChatWin_4.1.10.27.exe 装上。
-  2. 右键「PowerShell」→ 以管理员身份运行：
-       cd "<解压出来的目录>\installers\wechat-4.1.10.27"
-       powershell -NoProfile -ExecutionPolicy Bypass -File .\do_install.ps1
-       powershell -NoProfile -ExecutionPolicy Bypass -File .\do_hook_install.ps1
-     脚本会自己找微信目录和你的用户目录，**不用改任何东西**。
-     结果看同目录的 install-log.txt / hook-install-log.txt。
-  3. 重启微信，浏览器打开 http://127.0.0.1:30001/QueryDB/status
-     能返回 JSON 就说明 hook 装好了。
+■ 装法（推荐）：双击 **助手.bat**，按 **[9] 一键配置**，然后**一路回车**
+  它按真实顺序走一遍：
+    ① 装 hook 进微信（会弹 UAC，要管理员权限——这一步不做，后面全白搭）
+    ② 装 Python 依赖（要联网下载，第一次几分钟）
+    ③ 启动助手（后台运行）
+    ④ 就地配「用哪个模型 + API Key」（不用去微信里打字）
+  前提：这台电脑要有 **64 位 Python**（推荐 3.11）。没有就先装一个：
+      winget install -e --id Python.Python.3.11
+  ⚠️ 装 hook 前先确认微信版本是 4.1.10.27（微信里「设置 → 关于微信」看一眼）。
+     不是这个版本，就先双击 installers\wechat-4.1.10.27\WeChatWin_4.1.10.27.exe 装上。
+  装完**重启微信**，浏览器打开 http://127.0.0.1:30001/QueryDB/status
+  能返回 JSON 就说明 hook 装好了（"IsLogin": 1 才是真的登录成功）。
 
-■ 第二步：装 Python 环境、起助手
-  1. 没有 Python 3.11 就先装： winget install -e --id Python.Python.3.11
+■ 装法（手工，等价于 [9]；每条都要在**管理员** PowerShell 里跑）
+  1. cd "<解压出来的目录>\installers\wechat-4.1.10.27"
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\do_hook_install.ps1
+     （微信版本不对时，才先跑一次 .\do_install.ps1）
+     脚本会自己找微信目录和你的用户目录，**不用改任何东西**；
+     结果看同目录的 hook-install-log.txt。
   2. 双击 **install.bat**，等依赖装完（会自己建 .venv）。
-  3. 双击 **启动助手.bat**。
+  3. 双击 **启动助手.bat**（或 助手.bat → [3]）。
+  4. 双击 **配置模型.bat** 按提示填；也可以之后在微信里发  /api <你的key>
 
-■ 第三步：配模型
-  双击 **配置模型.bat** 按提示填；也可以之后在微信里发  /api <你的key>
+■ 装完之后怎么用
+  双击 **助手.bat** 就是全部： [3] 启动 / [4] 停止重启 / [5] 看状态 /
+  [6] 看日志 / [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启）。
+  然后**全程在微信里操作**，直接跟助手说话就行。
 
 ■ 出问题了看哪
   · README.md 的「排错」一节（最常见的问题都在那儿）
-  · 助手没反应 → 先看 bot.log
-  · 想自测（不需要真微信、不碰 hook）：.venv\Scripts\python.exe selftest_all.py
+  · 助手没反应 → 先看 bot.log（或 助手.bat → [6]）
+  · 想自测（不需要真微信、不碰 hook）：助手.bat → [8] → 跑全部自测
 
 ■ 这个包里**没有**什么
   · 没有聊天记录、没有本机配置、没有 API key（config.yaml 是示例，key 是空的）

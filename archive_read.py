@@ -19,8 +19,9 @@ import shutil
 import tempfile
 import zipfile
 
+import tempdir
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_TMP_DIR = os.path.join(_HERE, "data", "tmp_unpack")
 
 ARCHIVE_EXTS = (".zip", ".7z", ".rar")
 ARCHIVE_KINDS = ("zip", "7z", "rar")
@@ -68,8 +69,8 @@ def max_members(cfg=None):
 
 
 def _tmp_dir():
-    os.makedirs(_TMP_DIR, exist_ok=True)
-    return _TMP_DIR
+    """解压临时目录。统一走 `tempdir.get()` —— 可用 `PROJ_TMP` 改道（见 `tempdir.py`）。"""
+    return tempdir.get("tmp_unpack")
 
 
 def _sanitize(name, i=0):
@@ -140,8 +141,7 @@ def _sevenz_members(path, budget, cfg):
         for n in picked:
             budget.check(int(sizes.get(n) or 0))
 
-        os.makedirs(_TMP_DIR, exist_ok=True)
-        d = tempfile.mkdtemp(prefix="7z_", dir=_TMP_DIR)
+        d = tempfile.mkdtemp(prefix="7z_", dir=_tmp_dir())
         try:
             z.extract(path=d, targets=picked)
             root = os.path.realpath(d)
@@ -274,25 +274,4 @@ def read_archive(path, cfg=None, on_image=None, budget=None, depth=0):
 
 def sweep_tmp(max_age=86400.0):
     """清理临时目录（**删了什么要打日志**）。正常路径每个成员用完就删，这里只是兜底。"""
-    import time
-    try:
-        names = os.listdir(_TMP_DIR)
-    except OSError:
-        return []
-    dead = []
-    now = time.time()
-    for n in names:
-        p = os.path.join(_TMP_DIR, n)
-        try:
-            if now - os.path.getmtime(p) > max_age:
-                if os.path.isdir(p):
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    os.remove(p)
-                dead.append(n)
-        except OSError:
-            continue
-    if dead:
-        print(f"⚠️ archive_read: 清理了 {len(dead)} 个临时文件（>{max_age/3600:.0f} 小时）。",
-              flush=True)
-    return dead
+    return tempdir.sweep("tmp_unpack", max_age, "archive_read")

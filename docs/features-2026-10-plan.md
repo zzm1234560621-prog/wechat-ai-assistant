@@ -88,6 +88,12 @@
 - **验证**：用例用假文件目录 + 假魔数覆盖「找到并判定 / 没找到如实说 / 解不开如实说」。
 
 ### T9 · 发普通文件（用户 2026-10-02 追加）
+> **⚠️ 本节 2026-10-02 当天晚些时候被推翻并已实施**：下面「没有发文件的接口」是**错的**——
+> 实测 `POST /SendImgMsg` 就能发普通文件（xlsx/zip 都成了文件消息 `local_type=(6<<32)|49`），
+> `/SendFileMsg` 才是 404。现在的实现：`agent.send_file`（默认 true）+ `agent.send_file_via`
+> （默认 imgmsg）→ `aixed_api.send_file(path, wxid, cfg)`。证据见 `docs/send-file-hook-notes.md`、
+> 验证工具 `_audit/check_file_msg.py`。**本节保留只作当时的设计记录。**
+
 - **文件**：`agent_tools.py`（新工具 `send_file`）、`aixed_api.py`（`send_file` 客户端方法，走 `POST /SendFileMsg`）、两份 config、`docs/send-file-hook-notes.md`（新）
 - **现状（已核实，2026-10-02）**：`docs/aixed-api.postman.json` 里 hook 的**全部**接口只有
   `SendTextMsg` / `SendImgMsg` / `ForwardXMLMsg` / `Decode_Pic` / `GetSelfProfile` /

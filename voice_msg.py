@@ -245,17 +245,44 @@ def to_pcm(data):
         except ImportError:
             return b"", ("SILK 要 pilk 解码：.venv\\Scripts\\python.exe -m pip install pilk"
                          "（或把 codec 交给微信自己：见下）")
+        import shutil
         import tempfile
+        tmp = None
         try:
-            fi = tempfile.NamedTemporaryFile(suffix=".silk", delete=False)
-            fi.write(data)
-            fi.close()
-            fo = fi.name + ".pcm"
-            pilk.silk_to_pcm2(fi.name, fo, rate=16000)
-            with open(fo, "rb") as fh:
-                return fh.read(), ""
+            tmp = tempfile.mkdtemp(prefix="pilk_")
+            src = os.path.join(tmp, "in.silk")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            # ⚠️ pilk 有**两代 API，两代都要认**（2026-10-03 真机踩到）：
+            #   老版 0.1.x：`silk_to_pcm2(src, dst, rate=16000)` → 16k PCM
+            #   新版 0.2.x（现在 `pip install pilk` 装到的就是这个）：
+            #       `decode(src, dst)` → **24k** PCM；`silk_to_wav(src, dst)`
+            #   只写老 API 的话，解出来永远是
+            #   `AttributeError: module 'pilk' has no attribute 'silk_to_pcm2'`
+            #   —— 也就是「装了解码器却一条都解不出来」。
+            if hasattr(pilk, "silk_to_pcm2"):
+                dst = os.path.join(tmp, "out.pcm")
+                pilk.silk_to_pcm2(src, dst, rate=16000)
+                with open(dst, "rb") as fh:
+                    return fh.read(), ""
+            if hasattr(pilk, "decode"):
+                dst = os.path.join(tmp, "out.pcm")
+                pilk.decode(src, dst)
+                with open(dst, "rb") as fh:
+                    return fh.read(), ""
+            if hasattr(pilk, "silk_to_wav"):
+                dst = os.path.join(tmp, "out.wav")
+                pilk.silk_to_wav(src, dst)
+                import wave as _wave
+                with _wave.open(dst, "rb") as w:
+                    return w.readframes(w.getnframes()), ""
+            return b"", ("pilk 装上了，但没有能用的解码入口（既没有 silk_to_pcm2 / "
+                         "decode，也没有 silk_to_wav）—— 别当成功")
         except Exception as e:
             return b"", f"pilk 解码失败：{type(e).__name__}: {str(e)[:120]}"
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
     # 其它容器交给 PyAV
     try:
         import av

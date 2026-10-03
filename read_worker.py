@@ -168,6 +168,17 @@ def submit(chat, label, fn, cfg=None):
     """
     qmax, timeout = configured(cfg)
     with _LOCK:
+        # ⚠️ **同一个文件不重复排队**：模型很容易连着提交好几次 —— 真机踩过
+        # （2026-10-03）：一份 A.zip 被提交了 **4 次**，每次读完都把两万七千字
+        # 原文倒进聊天，用户看到的就是「我让它找文件，它刷了我好几屏」。
+        # 已经在读/在排队的直接告诉它「在读了」，**别再占队列、别再发一遍**。
+        for w in _WAITING:
+            if w.get("chat") == chat and w.get("label") == label:
+                return True, (f"这份「{label}」**已经在排队等读了**，不用再提交一次 —— "
+                              f"读完我会主动把内容发出来。**你现在手里还没有内容，别编。**")
+        if _CURRENT and _CURRENT.get("chat") == chat and _CURRENT.get("label") == label:
+            return True, (f"这份「{label}」**正在读**，不用再提交一次 —— "
+                          f"读完我会主动把内容发出来。**你现在手里还没有内容，别编。**")
         pending = len(_WAITING) + (1 if _CURRENT else 0)
         if pending >= qmax:
             return False, (f"前面已经排了 {pending} 份在读了（上限 read.queue_max={qmax}）。"

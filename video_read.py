@@ -20,8 +20,9 @@ import os
 import shutil
 import time
 
+import tempdir
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_TMP_DIR = os.path.join(_HERE, "data", "tmp_video")
 
 VIDEO_EXT = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv",
              ".flv", ".mpg", ".mpeg", ".3gp", ".ts")
@@ -91,29 +92,13 @@ def available(cfg=None):
 
 
 def tmp_dir():
-    os.makedirs(_TMP_DIR, exist_ok=True)
-    return _TMP_DIR
+    """抽帧/抽轨的临时目录。统一走 `tempdir.get()` —— 可用 `PROJ_TMP` 改道（见 `tempdir.py`）。"""
+    return tempdir.get("tmp_video")
 
 
 def sweep_tmp(max_age=86400.0):
-    """清理抽帧/抽轨留下的临时文件（**删了什么要打日志**）。"""
-    try:
-        names = os.listdir(_TMP_DIR)
-    except OSError:
-        return []
-    dead, now = [], time.time()
-    for n in names:
-        p = os.path.join(_TMP_DIR, n)
-        try:
-            if now - os.path.getmtime(p) > max_age:
-                os.remove(p)
-                dead.append(n)
-        except OSError:
-            continue
-    if dead:
-        print(f"⚠️ video_read: 清理了 {len(dead)} 个视频临时文件（>{max_age/3600:.0f} 小时）。",
-              flush=True)
-    return dead
+    """清理抽帧/抽轨留下的临时文件（**删了什么要打日志**，由 `tempdir.sweep` 统一实现）。"""
+    return tempdir.sweep("tmp_video", max_age, "video_read")
 
 
 def info(path):

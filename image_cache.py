@@ -42,8 +42,57 @@ def _home():
     return os.path.expanduser("~")
 
 
+def _wechat_save_roots():
+    """微信自己记的「文件保存位置」（`xwechat_files` 的**父目录**）。
+
+    ⚠️ 为什么需要它（2026-10-02 真踩过）：以前 `data_root()` 把路径**写死**成
+    `~/Documents/xwechat_files`。用户把微信数据搬到 D 盘之后它返回 None，于是
+    **发图白名单空、读文件全找不到、图片缓存全空** —— 而表面上一切正常
+    （不报错、不打日志），正是这个项目最怕的那种「静默失效」。
+
+    微信 4.x 把保存位置记在 `%APPDATA%\\Tencent\\xwechat\\config\\<哈希>.ini`，
+    **文件内容就是一行路径**（实测本机是 9 个字节的 `D:\\wechat`）。
+    文件名是哈希、认不出来，所以**只能按内容判**：一行、像盘符路径、
+    且 `<它>\\xwechat_files` 确实存在的，才算。
+    """
+    base = os.path.join(os.environ.get("APPDATA") or "",
+                        "Tencent", "xwechat", "config")
+    out = []
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return out
+    for name in names:
+        if not name.lower().endswith(".ini"):
+            continue
+        try:
+            with open(os.path.join(base, name), "r", encoding="utf-8",
+                      errors="ignore") as fh:
+                txt = fh.read(4096).strip()
+        except OSError:
+            continue
+        # 只认「一行、像盘符/UNC 路径」的内容 —— 那个目录下还有别的配置 ini
+        if not txt or "\n" in txt or len(txt) > 260:
+            continue
+        if not (re.match(r"^[A-Za-z]:[\\/]", txt) or txt.startswith("\\\\")):
+            continue
+        if os.path.isdir(os.path.join(txt, "xwechat_files")):
+            out.append(txt)
+    return out
+
+
 def data_root():
-    """微信 4.x 数据根目录（xwechat_files）。找不到返回 None。"""
+    """微信 4.x 数据根目录（xwechat_files）。找不到返回 None。
+
+    查找顺序（**别写死** —— 数据搬过盘就靠第一条）：
+
+      1. 微信自己记的保存位置，见 `_wechat_save_roots()`；
+      2. 历史默认位置 `~/Documents/xwechat_files`。
+    """
+    for root in _wechat_save_roots():
+        p = os.path.join(root, "xwechat_files")
+        if os.path.isdir(p):
+            return p
     p = os.path.join(_home(), "Documents", "xwechat_files")
     return p if os.path.isdir(p) else None
 

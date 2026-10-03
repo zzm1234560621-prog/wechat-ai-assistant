@@ -74,7 +74,9 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 ```
 
 - `live_history.py` — 查库核心，**双版本 schema 适配**（v3 = wcferry/3.9.x，v4 = aixed/4.1.x）。所有查询都经过它，别在别处裸调 `client.query_sql`。
-- `agent_tools.py` — 给大模型的工具层（**27 个工具**：find_contact / send_text / broadcast / group / read_history / day_history / search_history / auto_reply / schedule / watch / find_images / read_image / find_files / read_file / recent_messages / search_in_chat / pending_replies / group_members / send_image / send_images / forward_message / send_asset / web_search / run_command / what_happened / send_file / semantic_search）+ 待确认机制 + 查询预算。联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
+- `agent_tools.py` — 给大模型的工具层（**28 个工具**，权威清单就是 `TOOLS`；新增工具必须同时改
+  `TOOLS` + 两份 config 的 `system_prompt`，见「改代码时的约定」）+ 待确认机制 + 查询预算。
+  联系人解析统一走模块级的 `resolve_contacts` / `resolve_one`（`/定时` 命令复用同一套，重名规则才不会两处不一致）。
 - `assets.py` — **素材暂存区**：用户在控制会话里发一次图/表情，之后说「发给谁」就能再发。见下面「素材暂存」。
 - `auto_reply.py` — 代用户本人回指定会话。
   - **审核是「每个会话一份」，全局那份只是默认值**（`review_on(rec, cfg)`：`rec["review"]` 优先，`None` 才继承全局）。
@@ -292,22 +294,26 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   - `image.mode` 写错值**一律按 `off`**（fail-safe：宁可不解读，也不因为写错一个词把图发去某处）并告警。
 - `audio_read.py` — **语音输入**：把**音频文件**（`.m4a/.mp3/.wav/.amr`…）转成文字，
   由 `file_read.extract()` 按扩展名分派过来（**没有新工具，还是 `read_file`**）。规格：`docs/voice-input-spec.md`。
-  - **范围**：只处理**当文件发来**的音频（明文在 `<账号>/msg/file/<月>/`）。
-    ❌ **微信语音条**（那个小喇叭，`local_type=34`）**不在这里** —— 真机实测拿不到音频字节
-    （82 个 `Rec/` 目录全空、全盘无 `.silk/.amr`），可行性见 `docs/voice-msg-feasibility.md`。
-    ❌ 发语音 / 语音通话：hook 做不到。
-  - **三条硬约束**（改之前先读规格）：① `audio.max_seconds`（默认 1800）+ `file.max_bytes`
+  - **范围**：文件形式的音频走这里。✅ **语音条（`local_type=34`）已能读**，但不从本入口进：
+    `bot.read_voice_message()` → **`voice_mem.py`**（趁热扫微信内存拿明文 SILK → pilk 解码 →
+    本模块转写），或读微信点过的「转文字」。❌ 发语音/通话：hook 做不到。
+  - ⚠️ **语音语言**：`language` 默认 `auto`（别写死 `zh`，英文会被硬凑成捏造的中文）；
+    `languages` 默认 `[zh,en]`，探测出表外语言**如实拒绝、不给文本**；**语音处理必须排在
+    `is_label_only` 之前**（英文界面 `[Audio] 8"` 否则静默丢弃）。见 `docs/voice-notes-2026-10-03.md`。
+  - ⚠️ **语音条定位（2026-10-03 晚侦察后修）**：`silk_for_duration` 的 `est` **必须 clamp 到
+    末帧**——旧代码 `est > 帧数` 会把内存里**完整存在**的候选扔掉（长语音读不出来的根因）；
+    定位再用消息 XML 的 `length` 做指纹（真实 SILK 长度 = `length`−1）。**别删**"够不着就不
+    解码"的便宜闸（否则几百次 pilk 解码卡死轮询）。见 **`docs/voice-reliability-2026-10-03.md`**。
+  - **三条硬约束**（改之前先读 `docs/voice-input-spec.md`）：① `audio.max_seconds`（默认 1800）+ `file.max_bytes`
     是**硬上限，超了如实拒绝、绝不静默截断音频**；
     ② **绝不在聊天里静默下模型** —— 推理只认本地目录（结构上不可能联网），下载只由
     `--setup` 触发（走 `HF_ENDPOINT=https://hf-mirror.com`，本机 huggingface.co 不通）；
     ③ 默认 `local` → **音频一个字节都不出本机**；配 `cloud` 才上传，**上传必打日志**。
-  - **长音频分段**（`audio_read.window`）：超 `audio.max_seconds` **不是拒绝**，切一段（16k）转写 + 给同一个 cursor；**时长读不出就不分段**。默认 **120→1800**（音频是重活、由 worker 读），且必须与 `video.max_seconds` 对齐。
-  - **音频分支跳过 `_looks_garbled`**：「好的」只有两个字，按「短于 20 字当可疑」会被拒。
-  - **`faster-whisper` 绝不能写成 `requirements.txt` 的正式需求行**（真踩过）：
-    `envsetup.requirements_specs()` 读**所有非注释行**，「可选段」只是文件里的约定；
-    写成正式行它就会进 `required_import_names()` → 启动助手.bat 自检要求它 →
-    没装的人「装完还是起不来」死循环（H1 那类），installer 还会去装这个重包。
-    **可选依赖一律写成注释**（pywxdump 一直是这么写的）。回归：`selftest_audio.py`。
+  - **长音频分段**（`audio_read.window`）：超 `audio.max_seconds` **不是拒绝**，切一段（16k）+ 同一个 cursor；**时长读不出就不分段**。默认 **120→1800**，须与 `video.max_seconds` 对齐。
+  - **音频分支跳过 `_looks_garbled`**（「好的」只有两个字，会被当可疑拒掉）。
+  - **`faster-whisper` 绝不能写成 `requirements.txt` 的正式需求行**（可选依赖一律写注释）：
+    `envsetup.requirements_specs()` 读**所有非注释行**，写成正式行 → 启动助手.bat 自检要求它 →
+    没装的人「装完还是起不来」死循环，installer 还会去装这个重包。回归：`selftest_audio.py`。
 - `image_cache.py` — 找微信 4.x 的**明文缩略图缓存**（`<账号>/cache/<月>/Message/<md5>/Thumb/`）。`send_image` 的默认白名单就是这里的 `image_cache_dirs()`（即 `<账号>/cache`），**不再是整个 `xwechat_files`**。
   - **「自己发出去的图没有明文缩略图」这条已经反例**（2026-10-01 实测）：`cache\<月>\Message\<md5(会话)>\Thumb\<local_id>_<create_time>_thumb.jpg`
     里确实有**自己发出去**的图——`md5("filehelper")` 那个目录下就有
@@ -464,8 +470,8 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 **fts 句柄掉了之后查询不报错、只返回 0 行**（连 `sqlite_master` 都列不出表）。表现是：**无报错、无日志、游标不动，看起来就是「bot 没反应」**。
 
 - 恢复手段：`live_history.force_rescan(client)`（重建句柄表，自带 45s 限流，实测 1.8 秒修好）。
-- 已加自愈：`_v4_fts_tables` 探测为空会自动 `force_rescan` 再重试一次，间隔由 `agent.fts_rescan_interval` 控制（默认 300s）。
-- 另有 `_v4_new_messages_session` 只用 `session.db` 的 `SessionTable.summary` 兜底，fts 和 `Msg_` 表同时掉线也能收到消息。
+- 已加自愈：`_v4_fts_tables` 为空会自动 `force_rescan` 再试一次，间隔 `agent.fts_rescan_interval`（默认 300s）。
+- 另有 `_v4_new_messages_session` 只用 `session.db` 兜底（fts 与 `Msg_` 全掉时也能收到消息）；它带 `local_type`，非文本不再静默丢掉。
 - **debug 顺序**：
   0. **先分诊「是不是掉登录了」**：跑 `is_login()` / `self_profile()`。
      微信会**自己重启到登录界面**（换 PID、内存掉到 ~148MB、30001 仍在监听但 `IsLogin: 0`）——
@@ -476,14 +482,9 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。
 - 回归用例：`selftest_aixed.py` 的 `_V4StaleFtsStub`。
 
-## 素材暂存（assets.py）——发一次图/表情，之后说「发给谁」就能再发
+## 素材暂存（assets.py）
 
-在控制会话发一张图/表情 → 之后说「发给张三」就转发出去（想发几次发几次）。
-**详细规矩已原样搬到 `docs/assets-notes.md`**（2026-10-02 为腾出 CLAUDE.md 的 64KB 指令预算），
-改这个功能前**先读它**。三条最容易踩的：① 存的是**消息 XML**不是图片副本（自己发的图在磁盘上
-只有加密 `.dat`）；② 只收**用户自己发出去**的、且只有图片/视频/表情三类能收（转发不了的不收，
-收进来就是骗用户）；③ **hook 成功也只回 `ret:0`**，所以只能说「已发出」、**不许**说「对方收到了」。
-回归：`selftest_assets.py`。
+发一次图/表情，之后说「发给谁」就能再发。**三条最易踩的与全部规矩见 `docs/assets-notes.md`**（2026-10-02 为腾出本文件 64KB 指令预算搬过去的）。回归：`selftest_assets.py`。
 
 ## 运行看护（health / status_page / usage / redact）
 
@@ -542,8 +543,13 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **工具返回的文本要顺手告诉模型「该怎么办」。** 查库失败时别只回一句「失败：…」——模型会原地重试，而每次重试都是一次真实的 hook 调用。统一用 `agent_tools._db_fail()`。
 - **往对话记忆里只放原始提问和最终答复**（`bot.dialog_*`），**绝不能放检索到的历史**——那段每轮都重算，记下来等于每轮重发整块历史，token 直接爆。
 - **发消息是不可逆动作**，默认不许乱发：名单外的一律走「待确认」（`agent_tools`）。别绕过这个机制。文本/图片/转发的分派在 `agent_tools.send_pending()`。
+- **发出去的文件会回显成新消息**（同图片那个坑；2026-10-03 真机踩出「为什么会重复发」）：file 分支发完必须 `remember_sent_file()`，主循环用 `is_own_file()` 认掉。
 - **`send_image` 的路径必须过 `_image_path_ok()` 白名单**。path 是**模型填的**，不校验就等于让它从你硬盘上挑任意文件发出去。默认白名单是 `image_cache.allowed_image_dirs()` 推出来的**微信图片缓存根**（`<账号>/cache`），**不是整个 `xwechat_files`**（那是 `data_root()`，里面有配置、`db_storage`、收到的文件）；推不出来才退回 `data_root()` 并告警。用户在 `agent.send_image_dirs` 里配的目录是**加在默认之上**（并集），**不是换一份名单**——以前实现是「配了就顶掉默认」，真机自检里撞出来过：用户为了自测加了个 `test_images`，就**静默地**再也发不出聊天里的图了。改并集时**必须打一条告警**说明「两处都能发」（边界可以宽，但用户得知道宽在哪）。要加目录让**用户**改 `agent.send_image_dirs`，不要自己改配置绕。`send_images`（按目录群发）走同一个 `_in_allowed_dirs`，别另开一套。
-- **这个 hook 只能发文本和图片**（`SendTextMsg` / `SendImgMsg` / `ForwardXMLMsg`，转发也只认图片/视频/动图）。**发不了普通文件**（pdf/Word/Excel 一律不行），转发别人的文件也不行。用户提这类需求时要**如实说做不到**，别含糊、更别假装发了。想加只能改 hook 的 C++ 重编译。
+- **hook 能发文本、图片和普通文件**（pdf/Word/Excel/zip）。⚠️ 文件走的**也是 `/SendImgMsg`**
+  （2026-10-02 实测 xlsx/zip 真成了文件消息 `local_type=(6<<32)|49`、服务端字段齐全、无新转储）；
+  `/SendFileMsg` 是 404。所以「hook 发不了普通文件、得重编译 C++」**是错的，别再写回去**。
+  接线：`agent.send_file`（默认 true）+ `agent.send_file_via`（默认 imgmsg）+ `aixed_api.send_file`；
+  发文件仍要用户确认、定位只认 `msg/file/`。证据见 `docs/send-file-hook-notes.md`。
 - **重名不许静默取第一个。** 解析联系人统一走 `ToolBox._one()`，重名时回一句让模型去问用户——静默取第一个会读错人、发错人。
   - **调 `resolve_contacts` / `resolve_one` 时记得传 `aliases`**（`auto_reply.address_aliases(cfg)`）：
     那是「学到的称呼」那张表，不传的话「给老张发消息」就认不出来。
@@ -581,9 +587,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 
 ## 2026-10 功能批次（T1–T11）
 
-T1–T11 都已落库、各自带回归（`/预算`、`/自检`、游标停滞自愈、`/盯着 关键词`、已执行指纹、
-`/导出`、语音条 `--probe`、发普通文件（项目侧）、本地语义检索、`/bot` 控制台 + `助手.bat`
-全功能菜单）。**细节与「别改回去什么」见 `docs/features-2026-10-notes.md`。**
+T1–T11 都已落库、各自带回归。**细节与「别改回去什么」见 `docs/features-2026-10-notes.md`。**
 **❌ 多账号：已取消。**
 ## 编译期踩过的坑
 
@@ -597,4 +601,7 @@ T1–T11 都已落库、各自带回归（`/预算`、`/自检`、游标停滞�
 - TG 交流群：`t.me/WeChat_Hook`（作者的导出快照已失效，别引用）。
 - 源码快照两份，**xLog hook 偏移不同，不要混用**：项目内 `installers/wechat-4.1.10.27/src-4.1.10.27/`，以及作者发布包里解出来的那一份（放哪儿由你自己决定，**别把绝对路径写进文档/配置**）。
 - 图片加密：`docs/wechat4-dat-image-notes.md`；hook 反篡改：`docs/hook-anti-tamper-notes.md`。
-- **做不了的事**：hook 没有任何通话接口，`VoipEngine.dll` 那条路要自逆向 `Weixin.dll`，且 README 说明 main 分支已移除协议直发能力。别去文档里找通话接口。
+- 语音条可行性评估：`docs/voice-msg-feasibility.md`。
+- **打电话（微信语音通话）**：**已定案：hook 做不到**（真机+官方文档三重证据）。发起通话由微信
+  客户端**状态机**驱动，不是发消息；官方 4.1.10.27 无通话接口，main 分支已移除 `PB/NetSceneSendPB`。
+  替代路线 / 全部证据见 **`docs/call-voip-notes.md`**。

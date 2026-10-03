@@ -1099,6 +1099,14 @@ def t12_embedded_images():
 
 
 def main():
+    # 临时根改到系统临时盘（`PROJ_TMP`）：默认的 `<项目>/data/tmp_*` 在受限环境
+    # （只允许写工作区顶层的沙箱）里**建都建不了**，压缩包用例会 PermissionError。
+    # 生产默认不受影响 —— 见 `tempdir.py`。
+    try:
+        import tempdir
+        tempdir.use_for_tests()
+    except Exception as _e:            # 改道失败不许拦住跑测试
+        print(f"⚠️ 临时目录改道失败（{type(_e).__name__}: {_e}），继续用默认")
     print("=" * 60)
     print("file_read / llm / settings 回归自测（临时目录：%s）" % TMP)
     print("=" * 60)

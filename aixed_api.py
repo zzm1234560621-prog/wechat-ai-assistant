@@ -35,6 +35,29 @@ DEFAULT_BASE_URL = "http://127.0.0.1:30001"
 # 所以这个阈值要低——宁可多报，也不要等到微信卡死才发现。
 SLOW_QUERY_SEC = 1.0
 
+# 发普通文件走哪个端点。**这是个反直觉的坑，别按名字选**：
+#   "imgmsg"（默认）= POST /SendImgMsg —— 本版 hook 上**唯一真能发出普通文件**的路。
+#     端点名字里的 Img 是历史遗留：上游 update.log 20260727
+#     「发送图片等接口统一改为发送文件类接口」，实测 xlsx / zip 都发出成文件消息。
+#   "filemsg"      = POST /SendFileMsg —— 名字最正经的那条，但本版**没有这个路由**
+#     （实测 404）。只在换了带该接口的 hook 之后才有意义。
+SEND_FILE_ENDPOINTS = {
+    "imgmsg": "/SendImgMsg",
+    "filemsg": "/SendFileMsg",
+}
+
+
+def send_file_via(cfg=None):
+    """解析「发普通文件打哪个端点」，返回路径。**写歪的值一律回退到默认的 imgmsg**。
+
+    为什么不 fail-safe 到「什么都不发」：这是**能力**不是**安全闸**——
+    写错一个词就让用户以为「发文件坏了」，比回退到唯一能用的那条更糟。
+    （真正把关的是 `agent_tools.send_file_on` 那个能力闸和待确认队列。）
+    """
+    sec = (cfg or {}).get("agent") or {}
+    raw = str(sec.get("send_file_via") or "").strip().lower()
+    return SEND_FILE_ENDPOINTS.get(raw) or SEND_FILE_ENDPOINTS["imgmsg"]
+
 
 class AixedError(RuntimeError):
     """连不上服务或服务返回了错误。"""
@@ -54,16 +77,23 @@ class Msg:
     `local_type` 是 4.x 的消息类型（1=文本 3=图片 49=appmsg…）：**图片不在 fts 里**，
     是靠 `live_history` 的非文本补漏捞回来的，上层要区分它才能决定该不该响应
     （例如自己刚发出去的图不该再当成新消息答一遍）。默认 1 = 文本，老调用不受影响。
+
+    `local_id` 是**这条消息在 `Msg_<md5(会话)>` 表里的主键**（fts 那条路没有它，
+    非文本补漏那条路有）。**语音转写必须要它**：`live_history.voice_info()` 就是按
+    (talker, local_id) 点查的。默认空串 = 这条消息没带，调用方要自己判。
     """
 
-    __slots__ = ("talker", "content", "is_self", "create_time", "local_type")
+    __slots__ = ("talker", "content", "is_self", "create_time", "local_type",
+                 "local_id")
 
-    def __init__(self, talker="", content="", is_self=0, create_time=0, local_type=1):
+    def __init__(self, talker="", content="", is_self=0, create_time=0, local_type=1,
+                 local_id=""):
         self.talker = str(talker or "")
         self.content = str(content or "")
         self.is_self = _as_int(is_self)
         self.create_time = _as_int(create_time)
         self.local_type = _as_int(local_type) or 1
+        self.local_id = str(local_id or "")
 
     @property
     def type(self):
@@ -219,20 +249,65 @@ class AixedClient:
         """
         return self._request("POST", "/ForwardXMLMsg", {"to_wxid": wxid, "content": xml})
 
-    def send_file(self, path, wxid):
-        """发一个**普通文件**。
+    def send_file(self, path, wxid, cfg=None):
+        """发一个**普通文件**（pdf / Word / Excel / zip …）。
 
-        ⚠️⚠️ **当前 hook 版本没有这个接口。** 已核实的接口全集是
-        `SendTextMsg` / `SendImgMsg` / `ForwardXMLMsg` / `Decode_Pic` /
-        `GetSelfProfile` / `QueryDB/{execute,GetAllDBName,status}`
-        （见 `docs/aixed-api.postman.json`），**没有发文件的**。
-        所以这里发出去只会 404/连不上——**这不是「没试过」，是已经查清楚了**。
+        ⚠️ 这里有个**反直觉的事实**（2026-10-02 真机实测，别再照着接口名猜）：
+        **4.1.10.27 这个 hook 发普通文件走的就是 `/SendImgMsg`**，端点名字里那个
+        "Img" 是历史遗留（上游 update.log 20260727：「发送图片等接口**统一改为**
+        发送文件类接口」，我们实测 xlsx / zip 都发出成**文件消息**）。
 
-        留这个方法是为了：换了支持发文件的 hook 之后，**上层一行都不用改**。
-        上层必须由 `agent.send_file_hook` 这个开关把关（默认 false），
-        关着的时候就别调到这儿来（见 agent_tools.t_send_file）。
+        实测证据：`POST /SendImgMsg {"path": "...\\xlsx"}` 之后，文件传输助手的
+        `Msg_` 表新增一条 `local_type = 25769803825 = (6<<32)|49`（**文件消息**，
+        不是图片的 3），XML 里 `title/totallen(与磁盘字节数一致)/fileext/attachid/
+        cdnattachurl/aeskey/fileuploadtoken` 全是服务端签发的真值；调用前后
+        `IsLogin:1`、crashinfo 无新转储。
+
+        而真正名为 `/SendFileMsg` 的那个路由**不存在**（实测 HTTP 404）——它是
+        「等一个带发文件接口的 hook」时留的接口形状，不是本版能用的。
+
+        端点由 `send_file_via(cfg)` 决定：默认 `imgmsg`（本版唯一可用的那条），
+        想只用那个「正经」端点就配 `agent.send_file_via: filemsg`。
+
+        上层必须由能力闸把关（`agent_tools.send_file_on`，默认**开**），
+        并且**发文件永远要用户确认**（`kind="file"` 的待确认项）。
         """
-        return self._request("POST", "/SendFileMsg", {"wxidorgid": wxid, "path": path})
+        return self._request("POST", send_file_via(cfg),
+                             {"wxidorgid": wxid, "path": path})
+
+    # ---------------- 打电话（/CallVoip）----------------
+
+    def call_voip(self, wxid, self_wxid=None, *, msg_type=None, body=None):
+        """发起一通微信语音通话。
+
+        契约（**仓库源码里实装的 `/CallVoip`**，2026-10-03）：
+
+            POST /CallVoip   {"wxid": <被叫 wxid>}
+
+        实现：hook 源码 `src/wx_send.cpp` 的 `SendVoipInvite()` +
+        `src/SendTextMsg.cpp` 的路由。原理 —— 微信发起语音通话 = 发一条
+        **类型 50（0x32）** 的消息，正文是那段 277 字节的邀请 XML
+        （`<voipinvitemsg>`+`<voipextinfo>`+`<voiplocalinfo>`，**全是常量或 0**，
+        没有任何服务端下发的一次性数据）。取证与互证见
+        `_audit/通话功能-逆向进度与恢复.md` 第二十三轮。
+
+        `self_wxid` **不再需要**（发送方由 WeChat 自己填，走的和发文本同一条
+        路），保留这个参数只是为了不打断已有调用点。
+
+        `msg_type` / `body` 是给**真机试验**用的：不给就用内置的邀请 XML。
+        做成参数是因为每改一次常量都得重编 DLL + 重启微信（每次重启都要
+        重新扫码），而做成参数就一个 HTTP 调用试一个取值。
+
+        ⚠️ 即使 HTTP 成功、`ret == 0`，也只能说「**邀请已发出**」，
+        **绝不许说「对方收到了」** —— 本地无法确认对方是否响铃/接听
+        （和 `/SendImgMsg` 同一个道理）。
+        """
+        payload = {"wxid": str(wxid or "")}
+        if msg_type is not None:
+            payload["type"] = int(msg_type)
+        if body is not None:
+            payload["body"] = str(body)
+        return self._request("POST", "/CallVoip", payload)
 
     def self_profile(self):
         return self._request("POST", "/GetSelfProfile", {})
@@ -329,7 +404,7 @@ class AixedClient:
                 continue
             seen[key] = None
             out.append(Msg(m["talker"], m["content"], m["is_self"], m["_ts"],
-                           m.get("local_type", 1)))
+                           m.get("local_type", 1), m.get("local_id", "")))
         while len(seen) > seen_max:
             seen.pop(next(iter(seen)))
         return out, new_cursor, seen

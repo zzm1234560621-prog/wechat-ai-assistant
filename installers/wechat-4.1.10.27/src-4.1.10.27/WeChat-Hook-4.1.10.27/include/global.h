@@ -36,6 +36,11 @@ extern uint64_t g_MyModuleBase;
 extern uint64_t g_MyModuleSize;
 extern uint64_t g_MyModuleEnd;
 
+// 「登录就绪」判据的诊断文本（空串 = 正常/还没结论）。
+// 由 QueryDB.cpp 的 /QueryDB/status 透出去：IsLogin 恒为 0 时，用户能一眼看到原因。
+// 见 inline_weixin_dll_load.cpp 里 WxDbWrittenSinceLoad() 的注释。
+const char* LoginGateNote();
+
 
 struct SelfInfo_t
 {
@@ -85,6 +90,15 @@ namespace offset
     inline constexpr uintptr_t txt_message_vtbl = 0x8279358;
     inline constexpr uint64_t img_msg_vtbl = 0x84F96B8; 
     inline constexpr uint64_t img_msg_vtb2 = 0x84F9748;
+
+    // ---- 语音通话邀请用到的两个**微信自己的原语**（2026-10-03 逆向，见 _audit/通话档案）----
+    // `msg_ctor(this)`：通用消息对象构造器，**写虚表 base+0x81D2458**。
+    //   微信自己在 0x173D080 / 0x3481720 里就是 `mov r8d,0x2d8` 开一块缓冲再调它 ——
+    //   **对象大小 0x2D8**，而真机打电话时抓到的那个消息对象（H0 的 rdx）
+    //   虚表恰好是 0x81D2458、`+0x038` 恰好是对方 wxid —— 两边对得上。
+    // `type_dispatch(obj, type)`：按类型做下一步（`cmp dword ptr [rcx+0xc], edx`）。
+    inline constexpr uintptr_t msg_ctor = 0xA04560;
+    inline constexpr uintptr_t type_dispatch = 0xA1B1B0;
 }
 
 

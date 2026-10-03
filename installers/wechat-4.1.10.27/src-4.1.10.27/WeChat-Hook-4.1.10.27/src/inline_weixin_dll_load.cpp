@@ -5,6 +5,9 @@
 #include <winternl.h>
 #include <cstring>
 #include <sstream>
+#include <atomic>
+#include <cctype>
+#include <vector>
 
 #include "http_server.h"
 #include "Hook_Method.h"
@@ -17,6 +20,7 @@
 #include "wx_ini_reader.h"
 #include "inline_weixin_dll_load.h"
 #include "hook_xlog.h"
+#include "hook_voip.h"
 
 using json = nlohmann::json;
 
@@ -207,14 +211,127 @@ static bool DirHasFreshDb(const std::wstring& dir)
     return ok;
 }
 
-static bool WxDbWrittenSinceLoad()
+// ---- 「登录就绪」的候选数据根 ----
+//
+// ⚠️ 和 Python 侧 `image_cache._wechat_save_roots()` 是**同一个判据，两处必须一致**：
+// 微信 4.x 把「文件保存位置」记在 %APPDATA%\Tencent\xwechat\config\<哈希>.ini，
+// 文件内容就是**一行路径**（本机实测：`D:\wechat`）。
+//
+// 为什么必须有这条（2026-10-03 真机踩到）：以前这里把路径**写死**成
+// `%USERPROFILE%\Documents\xwechat_files`。用户 2026-10-02 22:25 把微信数据搬到
+// `D:\wechat` 之后，那条路径**不存在**了 → 下面这个就绪判据永远不成立 →
+// `g_IsLogin` 恒为 0 → `db_mgr` 的门禁永远关着 → 所有 QueryDB 一律回
+// 「get database handle which named xxx.db failed」。**不报错、不打日志**，
+// 正是这个项目最怕的那种静默失效。Python 侧当年踩的是同一个坑、那边已经修了，
+// 这边没同步 —— 这是**重复 owner** 的代价。
+static std::string Utf8FromWide(const std::wstring& w)
 {
-    wchar_t profile[MAX_PATH] = {};
-    if (!GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH))
-        return false;
+    if (w.empty())
+        return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                nullptr, 0, nullptr, nullptr);
+    if (n <= 0)
+        return std::string();
+    std::string out((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0], n, nullptr, nullptr);
+    return out;
+}
 
-    const std::wstring root = std::wstring(profile) + L"\\Documents\\xwechat_files";
+static std::wstring WideFromUtf8(const std::string& s)
+{
+    if (s.empty())
+        return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0)
+        return std::wstring();
+    std::wstring out((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+    return out;
+}
 
+static std::string ReadSmallText(const std::wstring& path, DWORD cap = 4096)
+{
+    std::string out;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return out;
+    char buf[4096];
+    DWORD got = 0;
+    if (ReadFile(h, buf, cap < sizeof(buf) ? cap : sizeof(buf), &got, nullptr) && got > 0)
+        out.assign(buf, got);
+    CloseHandle(h);
+    return out;
+}
+
+static std::string TrimAscii(const std::string& s)
+{
+    size_t a = 0, b = s.size();
+    while (a < b && (unsigned char)s[a] <= ' ')
+        a++;
+    while (b > a && (unsigned char)s[b - 1] <= ' ')
+        b--;
+    return s.substr(a, b - a);
+}
+
+// 微信自己记的保存位置（xwechat_files 的**父目录**）。判据见上面那段注释。
+static std::vector<std::wstring> WechatSaveRoots()
+{
+    std::vector<std::wstring> out;
+    wchar_t appdata[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH))
+        return out;
+
+    const std::wstring dir = std::wstring(appdata) + L"\\Tencent\\xwechat\\config";
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((dir + L"\\*.ini").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return out;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        std::string txt = TrimAscii(ReadSmallText(dir + L"\\" + fd.cFileName));
+        // 只认「一行、像盘符/UNC 路径」的内容 —— 那个目录下还有别的配置 ini
+        if (txt.empty() || txt.size() > 260 || txt.find('\n') != std::string::npos)
+            continue;
+        const bool drive = txt.size() >= 3 && isalpha((unsigned char)txt[0]) &&
+                           txt[1] == ':' && (txt[2] == '\\' || txt[2] == '/');
+        const bool unc = txt.size() >= 2 && txt[0] == '\\' && txt[1] == '\\';
+        if (!drive && !unc)
+            continue;
+        std::wstring w = WideFromUtf8(txt);
+        if (w.empty())
+            continue;
+        if (GetFileAttributesW((w + L"\\xwechat_files").c_str()) != INVALID_FILE_ATTRIBUTES)
+            out.push_back(w);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return out;
+}
+
+// 登录就绪判据的**可读诊断**，发布给 /QueryDB/status。
+// 只写一次（写侧只有登录线程）、读侧拿原子快照 —— 不用锁。
+static std::string g_gateNoteBuf;
+static std::atomic<const char*> g_gateNotePtr{""};
+
+void SetLoginGateNote(const std::string& s)
+{
+    if (g_gateNotePtr.load()[0] != '\0')
+        return;
+    g_gateNoteBuf = s;
+    g_gateNotePtr.store(g_gateNoteBuf.c_str());
+}
+
+const char* LoginGateNote()
+{
+    return g_gateNotePtr.load();
+}
+
+// 在某个数据根下找「本 DLL 加载之后被写过的 .db」
+static bool RootHasFreshDb(const std::wstring& root)
+{
     WIN32_FIND_DATAW fd = {};
     HANDLE h = FindFirstFileW((root + L"\\*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE)
@@ -247,6 +364,40 @@ static bool WxDbWrittenSinceLoad()
     return ok;
 }
 
+static bool WxDbWrittenSinceLoad()
+{
+    // 候选按优先级：① 微信自己记的保存位置 ② 历史默认位置。
+    std::vector<std::wstring> roots;
+    for (const std::wstring& r : WechatSaveRoots())
+        roots.push_back(r + L"\\xwechat_files");
+
+    wchar_t profile[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH))
+        roots.push_back(std::wstring(profile) + L"\\Documents\\xwechat_files");
+
+    int existing = 0;
+    for (const std::wstring& root : roots) {
+        if (GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES)
+            continue;
+        existing++;
+        if (RootHasFreshDb(root))
+            return true;
+    }
+
+    if (existing == 0) {
+        // 一个候选根都不存在 = **配置问题**（数据被搬到别处了），不是「还没登录」。
+        // 如实写进 /QueryDB/status，别让用户对着一个恒为 0 的 IsLogin 猜。
+        std::string note = "登录就绪判据失败：候选数据根一个都不存在 -> ";
+        for (size_t i = 0; i < roots.size(); i++) {
+            if (i)
+                note += " | ";
+            note += Utf8FromWide(roots[i]);
+        }
+        SetLoginGateNote(note);
+    }
+    return false;
+}
+
 static DWORD WINAPI LoginReadyThread(LPVOID)
 {
     for (int i = 0; i < 3600; i++) {          // 最多等 30 分钟
@@ -254,10 +405,28 @@ static DWORD WINAPI LoginReadyThread(LPVOID)
             Sleep(3000);                      // 登录瞬间句柄和索引还在建，缓一缓
             if (WxDbWrittenSinceLoad()) {
                 g_IsLogin = 1;                // 放行 db_mgr 门禁
+                SetLoginGateNote("ok：已在微信自己记的保存位置下看到新写入的 db");
                 return 0;
             }
         }
         Sleep(500);
+    }
+    // 30 分钟都没等到 —— 把结论写出去，别再让用户对着恒为 0 的 IsLogin 猜。
+    {
+        std::string note = "登录就绪判据 30 分钟未命中（不是崩溃，是判据没找到数据）。已试过：";
+        wchar_t profile[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+        const std::wstring fallback =
+            std::wstring(profile) + L"\\Documents\\xwechat_files";
+        bool any = false;
+        for (const std::wstring& r : WechatSaveRoots()) {
+            note += Utf8FromWide(r + L"\\xwechat_files") + " ";
+            any = true;
+        }
+        if (!any)
+            note += "（微信的 config\\*.ini 里没读到任何有效保存位置）";
+        note += " | 默认位置 " + Utf8FromWide(fallback);
+        SetLoginGateNote(note);
     }
     return 0;
 }
@@ -303,10 +472,19 @@ void Evt_WeixinLoad()
         g_httpServer = new HttpServer();
         g_httpServer->Start("0.0.0.0", g_StartPort);
     }
-#ifdef _DEBUG
-    //xLog 日志
-    //Hook_Call(WeixinDll_Offset(0xF22C1), 5, hook::MyCallHandler_xLog);
-#endif
+    // xLog 明文捕获：**默认关**（只有 %TEMP%\wx_xlog_capture.on 存在才装）。
+    // 为什么需要：盘上的 .xlog 是 RSA 加密的，唯一能拿到明文的地方就是
+    // mars xlog 写入路径、加密之前。旧代码用的 0xF22C1 偏移对本版已过期
+    // （实测不是指令边界），所以由 InstallXlogCapture 自己按 RVA 装。
+    hook::InstallXlogCapture();
+
+    // 语音通话邀请对象的静默抓取：**同样默认关**（只有 %TEMP%\wx_voip_capture.on
+    // 存在才装）。为什么要有它：探针版 version.dll 装了 19 个钩子、每命中一次
+    // 同步写 3KB、还挂了 ws2_32!send，实测一发消息就把微信卡死（重启 4 次）。
+    // 这一版**只钩一个点**（Weixin!0x2319D00，voipinvitemsg 消息层），
+    // 命中上限 24 次、超了一个字节都不写 —— 只为"打一次真电话、把邀请对象的
+    // 字段布局干净地抓回来"。详见 _audit/通话功能-逆向进度与恢复.md 第十轮。
+    hook::InstallVoipCapture();
     
 
     

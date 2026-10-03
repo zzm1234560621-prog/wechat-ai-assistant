@@ -57,11 +57,14 @@ def _fake_module(name):
 class _FakeWhisper:
     """假的 faster_whisper：只回答「转出了什么」和 info。"""
 
-    def __init__(self, segments, language="zh", duration=3.0):
+    def __init__(self, segments, language="zh", duration=3.0, prob=0.9, detect=True):
         self.segments = segments
-        self.language = language
+        self.language = language        # 既当 info.language，也当 detect_language 的结果
         self.duration = duration
+        self.prob = prob
+        self.detect = detect            # False = 模拟"老版本没有探测接口"
         self.calls = []
+        self.detect_calls = 0
 
     def install(self, module_name="faster_whisper"):
         outer = self
@@ -70,12 +73,22 @@ class _FakeWhisper:
             def __init__(self, path, device=None, compute_type=None):
                 outer.calls.append(("model", path, device, compute_type))
 
-            def transcribe(self, path, language=None, vad_filter=None):
+            def transcribe(self, path, language=None, vad_filter=None,
+                           initial_prompt=None):
                 outer.calls.append(("transcribe", path, language, vad_filter))
                 segs = [types.SimpleNamespace(text=t) for t in outer.segments]
                 info = types.SimpleNamespace(language=outer.language,
                                              duration=outer.duration)
                 return segs, info
+
+        if self.detect:
+            # `audio.languages` 那条限制用的是 detect_language（先探再决定转不转），
+            # 所以桩必须有它；否则限制被当成"探测不了"而静默放行（用例会假绿）。
+            def _detect(audio=None, **kw):
+                outer.detect_calls += 1
+                return outer.language, outer.prob, [(outer.language, outer.prob)]
+
+            _Model.detect_language = staticmethod(_detect)
 
         mod = _fake_module(module_name)
         mod.WhisperModel = _Model
@@ -258,9 +271,13 @@ def t3_local_and_privacy(tmp):
     check("模型是按本地目录构造的（不可能联网拉模型）",
           any(c[0] == "model" and c[1] == audio_read.model_dir(cfg) for c in fw.calls),
           fw.calls)
-    check("传了 device=cpu / compute_type=int8 / 中文",
-          any(c[0] == "model" and c[2] == "cpu" and c[3] == "int8" for c in fw.calls)
-          and any(c[0] == "transcribe" and c[2] == "zh" for c in fw.calls), fw.calls)
+    check("传了 device=cpu / compute_type=int8",
+          any(c[0] == "model" and c[2] == "cpu" and c[3] == "int8" for c in fw.calls),
+          fw.calls)
+    # ⚠️ 2026-10-03 之前这里断言的是 `language == "zh"`（代码写死中文）——
+    #    正是那条写死让英文语音被硬凑成捏造的中文。现在默认 auto = **不传 language**。
+    check("默认 auto：**不写死语言**（不传 language，让 whisper 自己探测）",
+          any(c[0] == "transcribe" and c[2] is None for c in fw.calls), fw.calls)
 
     # 静音/没识别出内容：必须当失败，不许当成功返回空串
     fw2 = _FakeWhisper([]).install()
@@ -465,7 +482,13 @@ def t7_long_audio_windows(tmp):
     real_tr = audio_read.transcribe
     seen = []
 
-    def fake_tr(path, cfg=None, max_bytes=None):
+    def fake_tr(path, cfg=None, max_bytes=None, **kw):
+        # ⚠️ `**kw` 不能删：`window()` 是按**关键字**调 `transcribe(path, cfg, max_bytes=…)`
+        # 的（见 audio_read.window），而这个桩以前只收位置参数 → 桩自己抛
+        # `TypeError: got an unexpected keyword argument 'max_bytes'`，被 `window()`
+        # 的兜底吞掉后返回 `(None, None, ...)`，于是下面的 `text.startswith` 报
+        # `'NoneType' object has no attribute 'startswith'`。**桩的形状必须跟
+        # 生产调用的形状一致**，否则整份套件会在这里断掉、后面所有用例都跑不到。
         seen.append(os.path.basename(path))
         return f"第 {len(seen)} 段的转写", ""
 
@@ -573,9 +596,141 @@ def t8_max_bytes_zero(tmp):
         audio_read.transcribe = real
 
 
+def t9_language(tmp):
+    """`audio.language`：默认 auto（不传），显式值照传，非法值退回 auto 并告警。
+
+    **这个用例是补 2026-10-03 真机那个缺陷的**：以前 `_local` / `transcribe_scored`
+    两处 kwargs 写死 `language="zh"`，说英文 `superboynick` 被中文词汇表硬凑成
+    「你好,你好,我跟俗文貴你最近聊了什麼…」——通顺、但完全是捏造的，还被当成
+    用户原话送进 `run_agent` 去执行。写死时**所有用例都是绿的**，所以必须有一条
+    专门钉住"语言到底传了什么"，否则这个 bug 会再回来。
+    """
+    sec("转写语言：auto 不写死 / 显式照传 / 非法值退回 auto")
+
+    check("默认（没配）= auto → 返回 None（让 whisper 探测）",
+          audio_read.language({}) is None and audio_read.language({"audio": {}}) is None)
+    check("显式 auto（含大小写 / 空串）都当自动",
+          all(audio_read.language({"audio": {"language": v}}) is None
+              for v in ("auto", "AUTO", " auto ", "", None, "detect")))
+    check("显式代码照传（含大小写归一）",
+          audio_read.language({"audio": {"language": "en"}}) == "en"
+          and audio_read.language({"audio": {"language": "ZH"}}) == "zh"
+          and audio_read.language({"audio": {"language": "ja"}}) == "ja")
+
+    # 非法值：**必须告警**（不许静默下传 —— whisper 遇到不认识的 language 会抛，
+    # 等于把配置里一个手滑的拼写变成「每次转写都失败」）。stderr 在这里不好抓，
+    # 所以只断言"退回了 auto"这个可观测结果。
+    check("非法值退回 auto（不抛、不把错值下传给 whisper）",
+          all(audio_read.language({"audio": {"language": v}}) is None
+              for v in ("chinese", "zh-CN", "ei", "123", "z")))
+
+    p = os.path.join(tmp, "lang.m4a")
+    with open(p, "wb") as f:
+        f.write(b"\0" * 64)
+    _make_dir(audio_read.model_dir(_cfg(tmp)))
+
+    # ① 默认 auto 走完 `transcribe()` 全程：language 必须是 None
+    fw = _FakeWhisper(["hello there"]).install()
+    cfg = _cfg(tmp)
+    text, err = audio_read.transcribe(p, cfg)
+    tcall = [c for c in fw.calls if c[0] == "transcribe"]
+    check("auto：转写成功且 language=None", err == "" and text == "hello there", (text, err))
+    check("auto：确实**没传** language（写死 zh 的 bug 钉在这）",
+          tcall and tcall[-1][2] is None, fw.calls)
+
+    # ② 配了 en：`transcribe()` 必须把 en 传下去
+    fw2 = _FakeWhisper(["hello there"]).install()
+    audio_read.transcribe(p, _cfg(tmp, language="en"))
+    tcall2 = [c for c in fw2.calls if c[0] == "transcribe"]
+    check("配 en：language='en' 传到了 transcribe",
+          tcall2 and tcall2[-1][2] == "en", fw2.calls)
+
+    # ③ 语音条那条路（transcribe_scored）走的是**另一份 kwargs**：
+    #    两处以前都写死 zh，必须**两条都钉住**（只钉一处会漏）。
+    fw3 = _FakeWhisper(["hello there"]).install()
+    text3, score, err3 = audio_read.transcribe_scored(p, _cfg(tmp, language="en"))
+    tcall3 = [c for c in fw3.calls if c[0] == "transcribe"]
+    check("语音条路（transcribe_scored）也按配置传 language",
+          err3 == "" and text3 == "hello there" and tcall3 and tcall3[-1][2] == "en",
+          (text3, err3, fw3.calls))
+
+    fw4 = _FakeWhisper(["hello there"]).install()
+    audio_read.transcribe_scored(p, _cfg(tmp))
+    tcall4 = [c for c in fw4.calls if c[0] == "transcribe"]
+    check("语音条路默认 auto 同样是 None",
+          tcall4 and tcall4[-1][2] is None, fw4.calls)
+
+
+def t10_languages(tmp):
+    """`audio.languages`：**限制只转写允许的语言**（默认中英文）。
+
+    **为什么必须有这条**：`audio.language: auto`（不写死语言）只解决了"被迫说中文"，
+    没解决"**选错语言照样捏造**"——2026-10-03 真机：一句短外语被 whisper 判成法语，
+    转出 `Super poignée comme elle a l'air d'un chemin.`（语法通顺、语义不通），
+    照样被当作用户原话进 `run_agent`。所以探测出的语言不在允许表里时，
+    **必须拒绝并且一个字都不给**，绝不用表内的语言去"凑"那段音频。
+    """
+    sec("语音语言限制：默认中英文，探测到别的语言就如实拒绝")
+    check("默认（没配）→ zh/en", audio_read.allowed_languages({}) == ["zh", "en"],
+          audio_read.allowed_languages({}))
+    check("字符串 'zh, en' 也认",
+          audio_read.allowed_languages({"audio": {"languages": "zh, en"}}) == ["zh", "en"])
+    check("显式 [] → 关掉限制",
+          audio_read.allowed_languages({"audio": {"languages": []}}) == [])
+    check("非法项被丢掉、全非法退回默认",
+          audio_read.allowed_languages({"audio": {"languages": ["zh", "klingon"]}}) == ["zh"]
+          and audio_read.allowed_languages({"audio": {"languages": ["xx"]}}) == ["zh", "en"])
+
+    p = os.path.join(tmp, "lang2.m4a")
+    with open(p, "wb") as f:
+        f.write(b"\0" * 64)
+    _make_dir(audio_read.model_dir(_cfg(tmp)))
+
+    cfg = _cfg(tmp)
+    # 探测到不允许的语言 → 拒绝、且**不调用 transcribe**（不猜）
+    fw = _FakeWhisper(["Should not be used"], language="fr").install()
+    text, err = audio_read.transcribe(p, cfg)
+    check("法语 → 拒绝且不给文本", text == "" and "只允许" in err, (text, err))
+    check("……并明说没有编内容", "没有编内容" in err, err)
+    check("……**没有**调 transcribe（绝不拿允许的语言去凑）",
+          not any(c[0] == "transcribe" for c in fw.calls), fw.calls)
+
+    # 探测到允许的语言 → 照常转写
+    fw = _FakeWhisper(["superboynick"], language="en").install()
+    text, err = audio_read.transcribe(p, cfg)
+    check("英文 → 照常转出文本", err == "" and text == "superboynick", (text, err))
+
+    # 显式 language：用户说死了就照办，不探测
+    audio_read.transcribe(p, _cfg(tmp, language="en"))
+    tcall = [c for c in fw.calls if c[0] == "transcribe"]
+    check("显式 language=en 时透传", tcall and tcall[-1][2] == "en", fw.calls)
+
+    # 语音条那条路同样受限
+    fw = _FakeWhisper(["Should not be used"], language="fr").install()
+    t3, score, e3 = audio_read.transcribe_scored(p, cfg)
+    check("语音条路（scored）同样拒绝", t3 == "" and "只允许" in e3 and score is None,
+          (t3, score, e3))
+
+    # 老版本没有 detect_language：可选功能不该变成硬故障（用桩自带的 detect=False 模拟）
+    fw = _FakeWhisper(["whatever"], detect=False).install()
+    text, err = audio_read.transcribe(p, cfg)
+    check("没有探测接口 → 照转（不因可选功能失败）", err == "" and text == "whatever",
+          (text, err))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="selftest_audio_")
     global _OK
+    # 把临时根目录改到本测试自己的目录：**用环境变量，不再 monkeypatch 生产函数**。
+    # 为什么需要：生产临时目录是 `data/tmp_audio`（由 `file_read` 使用），而在**受限环境**
+    # （只允许写工作区顶层的沙箱）里连建文件都做不到 —— `t7`（长音频分段真跑 PyAV 切片）
+    # 会当场 PermissionError 崩掉，整份套件后面的用例一条都跑不到。
+    # ⚠️ 必须是 `tmp` 下的**子目录**：t7 有一条断言「切片用完就删、目录里没有 .wav 残留」，
+    # 而用例自己的素材 wav（四十分钟.wav 等）就写在 `tmp` 根下 —— 指到根上会让那条断言
+    # 把"测试自己的素材"当成"没删干净的切片"，**假红**。
+    # 这条覆盖能力由 `tempdir.py` 正式提供（`PROJ_TMP`），所以这里不用再替换函数引用。
+    _old_proj_tmp = os.environ.get("PROJ_TMP")
+    os.environ["PROJ_TMP"] = os.path.join(tmp, "tmp_audio")
     print("=" * 60)
     print("语音输入（audio_read）回归自测（不联网、不下模型、不碰微信）")
     print("=" * 60)
@@ -589,11 +744,18 @@ def main():
         t6_cloud_failure(tmp)
         t7_long_audio_windows(tmp)
         t8_max_bytes_zero(tmp)
+        t9_language(tmp)
+        t10_languages(tmp)
     finally:
         if _real_fw is None:
             sys.modules.pop("faster_whisper", None)
         else:
             sys.modules["faster_whisper"] = _real_fw
+        # 还原 PROJ_TMP（别把它留给同进程里后面的用例）
+        if _old_proj_tmp is None:
+            os.environ.pop("PROJ_TMP", None)
+        else:
+            os.environ["PROJ_TMP"] = _old_proj_tmp
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 60)

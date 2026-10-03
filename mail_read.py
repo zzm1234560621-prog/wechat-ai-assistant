@@ -15,6 +15,8 @@ import email.policy
 import os
 import tempfile
 
+import tempdir
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 MAIL_EXT = (".eml", ".msg", ".mbox")
@@ -96,8 +98,7 @@ def read_eml(path, cfg=None, on_image=None):
     if attachments:
         lines.append(f"\n【附件 {len(attachments)} 个】")
         limit = max_attachments(cfg)
-        d = os.path.join(_HERE, "data", "tmp_mail")
-        os.makedirs(d, exist_ok=True)
+        d = tempdir.get("tmp_mail")
         for i, (name, part) in enumerate(attachments):
             if i >= limit:
                 lines.append(f"  · {name}（**没读**：超过 mail.max_attachments={limit}）")
@@ -242,23 +243,5 @@ def read_msg(path, cfg=None, on_image=None):
 
 
 def sweep_tmp(max_age=86400.0):
-    """清理邮件附件留下的临时文件（**删了什么要打日志**）。"""
-    import time
-    d = os.path.join(_HERE, "data", "tmp_mail")
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return []
-    dead, now = [], time.time()
-    for n in names:
-        p = os.path.join(d, n)
-        try:
-            if now - os.path.getmtime(p) > max_age:
-                os.remove(p)
-                dead.append(n)
-        except OSError:
-            continue
-    if dead:
-        print(f"⚠️ mail_read: 清理了 {len(dead)} 个邮件临时文件（>{max_age/3600:.0f} 小时）。",
-              flush=True)
-    return dead
+    """清理邮件附件留下的临时文件（**删了什么要打日志**，由 `tempdir.sweep` 统一实现）。"""
+    return tempdir.sweep("tmp_mail", max_age, "mail_read")

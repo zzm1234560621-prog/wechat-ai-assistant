@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -180,6 +180,7 @@
     <ClInclude Include="include\Hook_Method.h" />
     <ClInclude Include="include\hideself.h" />
     <ClInclude Include="include\hook_xlog.h" />
+    <ClInclude Include="include\hook_voip.h" />
     <ClInclude Include="include\httplib.h" />
     <ClInclude Include="include\httplib_core.h" />
     <ClInclude Include="include\http_post.h" />
@@ -214,6 +215,7 @@
     <ClCompile Include="src\global.cpp" />
     <ClCompile Include="src\hideself.cpp" />
     <ClCompile Include="src\hook_xlog.cpp" />
+    <ClCompile Include="src\hook_voip.cpp" />
     <ClCompile Include="src\httplib_core.cpp" />
     <ClCompile Include="src\http_post.cpp" />
     <ClCompile Include="src\http_routes.cpp" />

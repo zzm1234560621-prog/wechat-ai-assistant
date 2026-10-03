@@ -38,6 +38,16 @@ def targets():
 
 def main(argv):
     verbose = "-v" in argv
+    # 把临时根改到系统临时盘（`PROJ_TMP`），**子进程会继承**，所以这里设一次就够。
+    # 为什么必须：默认临时目录是 `<项目>/data/tmp_*`，在**受限环境**（只允许写工作区
+    # 顶层的沙箱）里连建文件都做不到 —— 会让真跑切片的 t7、压缩包、视频、邮件、
+    # 缩图那几份套件当场 PermissionError。生产默认不受影响（见 `tempdir.py`）。
+    try:
+        import tempdir
+        _root = tempdir.use_for_tests()
+        print(f"临时根目录（测试用）：{_root}")
+    except Exception as e:                       # 绝不让"改道失败"拦住跑测试
+        print(f"⚠️ 临时目录改道失败（{type(e).__name__}: {e}），继续用默认")
     files = targets()
     print("=" * 66)
     print(f"跑全部自测，共 {len(files)} 份（无微信 / 不碰 hook / 不联网）")

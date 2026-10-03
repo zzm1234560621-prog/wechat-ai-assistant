@@ -277,7 +277,55 @@ _APPMSG_KIND = {
 }
 
 
-def _render_nontext(local_type, summary=""):
+VOICE_TRANSCRIPT_FIELD = 5      # packed_info_data 里字段 5 = 微信自己转的文字
+
+
+def voice_transcript(packed_hex):
+    """从 `Msg_*.packed_info_data` 里取**微信自己「转文字」的结果**。取不到返回 ""。
+
+    2026-10-03 真机取证（文件传输助手一条 1.24 秒语音，`local_id=613`）：
+
+        转文字前  080410385800
+        转文字后  080410382A0D08021209E4BDA0E5A5BDE380825800
+                  └ 字段5(13 字节) = { 字段1=2, 字段2="你好。" }
+
+    也就是说——**「转文字」的结果会落库**。所以语音条存在一条
+    **零成本、零上传、零本地算力**的读法：只要用户在微信里点过那一次「转文字」，
+    我们读这个字段就够了（不用扫内存、不用 whisper、不用云端）。
+
+    取不到（还没转 / 结构变了）就返回 "" —— 上层**必须如实说「还没转文字」**，
+    **绝不许**拿别的东西顶上。
+
+    ⚠️ 解析复用本模块**既有的** `_pb_fields` / `_pb_varint`（`decode_room_members`
+    用的就是那一套），**不要再写第二份 protobuf 遍历**：2026-10-03 我先写了一份
+    同名的 `_pb_fields`，把既有那个**覆盖**掉了（Python 后定义者胜），
+    结果 `voice_transcript` 拿到的是 2 元组、当场报
+    `not enough values to unpack (expected 3, got 2)` ——
+    同一个能力两个 owner，就是会这样互相踩。
+    """
+    s = str(packed_hex or "").strip()
+    if not s:
+        return ""
+    try:
+        data = binascii.unhexlify(s)
+    except (binascii.Error, ValueError):
+        return ""
+    for f, v in _pb_fields(data):
+        if f != VOICE_TRANSCRIPT_FIELD or not isinstance(v, (bytes, bytearray)):
+            continue
+        for sf, sv in _pb_fields(v):
+            if sf != 2 or not isinstance(sv, (bytes, bytearray)):
+                continue
+            try:
+                txt = bytes(sv).decode("utf-8").strip()
+            except UnicodeDecodeError:
+                return ""
+            if txt:
+                return txt
+    return ""
+
+
+def _render_nontext(local_type, summary="", packed=""):
     """把非文本消息渲染成一行文本，**让下游（LLM）能看见**。
 
     以前这类消息在轮询里被直接 `continue` 丢掉，表现是
@@ -288,9 +336,24 @@ def _render_nontext(local_type, summary=""):
     （文件名、链接标题之类）能直接用；表路径拿不到摘要就只给类型标签。
     **绝不能**把 message_content 原样塞进来——非文本那列是 zstd 压缩的
     十六进制，塞进去就是一坨乱码污染上下文。
+
+    `packed` 是 `Msg_` 表的 `packed_info_data`（非文本在表路径上才有）：
+    **语音的「转文字」结果就在里面**，见 `voice_transcript()`。
     """
     label = _type_label(local_type)
     s = str(summary or "").strip()
+    lt = _as_int(local_type) & 0xFFFFFFFF
+    if lt == 34:
+        txt = voice_transcript(packed)
+        if txt:
+            # 微信自己转过文字了 —— 这才是**真内容**，当正文用
+            return f"[语音 {s}] {txt}" if s else f"[语音] {txt}"
+        # 没转过：音频**不在本机磁盘上**（2026-10-03 实测：msg\attach、cache、
+        # VoiceTemp 三处按大小翻遍，候选全是图片缩略图/表情/朋友圈）。
+        # 所以要把「怎么才能读到」写进标签：只写 `[语音]` 的话，模型会以为自己
+        # 听过，然后凭空编一段内容出来 —— 那是骗用户。
+        label = ("语音条（**读不到内容**：音频不在本机磁盘上；"
+                 "在微信里点一次「转文字」，我就能读到）")
     return f"[{label}] {s[:200]}" if s else f"[{label}]"
 
 
@@ -744,7 +807,8 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None, since=None,
     for db in _v4_msg_dbs(client):
         self_id = _v4_self_rowid(client, db)
         sql = (
-            f"SELECT local_id, local_type, real_sender_id, create_time, message_content "
+            f"SELECT local_id, local_type, real_sender_id, create_time, message_content, "
+            f"packed_info_data "
             f"FROM {table}"
         )
         # 关键词检索只在文本里找（非文本那列是压缩十六进制，LIKE 没意义）
@@ -777,14 +841,27 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None, since=None,
             lid = _pick(r, "local_id", 0)
             ct = _pick(r, "create_time", 3)
             if lt == 1:
-                content = str(_pick(r, "message_content", 4) or "")
+                # ⚠️ **文本也必须解压**，不能原样取字符串。微信对**长文本**同样用
+                # zstd 压缩存 `message_content`（2026-10-03 真机取证：filehelper 里
+                # local_id 651~653 三条 `local_type=1` 的正文就是 `28B52FFD…` 开头的
+                # zstd；短的如「确认」才是明文）。以前这里 `str(...)` 原样取，后果有两个：
+                #   ① bot 把**自己上一条长回复的压缩串**当成用户新说的话，于是自己回
+                #      自己 —— 用户看到的就是「我就发了一条音频，它回了我好几条」，
+                #      而且回的是「还是同一串东西…第三遍了/第四遍了」这种莫名其妙的话；
+                #   ② `is_own_reply()` 拿这个串跟刚发出去的原文比对**必然对不上**，
+                #      于是「自己的回显」这条判据对**长回复完全失效**（短回复没事，
+                #      所以这个坑很难看出来）。
+                # `decode_msg_content()` 本来就是干这个的：是 zstd 就解，不是就原样返回。
+                content = decode_msg_content(_pick(r, "message_content", 4))
             elif (lt & 0xFFFFFFFF) == 49:
                 # appmsg：这里有原始 message_content，直接解出来解析
                 # （引用消息的被引用原文在 <refermsg> 里）
                 content = render_appmsg(decode_msg_content(_pick(r, "message_content", 4)))
             else:
-                # 非文本不再丢弃，渲染成标签；图片顺带把本地已解码缩略图路径带上
-                content = _render_nontext(lt)
+                # 非文本不再丢弃，渲染成标签；图片顺带把本地已解码缩略图路径带上。
+                # `packed_info_data` 要带上：**语音的「转文字」结果就存在那一列**
+                # （见 voice_transcript），不带的话语音永远只能渲染成「读不到内容」。
+                content = _render_nontext(lt, "", _pick(r, "packed_info_data", 5))
                 if lt == 3:
                     # **带上 local_id**：模型据此能直接调 read_image(contact, local_id)
                     # 去看图；不带的话它只知道「有张图」，得先 find_images 再 read_image，
@@ -1388,7 +1465,9 @@ def _v4_search_by_scan(client, keyword, limit=30, max_tables=40):
                 sid_i = _as_int(_pick(r, "real_sender_id", 0))
                 rows.append({
                     "talker": table,
-                    "content": str(_pick(r, "message_content", 2) or ""),
+                    # 同样是**长文本会被 zstd 压缩**，必须解（见 _v4_history_from_tables
+                    # 里那段注释）；不解的话这条兜底检索搜出来的"内容"是压缩串。
+                    "content": decode_msg_content(_pick(r, "message_content", 2)),
                     "is_self": 1 if (self_id is not None and sid_i == self_id) else 0,
                     "time": _fmt_time(_pick(r, "create_time", 1)),
                     "_ts": _as_int(_pick(r, "create_time", 1)),
@@ -2152,8 +2231,15 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
       两条路都瞎，用户看到的就是「我把图发过去了，它一点反应没有」。
 
     做法：只用 SessionTable 当「有新动静」的信号（几百行的小表、一次查询），
-    条件收紧到 **最后一条不是文本**（summary 为空）才回查那个会话的消息表。
-    稳态下这个查询返回 0 行 → **不增加任何额外查库**；真收到图才多 1~2 次查询。
+    条件收紧到 **最后一条不是文本**才回查那个会话的消息表。
+
+    ⚠️ 判据必须是 `last_msg_type`，**不能**再用「summary 为空」当「非文本」的替身：
+    图片的 summary 确实常是空串，但**语音的 summary 是时长**（实测 `1"`）、
+    表情/视频/系统消息也各有摘要 —— 拿 summary 当判据，这些类型**永远进不来**，
+    表现就是「我发了条语音，bot 完全没反应」（2026-10-03 真机踩到）。
+    文本(1) 和 appmsg(49) 由 fts 那条路覆盖，所以这里排掉这两个，其余全捞。
+
+    稳态下这个查询返回 0 行 → **不增加任何额外查库**；真收到图/语音才多 1~2 次查询。
 
     每个会话一个水位线 `cursors["__nonttext__"][talker]`，避免同一张图每轮重复报。
     **不做「第一次见到就只记水位线不报」那种 seed**——那会让「你在某个会话里发的
@@ -2164,9 +2250,11 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
       * 真有「停机期间的旧消息」漏进来，bot 主循环的 catchup 判定也只通知、不自动回复。
     """
     since = _as_int((cursors or {}).get("__time__", 0))
-    sql = ("SELECT username, last_timestamp FROM SessionTable "
+    # 判据用 last_msg_type（结构），不用 summary 是否为空（那是个不成立的替身）——
+    # 详见本函数 docstring：语音/表情/视频/系统消息的 summary 都非空。
+    sql = ("SELECT username, last_timestamp, last_msg_type FROM SessionTable "
            f"WHERE last_timestamp >= {since} "
-           "AND (summary IS NULL OR summary = '')")
+           "AND (last_msg_type IS NULL OR last_msg_type NOT IN (1, 49))")
     try:
         rows = _query(client, "session.db", sql)
     except Exception as e:
@@ -2297,10 +2385,21 @@ def _v4_new_messages_session(client, cursors, limit=200):
 
     固有代价：每个会话只能拿到**最后一条**，同一会话里连发多条会被折叠成一条。
     这是兜底路径——fts 一旦被重扫救回来，就恢复完整精度。
+
+    ⚠️ **非文本也要带上 `local_type`**（2026-10-03 晚加）：以前这条路的产出**没有**
+    `local_type`，于是语音条（`local_type=34`）在这条路上**进不去语音分支** ——
+    英文界面下它的 summary 就是 `[Audio] 8"`，被下游当成"只有类型标签"**静默丢掉**；
+    中文界面下 summary 是 `1"`，更糟：那串时长会被当成**用户说的话**送进模型。
+    现在把 `SessionTable.last_msg_type` 原样带下去（和 `_v4_pickup_nontext` 同一套代码空间，
+    它那边就是用 `last_msg_type NOT IN (1, 49)` 判非文本的）。
+    代价说清楚：这条路**拿不到 `local_id`**（它按设计不碰 `Msg_` 表），所以语音只能
+    "如实说读不出来"，**不会真的读出内容** —— 那是"静默丢掉"和"有话说"的区别。
+    取不到 `last_msg_type`（老库/结构变了）就**不写这个键**，行为和以前完全一致。
     """
     cursors = dict(cursors or {})
     since = _as_int(cursors.get("__time__", 0))
-    sql = ("SELECT username, summary, last_timestamp, last_msg_sender FROM SessionTable "
+    sql = ("SELECT username, summary, last_timestamp, last_msg_sender, last_msg_type "
+           "FROM SessionTable "
            f"WHERE last_timestamp >= {since} "
            f"ORDER BY last_timestamp ASC LIMIT {int(limit)}")
     try:
@@ -2325,7 +2424,7 @@ def _v4_new_messages_session(client, cursors, limit=200):
             continue  # 最后一条不是文本（图片/语音…），summary 是空的
         sender = str(_pick(r, "last_msg_sender", 3) or "")
         ts = _as_int(_pick(r, "last_timestamp", 2))
-        out.append({
+        m = {
             "talker": str(_pick(r, "username", 0) or ""),
             "content": content,
             "is_self": 1 if (sender and _SELF_WXID and sender == _SELF_WXID) else 0,
@@ -2333,7 +2432,15 @@ def _v4_new_messages_session(client, cursors, limit=200):
             "sender": sender,
             "time": _fmt_time(ts),
             "_ts": ts,
-        })
+        }
+        # 非文本要带 `local_type`（否则语音在英文界面被当"只有标签"静默丢掉、
+        # 中文界面还会拿 summary 里的 `1"` 冒充用户说的话）。取不到就**不加这个键**
+        # （`_as_int` 把 None 变成 0，所以这里必须先判原始值，否则"没有这一列"会
+        #  变成"local_type=0"，那也算改了行为）。
+        raw_lt = _pick(r, "last_msg_type", 4)
+        if raw_lt is not None and str(raw_lt).strip() != "":
+            m["local_type"] = _as_int(raw_lt)
+        out.append(m)
     out.sort(key=lambda m: m["_ts"])
     cursors["__time__"] = max([m["_ts"] for m in out], default=since)
     return out, cursors
