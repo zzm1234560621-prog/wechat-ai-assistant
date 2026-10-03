@@ -1293,6 +1293,41 @@ def t_export(tmp):
         bot.live_history.query_contact_history = old_q
 
 
+def t_now_line():
+    """模型每轮都拿得到**真实的当前时间**（2026-10-03 用户要的「实时获取时间」）。
+
+    模型自己不知道现在几点，问它「现在几点 / 今天星期几」它只能从训练数据里编。
+    所以每轮把真实时间拼进系统提示。两条硬要求：
+      1. **现算**——bot 是长驻进程，缓存一次就会一直骗到重启；
+      2. 拼在**系统提示**里（不是用户那句话里），而且不许把它塞回 `system` 变量
+         （塞回去就等于缓存了）。
+    """
+    from datetime import datetime as _D
+    sec("当前时间：每轮现算 + 拼进系统提示（不许缓存）")
+    fixed = _D(2026, 10, 3, 23, 41, 5)          # 2026-10-03 是周六
+    line = bot.now_line(fixed)
+    chk("2026-10-03 23:41:05" in line and "星期六" in line,
+        f"格式：日期+时间+星期（实际 {line!r}）")
+    joined = bot.with_now("你是助手。", fixed)
+    chk(joined.startswith("你是助手。") and "当前时间" in joined,
+        "拼在系统提示**末尾**，原文一个字不动")
+    chk(bot.with_now("", fixed).count("当前时间") == 1,
+        "空系统提示也不会炸")
+
+    a = bot.with_now("X")
+    time.sleep(1.05)
+    b = bot.with_now("X")
+    chk(a != b, "两次调用得到**不同**的时间（说明是现算，不是启动时算一次）")
+
+    # 静态护栏：几处真发请求的地方必须走 system_now()，不许直接用 system
+    with open(os.path.join(HERE, "bot.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    chk("llm.chat(system," not in src and "llm.chat(system " not in src,
+        "没有哪条路把**没带时间**的 system 直接丢给模型")
+    chk(src.count("system_now()") >= 4,
+        f"四条调用路（agent×2 / chat×2）都走 system_now()（实际 {src.count('system_now()')} 处）")
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1323,6 +1358,7 @@ def main():
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()
+    t_now_line()
 
     print("\n" + "=" * 60)
     if _FAIL:

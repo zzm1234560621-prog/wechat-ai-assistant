@@ -541,6 +541,8 @@ def t10_relative_time():
     for when, date, at in (
         ("10分钟后", "2026-10-01", "19:34"),       # 19:33:45 → 向上取整到 19:34
         ("十分钟后", "2026-10-01", "19:34"),
+        ("10分钟之后", "2026-10-01", "19:34"),     # 用户原话就是「10分钟之后」
+        ("20分钟以后", "2026-10-01", "19:44"),
         ("半个小时后", "2026-10-01", "19:54"),
         ("半个小时以后", "2026-10-01", "19:54"),
         ("2小时后", "2026-10-01", "21:24"),
@@ -1284,6 +1286,97 @@ def t16_no_commitment_on_my_behalf():
             f"{where} 里不许再有那句现成文案（弱模型会把它当万能回复）")
 
 
+# ---------------- T17：提醒我（mode=remind / 「10分钟之后 我 …」）----------------
+
+class _SchedToolStub:
+    """只借 `ToolBox.t_schedule` 这一个方法（**模型那条路**），不造真 ToolBox。"""
+
+    t_schedule = agent_tools.ToolBox.t_schedule
+
+    def __init__(self):
+        self.cfg_changed = False
+        self.cfg_provider = lambda: settings.effective({})
+
+    def _one(self, who):
+        return _resolve_one(who)
+
+
+def t17_remind_me():
+    """「10分钟之后提醒我喝水」——到点把这句话**原样**发回控制会话。
+
+    2026-10-03 用户要的。此前 `<对象>` 位置写「我」会去查联系人，只得到
+    「没找到「我」」；动作里也没有一个「提醒我自己」。三条路都要通：
+    `/定时 加提醒 …`、`/定时 加 … 我 …`、以及模型调 schedule 工具（mode=remind）。
+    """
+    print("T17. 提醒我：10分钟之后 / 「我」不要当联系人 / 到点只进控制会话")
+    now = datetime(2026, 10, 1, 19, 23, 45)      # 与 T10 同一个基准时刻
+    with TempSettings({"schedule": {"enabled": True, "tasks": []}}) as tmp:
+        # 1) 显式子命令
+        out, ch = scheduler.handle_command("加提醒 10分钟之后 喝水",
+                                           settings.effective({}), _resolve_one, now=now)
+        chk(ch and "已加定时任务" in out, f"加提醒建出任务（实际：{out[:40]!r}）")
+        t = tmp.read()["schedule"]["tasks"][-1]
+        chk(t.get("action") == "remind" and t.get("text") == "喝水" and not t.get("to"),
+            f"提醒任务：不用对象、内容原样（实际 {t}）")
+        chk(t.get("repeat") == "once" and t.get("at") == "19:34",
+            f"相对时间当场算成绝对时刻（实际 {t.get('date')} {t.get('at')}）")
+
+        # 2)「我 / 自己 / 本人」这些自称都算提醒我，绝不拿去查联系人
+        for who in ("我", "自己", "本人", "我本人"):
+            scheduler.handle_command(f"加 10分钟之后 {who} 吃药", settings.effective({}),
+                                     _resolve_one, now=now)
+            t = tmp.read()["schedule"]["tasks"][-1]
+            chk(t.get("action") == "remind" and t.get("text") == "吃药"
+                and not t.get("to"),
+                f"「… {who} 吃药」= 提醒我自己（实际 action={t.get('action')} "
+                f"to={t.get('to')!r} text={t.get('text')!r}）")
+
+        # 3) 反向：真人不能被抢走（否则「提醒张三」会变成提醒我）
+        scheduler.handle_command("加 10分钟之后 张三 开会", settings.effective({}),
+                                 _resolve_one, now=now)
+        t = tmp.read()["schedule"]["tasks"][-1]
+        chk(t.get("action") == "text" and t.get("to") == "wxid_z"
+            and t.get("text") == "开会",
+            f"真人还是发给真人（实际 {t.get('action')} {t.get('to')} {t.get('text')!r}）")
+
+        # 4) 列表里显示成「提醒你…」（不是「发给 我」）
+        out, _ = scheduler.handle_command("", settings.effective({}), _resolve_one)
+        chk("提醒你" in out, "列表里写「提醒你：…」")
+
+        # 5) 到点执行：只进控制会话，**一个联系人都没发**
+        sent, notes = [], []
+        due = [dict(t, next_ts=now.timestamp() - 1)
+               for t in tmp.read()["schedule"]["tasks"] if t.get("action") == "remind"]
+        chk(len(due) >= 1, "至少有两条提醒任务排到点")
+        real_save = scheduler._save
+        scheduler._save = lambda **kw: None       # 自测不写盘
+        try:
+            fired = scheduler.run_due(
+                {"schedule": {"enabled": True, "tasks": due}}, now,
+                send_text=lambda to, tx: sent.append((to, tx)), notify=notes.append)
+        finally:
+            scheduler._save = real_save
+        chk(len(fired) == len(due), f"{len(due)} 条提醒都触发了（实际 {fired}）")
+        chk(sent == [], f"提醒**不发给任何联系人**（实际 {sent}）")
+        chk(any("⏰ 提醒：喝水" in n for n in notes), f"喝水那条进了控制会话（{notes}）")
+
+        # 6) 模型那条路：t_schedule + mode=remind（模型常把 who 也填成「我」，也得对）
+        stub = _SchedToolStub()
+        stub.t_schedule({"action": "add", "when": "10分钟之后", "text": "站起来走两步",
+                         "mode": "remind", "who": "我"})
+        t = tmp.read()["schedule"]["tasks"][-1]
+        chk(t.get("action") == "remind" and t.get("text") == "站起来走两步"
+            and not t.get("to"),
+            f"模型路（mode=remind）也对（实际 action={t.get('action')} "
+            f"to={t.get('to')!r} text={t.get('text')!r}）")
+        chk(stub.cfg_changed is True, "改过配置要标 cfg_changed（主循环才会 reload）")
+
+        # 7) build_arg：mode=remind 时 who 位置那个「我」**不许混进正文**
+        arg = scheduler.build_arg("add", when="10分钟之后", who="我",
+                                  text="喝水", mode="remind")
+        chk(arg == "addremind 10分钟之后 喝水", f"拼出来的子命令对（实际 {arg!r}）")
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -1298,7 +1391,8 @@ def main():
                t9_review_scope_is_explicit, t10_relative_time,
                t11_per_person_persona, t12_learn_persona_from_history,
                t13_address_from_history, t14_groups,
-               t15_watch_keywords, t16_no_commitment_on_my_behalf):
+               t15_watch_keywords, t16_no_commitment_on_my_behalf,
+               t17_remind_me):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

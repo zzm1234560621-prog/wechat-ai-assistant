@@ -32,7 +32,7 @@
 | 走 `/voipinvite` CGI 吗？ | **不走**。CGI 链 `0x2A5DA80` ← `0x4BAB450` ← `0x4BAC4A0` 在真人打语音通话时**一次都没命中** |
 | 邀请消息长什么样？ | 已完整拿到：**277 字节 XML，全是常量或 0**（见下） |
 | 发出去会怎样？ | 微信**会**把它当类型 50 处理（`type_dispatch rdx=0x32` + `payload_ctor` 命中），**但不弹呼叫窗、对方不响** |
-| 项目侧现状 | `call` 工具 + `callgate.py` 三道闸**默认全关**；`action=call` 如实报错，**绝不降级成发文本** |
+| 项目侧现状 | **代码与闸门保留**（`t_call` / `callgate.py` / `aixed_api.call_voip` / hook 的 `/CallVoip`）；**对外描述已删**（`TOOLS` 那条 call、两份 config 的 `system_prompt`、README 那节）——见文末「2026-10-03 决定」。`action=call` 到点**如实报错，绝不降级成发文本** |
 | 替代路线 | 到点强提醒（零风险）/ 安卓 ADB 真拨号 / 企业微信 PSTN |
 
 ### 实测过的"能做到什么"（2026-10-03）
@@ -170,3 +170,30 @@ mov  dword ptr [obj2+0x2c], 0x32
 
 **已知的坑**：PowerShell 用 `*>` 重定向会把输出写成 UTF-16LE，`read` 会判成 binary，
 要先转 UTF-8 再读。
+
+
+---
+
+## 2026-10-03 决定：**只删描述**（用户口径）
+
+原话：「只删除描述就行，然后提醒那个真要」。落地如下：
+
+**删掉的（对外描述）**
+
+- `agent_tools.TOOLS` 里**那条 `call` 定义**（模型因此看不到它、不会再主动提打电话）；
+- **两份 config 的 `system_prompt`** 里那几段教模型怎么打电话 / `mode=call` 的文字；
+- `README.md` 的「打电话」那一节、定时任务表里 `/定时 加通话` 那一行；
+- `bot.py` 帮助文本里的 `/定时 加通话` 那一行、`scheduler._USAGE` 里同一条；
+- `schedule` 工具说明与 `mode` 枚举里的 `call`。
+
+**保留的（代码与闸门，整条不动）**
+
+- `agent_tools.ToolBox.t_call`（**登记待确认、永不自己拨**）、`callgate.py` 三道闸、
+  `aixed_api.call_voip`、hook 源码里的 `/CallVoip` 与 `SendVoip*`、探针 `hook_voip.cpp/.h`；
+- `selftest_call.py` 照旧跑（46 项全绿）；老的通话定时任务到点照旧**如实报错**；
+- 于是 `t_call` 是**故意的孤儿处理器**：`selftest_tool_registry.py` 里有一条**带原因**的例外
+  （`intended_orphans`），别的孤儿照样算失败。
+
+**要恢复可见**：把 `TOOLS` 里那条 call 加回去（原文在 git 历史里），别的都不用改。
+**别顺手删代码** —— 用户明确只要求删描述；`agent_tools.ToolBox.t_call` 的 docstring 里
+也写了这条来龙去脉。

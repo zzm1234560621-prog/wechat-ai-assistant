@@ -246,14 +246,15 @@ HELP_TEXT = (
     "/auto review on|off [谁] 开审核（草稿先发你，回「确认」才发）\n"
     "/auto ctx <1~30>         上下文条数\n"
     "\n"
-    "—— 定时任务（到点自动给对方发消息）——\n"
-    "也可以直接说「明天9点提醒我给张三发…」。\n"
+    "—— 定时任务（到点给对方发消息 / 到点提醒我）——\n"
+    "也可以直接说「明天9点提醒我给张三发…」「10分钟之后提醒我喝水」。\n"
     "/定时 —— 看列表\n"
     "/定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
+    "/定时 加提醒 <时间> <内容> —— 到点提醒我（发回本会话），不用填对象\n"
     "/定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
-    "/定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
     "/定时 删|开|关 <编号|all> —— 删 / 恢复 / 暂停\n"
-    "时间写法：9:00=每天，明天9:00=只一次，每周一 9:00=每周，每30分钟=每隔一段\n"
+    "时间写法：9:00=每天，明天9:00=只一次，每周一 9:00=每周，每30分钟=每隔一段，\n"
+    "          10分钟后 / 10分钟之后 / 半小时后 / 2小时后=只一次（从现在起算）\n"
     "\n"
     "—— 盯着某人（他发消息就通知我，不回他）——\n"
     "也可以直接说「张三发消息告诉我一声」。\n"
@@ -765,6 +766,28 @@ def _msg_speaker(m, names):
     if group and who != tname:
         return f"{tname or '群'}/{who}"
     return who
+
+
+def now_line(now=None):
+    """给模型的一行「现在几点」。**每次调用现算**，不是进程启动时算一次。
+
+    为什么要有：模型自己不知道现在是什么时候。用户问「现在几点」「今天星期几」，
+    或者让它按「今天 / 明天 / 这个月」算事情时，它只能从训练数据里编一个日期出来
+    ——实测就是这样。所以每轮把真实时间拼进系统提示。
+    """
+    t = now or datetime.now()
+    return (f"（当前时间：{t.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"星期{'一二三四五六日'[t.weekday()]}，本机时区）")
+
+
+def with_now(system, now=None):
+    """把「现在几点」拼到系统提示末尾。
+
+    ⚠️ **必须每轮现调**：bot 是长驻进程（后台跑几天很正常），
+    启动时拼一次的话，那行时间会一直骗到重启为止。所以别把它塞进
+    `system` 变量本身，只在真的要发请求时才拼。
+    """
+    return (str(system or "").rstrip() + "\n" + now_line(now)).strip()
 
 
 def build_user_prompt(query, wcf, contacts, cfg, static_history, live_ok):
@@ -2459,6 +2482,14 @@ def main():
     system = cfg.get("system_prompt", "")
     respond_to_self = bool(cfg.get("respond_to_self", False))
 
+    def system_now():
+        """每轮现算的系统提示（末尾带真实时间）。
+
+        为什么是函数：`system` 只在启动和 reload_cfg 时更新，而 bot 会连跑好几天
+        ——把那行时间缓存进 `system` 就等于给它一个会过期的假时间。
+        """
+        return with_now(system)
+
     # 自动回复：代替我本人回这些会话
     auto_on = auto_reply.enabled(cfg)
     auto_recs = auto_reply.chats(cfg)
@@ -2629,7 +2660,7 @@ def main():
             if agent_enabled(cfg):
                 run_state = {}
                 answer, changed = run_agent(
-                    llm, system, prompt, wcf, contacts, cfg, control_chat, self_wxid,
+                    llm, system_now(), prompt, wcf, contacts, cfg, control_chat, self_wxid,
                     cfg_provider=lambda: settings.effective(base_cfg),
                     history=history, state=run_state, user_query=query)
                 # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
@@ -2640,7 +2671,8 @@ def main():
                 answer = with_broadcast_preview(
                     answer, run_state.get("broadcast_preview", ""))
             else:
-                answer = llm.chat(system, history + [{"role": "user", "content": prompt}])
+                answer = llm.chat(system_now(),
+                                  history + [{"role": "user", "content": prompt}])
                 changed = False
             dialog_append(control_chat, "user", question, cfg)
             dialog_append(control_chat, "assistant", answer, cfg)
@@ -3244,7 +3276,7 @@ def main():
                         # 否则连着改两次（比如加了人再开开关）第二次会基于旧快照覆盖前一次。
                         run_state = {}
                         answer, cfg_changed = run_agent(
-                            llm, system, prompt, wcf, contacts, cfg, sender, self_wxid,
+                            llm, system_now(), prompt, wcf, contacts, cfg, sender, self_wxid,
                             cfg_provider=lambda: settings.effective(base_cfg),
                             history=history, state=run_state)
                         # 确定性兜底：模型没调 run_command 却自己说「已提交/等你确认」时，
@@ -3257,7 +3289,7 @@ def main():
                         answer = with_broadcast_preview(
                             answer, run_state.get("broadcast_preview", ""))
                     else:
-                        answer = llm.chat(system,
+                        answer = llm.chat(system_now(),
                                           history + [{"role": "user", "content": prompt}])
                         cfg_changed = False
                     send(answer, sender)

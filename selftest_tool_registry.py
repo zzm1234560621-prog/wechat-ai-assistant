@@ -86,13 +86,20 @@ def main():
     print("=" * 66)
 
     # ── 1 · TOOLS ↔ 处理器，双向不许有缺口 ───────────────────────────────
+    #
+    # 例外只有一条，而且是**用户拍板的**（2026-10-03）：「打电话只删描述」——
+    # `call` 的 TOOLS 定义删掉了（模型看不到、不会再提），但 `t_call` 与
+    # callgate / hook 的 `/CallVoip` 全保留，所以它现在**注定是孤儿**。
+    # 这条例外写在代码里、带原因和恢复动作，别的孤儿照样算失败。
     print("── 1 · TOOLS 与 t_* 处理器双向对齐 ──")
     no_handler = [n for n in names if n not in handlers]
     check("每个工具都有处理器（否则模型点了报「没有名为 X 的工具」）",
           not no_handler, f"缺处理器：{no_handler}")
-    orphan = [n for n in handlers if n not in names]
+    intended_orphans = {"call": "描述已删、代码保留：把 TOOLS 里那条 call 加回去即可恢复"}
+    orphan = [n for n in handlers if n not in names and n not in intended_orphans]
     check("没有孤儿处理器（有实现却没声明，模型不知道它存在）",
-          not orphan, f"未声明：{orphan}")
+          not orphan,
+          f"未声明：{orphan}（故意保留的孤儿：{sorted(intended_orphans)}）")
     dupes = sorted({n for n in names if names.count(n) > 1})
     check("TOOLS 里没有重名", not dupes, f"重名：{dupes}")
 
@@ -114,7 +121,7 @@ def main():
               "system_prompt 挪位置了？这份自测的检查点会失效，先修它")
     else:
         miss = [n for n in names if n not in pe]
-        check(f"25 个工具名都出现在示例的 system_prompt 里（缺 {len(miss)} 个）",
+        check(f"{len(names)} 个工具名都出现在示例的 system_prompt 里（缺 {len(miss)} 个）",
               not miss, f"发出去就丢指导：{miss}")
 
     # ── 4 · 两份配置的顶层段必须对齐（开发机有、发出去没有 = 功能只在本地活）──

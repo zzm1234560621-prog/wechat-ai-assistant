@@ -1,4 +1,4 @@
-"""定时任务：到点自动给某人发消息（以及将来打电话）。
+"""定时任务：到点给某人发消息 / 到点提醒我 / 到点让助手答一个问题。
 
 **为什么不做成后台线程**：hook 不支持并发（并发调用会把微信搞崩，见 CLAUDE.md），
 而轮询主循环本身是单线程的。所以定时器只在主循环**那一次 tick** 里跑，
@@ -8,10 +8,12 @@
 config.yaml 里给默认值。字段：
 
     id         短标识，命令里用（t1 / t2 …）
-    action     text=发文本；call=发起语音通话（**目前发不出去**，见下面 execute）
-    to         对方 wxid（创建时就解析好并落盘，tick 里不再查库）
+    action     text=给某人发文本；remind=到点提醒我（发到控制会话）；
+               ask=到点把 text 当提问跑一遍助手，答案回控制会话；
+               call=发起语音通话（**目前发不出去**，见下面 run_due）
+    to         对方 wxid（创建时就解析好并落盘，tick 里不再查库；remind/ask 为空）
     to_name    显示名，只用于回显
-    text       发的内容（action=text 用）
+    text       发的内容（text=要发的话；remind=提醒的话；ask=要问的话）
     repeat     once | daily | weekly | interval
     at         "HH:MM"（daily/weekly）
     date       "YYYY-MM-DD"（once）
@@ -40,14 +42,15 @@ _USAGE = (
     "用法（也可以直接跟助手说「明天9点提醒我给张三发…」）：\n"
     "  /定时 —— 看列表\n"
     "  /定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
+    "  /定时 加提醒 <时间> <内容> —— 到点**提醒我**（发回本会话），不用填对象\n"
     "  /定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
-    "  /定时 加通话 <时间> <对象> —— 加一个打电话的（该功能还没打通）\n"
     "  /定时 删 <编号> —— 删掉\n"
     "  /定时 开|关 —— 总开关（只有这两个子命令，不能带编号）\n"
     "时间写法：9:00 是每天，明天9:00 是只一次，"
     "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段，"
-    "10分钟后 / 半小时后 / 2小时后 / 3天后 是只一次（从**现在**起算）。\n"
+    "10分钟后 / 10分钟之后 / 半小时后 / 2小时后 / 3天后 是只一次（从**现在**起算）。\n"
     "例：/定时 加 明天9:00 张三 记得带伞\n"
+    "    /定时 加提醒 10分钟之后 喝水\n"
     "    /定时 加提问 每天8:00 整理一下谁还没回我、昨天有什么漏的"
 )
 
@@ -325,6 +328,9 @@ def describe(t):
     body = f"「{(t.get('text') or '')[:24]}」"
     if act == "call":
         what = f"打电话给 {t.get('to_name') or t.get('to')}"
+    elif act == "remind":
+        # 提醒我是发到控制会话的，没有「发给谁」这回事
+        what = f"提醒你：{body}"
     elif act == "ask":
         # 提问式的答案是回控制会话的，没有「发给谁」这回事
         what = f"问你：{body}"
@@ -364,7 +370,7 @@ def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
     """跑一遍到点的任务。**在主循环那次 tick 里调用**（单线程）。
 
     send_text(wxid, text)  发文本
-    notify(text)           把结果发到控制会话（可选）
+    notify(text)           把一段话发到控制会话（提醒我、以及各种告警都走它）
     call(wxid, name)       发起语音通话；返回 None 表示成功，返回字符串表示失败原因。
                            没给 call 就说明还没打通，如实报错、**不降级成发文本**。
     ask(prompt)            把这句话当提问跑一次助手，返回答复（失败就抛异常）。
@@ -429,7 +435,12 @@ def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
         name = t.get("to_name") or t.get("to")
         try:
             act = t.get("action")
-            if act == "ask":
+            if act == "remind":
+                # 提醒我：把这句话**原样**发到控制会话（notify）。
+                # 不跑模型——让模型复述一遍，提醒内容就可能走样；这里要的是
+                # 「到点把用户自己写的那句话还给他」。
+                _warn(f"⏰ 提醒：{t.get('text') or ''}")
+            elif act == "ask":
                 if ask is None:
                     _warn(f"⏰ 定时任务 [{tid}] 到点了，但没法执行——"
                           f"主循环没提供 ask 回调。")
@@ -510,7 +521,29 @@ def _merge_save(touched):
 
 # ---------------- 命令 / 工具 ----------------
 
-def build_arg(action, when="", who="", text="", target="", mode="call"):
+# 「提醒我」的几种自称。出现在 `<对象>` 位置上时，目标是**控制会话**（自己），
+# 不是一个叫「我」的联系人 —— 去查联系人只会得到一句「没找到「我」」。
+_SELF_WORDS = ("我本人", "我自己", "自个儿", "自己", "本人", "俺", "我")
+
+
+def _is_self(who):
+    return _norm(who) in _SELF_WORDS
+
+
+def _strip_self_lead(text):
+    """「我 喝水」/「提醒我 喝水」→「喝水」：只削掉开头那个自称词。"""
+    s = str(text or "").strip()
+    for w in sorted(_SELF_WORDS, key=len, reverse=True):
+        if s == w:
+            return ""
+        if s.startswith(w):
+            rest = s[len(w):].lstrip("，,、:： ").strip()
+            if rest:
+                return rest
+    return s
+
+
+def build_arg(action, when="", who="", text="", target="", mode="text"):
     """把 agent 工具的结构化参数拼成 /定时 的子命令串。
 
     和 auto_reply.build_arg 同一个套路：工具和命令走**同一条**实现。
@@ -519,9 +552,14 @@ def build_arg(action, when="", who="", text="", target="", mode="call"):
     if a in ("list", "status", "列表", ""):
         return ""
     if a in ("add", "加", "添加"):
-        if str(mode or "").lower() in ("call", "通话", "电话"):
+        m = str(mode or "").lower()
+        if m in ("call", "通话", "电话"):
             head = "addcall"
-        elif str(mode or "").lower() in ("ask", "提问"):
+        elif m in ("remind", "提醒"):
+            # 提醒我：没有「发给谁」，who 位置的东西（往往是「我」）丢掉，
+            # 否则它会变成提醒正文的一部分。
+            head, who = "addremind", ""
+        elif m in ("ask", "提问"):
             head = "ask"
         else:
             head = "add"
@@ -533,11 +571,13 @@ def build_arg(action, when="", who="", text="", target="", mode="call"):
     return a
 
 
-def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
+def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None):
     """处理 /定时 系列子命令。返回 (回复文本, 是否改了配置)。
 
     resolve(who) -> (候选人 dict, 错误文本)，由调用方提供
     （bot 用联系人快照、agent 用 ToolBox._one，重名时都会要求用户说清楚）。
+
+    `now` 只为**自测**能固定「明天 / 10分钟之后」而存在，生产不传。
     """
     parts = str(arg or "").split(maxsplit=1)
     sub = parts[0].strip().lower() if parts else ""
@@ -572,8 +612,10 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         _retire_id(rest)      # 本次运行内不再把 rest 发给新任务（编号撞了就删错人）
         return f"已删除任务 {rest}。", True
 
-    if sub in ("add", "加", "添加", "addcall", "加通话", "加电话", "加提问", "ask"):
+    if sub in ("add", "加", "添加", "addcall", "加通话", "加电话",
+               "addremind", "加提醒", "提醒", "remind", "加提问", "ask"):
         want_call = sub in ("addcall", "加通话", "加电话")
+        want_remind = sub in ("addremind", "加提醒", "提醒", "remind")
         want_ask = sub in ("加提问", "ask")
         # 时间可能是两个词（「明天 9:00」「2026-10-02 9:00」），先按前缀吃掉
         bits = rest.split()
@@ -585,13 +627,20 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
         when = " ".join(bits[:take])
         tail = bits[take:]
         try:
-            spec = parse_when(when)
+            spec = parse_when(when, now)
         except ValueError as e:
             return str(e), False
 
         if want_call:
             who = " ".join(tail).strip()
             text = ""
+        elif want_remind:
+            # 提醒我：整段剩下的话就是提醒内容。开头那个自称词要削掉
+            #（「加提醒 10分钟之后 提醒我 喝水」这种也要能认）。
+            text = _strip_self_lead(" ".join(tail))
+            who = ""
+            if not text:
+                return "要说清楚提醒什么。例：/定时 加提醒 10分钟之后 喝水", False
         elif want_ask:
             # 提问式：整段剩下的话就是问题，不用解析对象（答案回控制会话）
             text = " ".join(tail).strip()
@@ -603,11 +652,17 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
                 return _USAGE, False
             who = tail[0]
             text = " ".join(tail[1:]).strip()
+            if _is_self(who):
+                # 「10分钟之后提醒我喝水」走的就是这条路：<对象> 位置写的是「我」，
+                # 意思是**提醒我自己**（发到控制会话），不是去找一个叫「我」的人。
+                want_remind = True
+                who = ""
+                text = _strip_self_lead(" ".join(tail))
             if not text:
-                return "要发的内容不能空。用法：/定时 加 <时间> <对象> <内容>", False
+                return f"要发的内容不能空。{_USAGE}", False
 
         wxid = disp = ""
-        if not want_ask:
+        if not want_ask and not want_remind:
             cand, err = resolve(who)
             if err:
                 return err, False
@@ -617,12 +672,13 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None):
             if not can_lookup and not wxid:
                 return "当前查不到联系人，请直接填 wxid。", False
 
-        action = "call" if want_call else ("ask" if want_ask else "text")
+        action = "call" if want_call else (
+            "remind" if want_remind else ("ask" if want_ask else "text"))
         task = {"id": _next_id(recs), "action": action,
                 "to": wxid, "to_name": disp, "text": text, "enabled": True,
                 "last_ts": None}
         task.update(spec)
-        task["next_ts"] = initial_next(task)
+        task["next_ts"] = initial_next(task, now)
         recs.append(task)
         # **绝不在这里写 enabled=True**：总开关是用户自己的意图，加一个任务不该
         # 顺手把它打开。以前硬写 True，而下面文案又说「总开关是关着的」——
@@ -692,6 +748,13 @@ if __name__ == "__main__":
     chk(parse_when("每30分钟") == {"repeat": "interval", "every_minutes": 30}, "每30分钟")
     chk(parse_when("每2小时")["every_minutes"] == 120, "每2小时")
     chk(parse_when("9：00")["at"] == "09:00", "全角冒号")
+    # 相对现在的一次性：三种说法都要认（「之后」和「后」是一回事）
+    for rel, want in (("10分钟后", "08:10"), ("10分钟之后", "08:10"),
+                      ("半小时后", "08:30"), ("2小时以后", "10:00")):
+        got = parse_when(rel, base)
+        chk(got.get("repeat") == "once" and got.get("at") == want
+            and got.get("date") == "2026-10-01",
+            f"「{rel}」→ {want}（实际 {got}）")
     for bad in ("", "25:00", "每x分钟", "每周八 9:00"):
         try:
             parse_when(bad)
@@ -723,6 +786,9 @@ if __name__ == "__main__":
         {"id": "t2", "action": "call", "to": "wxid_b", "to_name": "李四",
          "text": "", "repeat": "once", "date": "2026-10-01", "at": "08:00",
          "enabled": True, "next_ts": base.timestamp() - 1, "last_ts": None},
+        {"id": "t5", "action": "remind", "to": "", "to_name": "",
+         "text": "喝水", "repeat": "once", "date": "2026-10-01", "at": "08:00",
+         "enabled": True, "next_ts": base.timestamp() - 1, "last_ts": None},
         {"id": "t3", "action": "text", "to": "wxid_c", "to_name": "王五",
          "text": "还没到", "repeat": "daily", "at": "23:00", "enabled": True,
          "next_ts": base.timestamp() + 9999, "last_ts": None},
@@ -744,13 +810,15 @@ if __name__ == "__main__":
                         notify=notes.append, ask=_ask)
     finally:
         globals()["_save"] = _real_save
-    chk(fired == ["t1", "t2", "t4"], f"触发 t1/t2/t4，没触发 t3（实际 {fired}）")
+    chk(fired == ["t1", "t2", "t5", "t4"],
+        f"触发 t1/t2/t5/t4，没触发 t3（实际 {fired}）")
     chk(asked == ["整理谁还没回我"], "提问式任务把 text 当问题传下去了")
     chk(any("整理结果" in n for n in notes), "提问的答案回控制会话了")
     chk(sent == [("wxid_a", "记得带伞")], "文本任务真发了")
     chk(all("李四" in n and "没有执行" in n for n in notes if "李四" in n),
         "通话任务**如实报错**，没有偷偷改成发文本")
-    chk(len(sent) == 1, "通话任务没有发出任何文本")
+    chk(any("提醒：喝水" in n for n in notes), "提醒我：原文进了控制会话")
+    chk(len(sent) == 1, "通话/提醒任务都没有发给任何联系人（提醒只进控制会话）")
     t1 = cfg["schedule"]["tasks"][0]
     chk(t1["next_ts"] > base.timestamp(), "重复任务已排下次")
     t2 = cfg["schedule"]["tasks"][1]
@@ -786,7 +854,13 @@ if __name__ == "__main__":
 
     try:
         globals()["_save"] = _fake_save
-        out, ch = handle_command("加 明天9:00 张三 记得带伞", c2, resolve)
+
+        # 时间**注入 base**：不然「明天9:00」会跟着跑测试那天变，
+        # 这个自测隔一天就红一次（以前就这样，只是没人在这个文件里跑它）。
+        def _cmd(arg):
+            return handle_command(arg, c2, resolve, now=base)
+
+        out, ch = _cmd("加 明天9:00 张三 记得带伞")
         chk(ch and "已加定时任务" in out, "「加」建出任务")
         tk = saved.get("tasks", [{}])[-1]
         chk(tk.get("to") == "wxid_z" and tk.get("text") == "记得带伞"
@@ -794,31 +868,46 @@ if __name__ == "__main__":
             f"任务字段正确（实际 to={tk.get('to')} date={tk.get('date')}）")
         chk(tk.get("next_ts") and tk["next_ts"] > 0, "算出了 next_ts")
 
-        out, ch = handle_command("加 明天9:00 张 你好", c2, resolve)
+        out, ch = _cmd("加 明天9:00 张 你好")
         chk(not ch and "匹配到多个人" in out, "重名**不静默取第一个**")
 
-        out, ch = handle_command("加 明天25:00 李四 你好", c2, resolve)
+        out, ch = _cmd("加 明天25:00 李四 你好")
         chk(not ch and "0~23" in out, "时间写错当场拒绝")
 
-        out, ch = handle_command("加通话 明天9:00 李四", c2, resolve)
-        chk(ch and "还没打通" in out, "建通话任务时明确警告没打通")
+        out, ch = _cmd("加通话 明天9:00 李四")
+        chk(ch and "还没打通" in out,
+            "建通话任务时明确警告没打通（这条命令的**描述**已从 TOOLS / 文档里拿掉，"
+            "代码保留：老任务到点仍如实报错）")
 
-        out, ch = handle_command("加 每30分钟 李四 打卡", c2, resolve)
+        out, ch = _cmd("加提醒 明天9:00 喝水")
+        tk = saved.get("tasks", [{}])[-1]
+        chk(ch and tk.get("action") == "remind" and tk.get("text") == "喝水"
+            and not tk.get("to"), f"加提醒：不用填对象（实际 {tk}）")
+
+        out, ch = _cmd("加 10分钟之后 我 吃药")
+        tk = saved.get("tasks", [{}])[-1]
+        chk(ch and tk.get("action") == "remind" and tk.get("text") == "吃药"
+            and not tk.get("to"),
+            f"「10分钟之后 我 吃药」= 提醒我自己（实际 action={tk.get('action')} "
+            f"to={tk.get('to')!r} text={tk.get('text')!r}）")
+        chk("提醒你" in out, "列表里把提醒显示成「提醒你…」")
+
+        out, ch = _cmd("加 每30分钟 李四 打卡")
         chk(ch and saved.get("tasks", [{}])[-1].get("every_minutes") == 30,
             "间隔式任务")
 
-        out, ch = handle_command("加提问 每天8:00 整理谁还没回我", c2, resolve)
+        out, ch = _cmd("加提问 每天8:00 整理谁还没回我")
         tk = saved.get("tasks", [{}])[-1]
         chk(ch and tk.get("action") == "ask" and tk.get("text") == "整理谁还没回我"
             and not tk.get("to"), "提问式任务：不用填对象，问题原样存下")
         chk("问你" in out, "列表里把提问式任务显示成「问你…」")
 
-        out, ch = handle_command("删 t1", c2, resolve)
+        out, ch = _cmd("删 t1")
         chk(ch and "已删除" in out, "按编号删")
-        out, ch = handle_command("删 t99", c2, resolve)
+        out, ch = _cmd("删 t99")
         chk(not ch and "没有编号" in out, "删不存在的编号要报错")
 
-        out, ch = handle_command("", c2, resolve)
+        out, ch = _cmd("")
         chk("定时任务" in out, "不带参数 = 看列表")
     finally:
         globals()["_save"] = _real_save
