@@ -57,12 +57,23 @@ def check(label, cond, detail=""):
 
 
 def code_files():
-    """扫出所有属于本项目的、会执行的源文件。"""
+    """扫出所有属于**本项目**的、会执行的源文件。
+
+    ⚠️ `plugins/` 里放的是**用户自己写的插件**（2026-10-04 加的插件契约）——
+    他在自己的插件里写自己机器的路径完全合理，拿它去查「有没有本机路径」会在
+    **他的电脑上**报一条假失败。本项目修过同类坑（包里少放 `config.example.yaml`
+    导致用户跑自测看到假失败），所以这里只扫 `plugins/_*.py`：`_` 开头的是
+    **我们自己的模板**（也正好是加载器**不会加载**的那些）。
+    """
     out = []
     for root, dirs, files in os.walk(BASE):
         dirs[:] = [d for d in dirs if d not in SKIP_DIR_NAMES]
+        rel = os.path.relpath(root, BASE)
+        in_user_plugins = rel.split(os.sep)[0] == "plugins" and rel != "."
         for name in files:
             if name == SELF:
+                continue
+            if in_user_plugins and not name.startswith("_"):
                 continue
             if name.lower().endswith(CODE_EXT):
                 out.append(os.path.join(root, name))

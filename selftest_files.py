@@ -660,6 +660,21 @@ def test_home_hints():
     ok &= check("相对路径 → 说清它被解析成了什么（不是用户目录）",
                 "相对路径" in out and os.path.abspath("桌面") in out, out[:260])
     ok &= check("相对路径那条也附上真实路径", desktop in out, out[:260])
+
+    # `~/xxx` 是**家目录锚定**的绝对路径 —— `os.path.isabs("~/x")` 为假，
+    # 所以第一版把它也说成了「相对路径」（自己踩的，靠这个用例钉住）
+    out = files.handler({"action": "list", "path": "~/OneDrive/Desktop"},
+                        {"cfg": {}, "from_self": True, "chat": "filehelper"})
+    ok &= check("`~/xxx` 不许被说成「相对路径」（它是绝对路径）",
+                "相对路径" not in out, out[:220])
+
+    # 换台电脑最常见的坑：配置里的 root 在**新机器**上不存在
+    # （Win11 的桌面/文档常被 OneDrive 接管成 ~/OneDrive/Desktop）
+    # 用一定不存在的目录，别依赖这台机器上有没有 OneDrive
+    ghost = os.path.join(home, "绝对不存在的目录_selftest_xyz")
+    notes = files.startup_notes({"files": {"roots": [ghost]}})
+    ok &= check("启动时点名**不存在的 root**（而不是等用户撞上「没有这个目录」）",
+                any("不存在" in n and ghost in n for n in notes), notes)
     return ok
 
 

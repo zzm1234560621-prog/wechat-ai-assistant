@@ -1441,6 +1441,59 @@ def t_from_self_reaches_toolbox():
         plugins.REGISTRY.rollback_source("_selftest_bot_loop")
 
 
+def t_clear_command():
+    """`/clear` 清对话记忆 —— **只清记忆，别的什么都不许动**。
+
+    为什么要有这条命令：记忆里存着**模型自己上一次的失败**，它下一轮会当成
+    既定事实（真机连撞两次：先复述「被配置限制了」，再复述「猜路径失败」）。
+    ttl 会自己过期，但正卡在牛角尖里时等不了。
+
+    ⚠️ **测试必须换掉 `DIALOG_PATH`**：`/clear all` 会 `store.clear()` 然后写盘，
+    照真实路径跑就会把用户**现有**的记忆清掉（那是真数据，不是测试夹具）。
+    夹具自己建自己清，不蹭 main 里那个 `tmp`（它到这一步已经被 rmtree 了）。
+    """
+    sec("`/clear`：清对话记忆（别动设置）")
+    tmp = tempfile.mkdtemp(prefix="bot_clear_selftest_")
+    saved_path, saved_mem = bot.DIALOG_PATH, bot._DIALOG
+    bot.DIALOG_PATH = os.path.join(tmp, "dialog_clear.json")
+    bot._DIALOG = None
+    try:
+        cfg = {}
+        bot.dialog_append("c1", "user", "问题一", cfg)
+        bot.dialog_append("c2", "user", "问题二", cfg)
+        chk(len(bot.dialog_history("c1", cfg)) == 1, "预备：c1 有记忆")
+
+        out, ch = bot.handle_command("/clear", None, cfg, False, [], chat="c1")
+        chk(bot.dialog_history("c1", cfg) == [], "`/clear` 把**本会话**清干净了")
+        chk(len(bot.dialog_history("c2", cfg)) == 1, "`/clear` **没有**误伤别的会话")
+        chk("设置" in out and "不动" in out, "回话里说清了「设置/名单等都不动」")
+        chk(ch is False, "清记忆不算「改了配置」")
+
+        # 再清一次：本来就没有 → 如实说，不许假装做了事
+        out2, _ = bot.handle_command("/clear", None, cfg, False, [], chat="c1")
+        chk("本来就没有" in out2, "重复清 → 如实说「本来就没有」，不谎报")
+
+        # 没有 chat（比如从别处调用）→ 如实说清不掉
+        # ⚠️ 别拿带 markdown 星号的原话去比（`得**在会话里**发`）—— 比不过会假红一次
+        out3, _ = bot.handle_command("/clear", None, cfg, False, [])
+        chk("在会话里" in out3 and "/clear all" in out3,
+            "拿不到会话时如实说，不默默清全部")
+
+        # 清全部
+        out4, _ = bot.handle_command("/clear all", None, cfg, False, [], chat="c1")
+        chk(bot.dialog_history("c2", cfg) == [], "`/clear all` 把别的会话也清了")
+        chk("所有会话" in out4, "`/clear all` 的回话说清了范围")
+
+        # 顺手量一下：它是**人**发的命令才有这条路（模型没有对应的工具）
+        import plugins
+        chk(not any("clear" in n.lower() or "forget" in n.lower()
+                    for n in plugins.REGISTRY.names()),
+            "**没有**给模型留「清记忆」的工具（提示词注入不该能清掉记忆）")
+    finally:
+        bot.DIALOG_PATH, bot._DIALOG = saved_path, saved_mem
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1474,6 +1527,7 @@ def main():
     t_auto_reply_truth_note()
     t_now_line()
     t_from_self_reaches_toolbox()
+    t_clear_command()
 
     print("\n" + "=" * 60)
     if _FAIL:

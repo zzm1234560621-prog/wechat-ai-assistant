@@ -230,6 +230,10 @@ HELP_TEXT = (
     "/预算 <金额>     设上限：超了就**拒绝调用模型**并说明原因，不偷偷降级\n"
     "/预算 关         关掉消费闸\n"
     "/help           显示本帮助\n"
+    "/clear          清空**本会话**的对话记忆（助手忘掉刚才聊过什么）\n"
+    "/clear all      清空**所有会话**的对话记忆\n"
+    "（只有「刚才聊过什么」会被清掉 —— 设置 / 名单 / 分组 / 定时 / 素材都不动。\n"
+    "  什么时候用：助手卡在牛角尖里，一直照着自己上一轮的错误结论说话时。）\n"
     "\n"
     "—— 自动回复（让 AI 代替我本人回某个人）——\n"
     "下面这些也能直接用大白话说，助手会自己调用工具：\n"
@@ -440,8 +444,13 @@ def bot_dashboard(cfg, contacts=None):
     return "\n".join(L)
 
 
-def handle_command(text, wcf, cfg, live_ok, contacts=None):
-    """识别 / 开头的命令。返回 (回复文本, 是否改了配置)；非命令返回 (None, False)。"""
+def handle_command(text, wcf, cfg, live_ok, contacts=None, chat=None):
+    """识别 / 开头的命令。返回 (回复文本, 是否改了配置)；非命令返回 (None, False)。
+
+    `chat` 是**发这条命令的会话**（主循环传进来）。只有需要「针对当前会话」的命令
+    才用它（目前是 `/clear`）—— 命令处理器原先不知道自己在哪个会话里，
+    所以别的地方照旧拿 `None` 也不会出问题。
+    """
     t = text.strip()
     if not t.startswith("/"):
         return None, False
@@ -451,6 +460,23 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None):
 
     if cmd in ("/help", "/帮助"):
         return HELP_TEXT, False
+
+    if cmd in ("/clear", "/清空记忆", "/忘掉"):
+        # 为什么要有：记忆里存着**模型自己上一次的失败**，它下一轮会当成既定事实
+        # （真机连撞两次：复述拒绝 / 复述猜路径失败）。详见 `dialog_forget`。
+        a = arg.lower()
+        if a in ("all", "全部", "所有", "所有会话"):
+            n = dialog_forget(None)
+            return (f"已清空**所有会话**的对话记忆（{n} 个会话有记忆，已清掉）。\n"
+                    "之后每轮都从零开始 —— 设置、名单、分组、定时、素材都不动。", False)
+        if not chat:
+            return ("这条命令得**在会话里**发（`/clear all` 可以清全部）。", False)
+        n = dialog_forget(chat)
+        if not n:
+            return "本会话本来就没有对话记忆，什么都没变。", False
+        return ("已清空**本会话**的对话记忆 —— 助手会忘掉刚才聊过什么，"
+                "但**设置、名单、分组、定时、素材都不动**。\n"
+                "要连别的会话一起清就发 `/clear all`。", False)
 
     if cmd in ("/bot", "/控制台", "/面板"):
         fresh = settings.effective(load_config())
@@ -1065,10 +1091,29 @@ def dialog_append(chat, role, content, cfg):
     _dialog_save()
 
 
-def dialog_forget(chat):
+def dialog_forget(chat=None):
+    """清掉对话记忆。`chat=None` = 清空**所有**会话。返回清掉的会话数。
+
+    为什么要开这条路（2026-10-04 用户提的）：记忆里存着**模型自己上一次的失败**，
+    而它下一轮会把那句话当成既定事实 —— 真机上连撞两次：
+      ① 照着上一轮的「被配置限制了」继续拒绝，压根不调工具；
+      ② 照着上一轮的「猜路径失败 + 我提议跑命令」继续重提命令，不用新给的路径清单。
+    记忆有 ttl（`agent.dialog_ttl`，默认 900 秒）会自己过期，但**正卡在牛角尖里时等不了**，
+    盘上还有 `_DIALOG_KEEP_SECONDS` 那层 7 天的地板。
+
+    ⚠️ **只做成 `/clear` 命令，不给模型工具**：这是不可逆操作，而模型手里有
+    `send_text` / `run_command` —— 一句提示词注入就能让它把你的记忆清掉。
+    命令只能由**人**在微信里发出来，这道口子不留给模型。
+    """
     store = _dialog_load()
-    if store.pop(str(chat), None) is not None:
+    if chat is None:
+        n = len(store)
+        store.clear()
+    else:
+        n = 1 if store.pop(str(chat), None) is not None else 0
+    if n:
         _dialog_save()
+    return n
 
 
 # ============================================================
@@ -3199,7 +3244,8 @@ def main():
                 #    写坏了会抛 YAML 错误——那属于「这一条消息没处理成功」，
                 #    不该让整个 bot 下线。
                 try:
-                    reply, changed = handle_command(query, wcf, cfg, live_ok, contacts)
+                    reply, changed = handle_command(query, wcf, cfg, live_ok, contacts,
+                                                    chat=sender)
                 except Exception as e:
                     traceback.print_exc()
                     send(f"这条命令没处理成功：{e}", sender)

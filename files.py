@@ -114,10 +114,16 @@ def _missing_note(raw, real, cfg):
 
     为什么专门解释相对路径：模型很爱给「桌面」这种相对路径，而它会被解析成
     **助手工作目录**下的「桌面」（仓库目录里当然没有），模型完全想不到是这个原因。
+
+    ⚠️ `~/xxx` 和 `%USERPROFILE%/xxx` **不算相对路径**：`os.path.isabs("~/x")` 为假
+    （`~` 不是分隔符），但它们显然是**家目录锚定**的绝对路径 —— 把它们说成
+    「相对路径」就是答非所问（写这段时自己踩了一次，靠 `~/OneDrive/Desktop` 试出来）。
     """
     bits = []
-    if raw and not os.path.isabs(str(raw)):
-        bits.append(f"「{raw}」是**相对路径**，我按助手的**工作目录**解析成了：{real}"
+    s = str(raw or "")
+    homey = s.startswith("~") or s.startswith("%")
+    if s and not os.path.isabs(s) and not homey:
+        bits.append(f"「{s}」是**相对路径**，我按助手的**工作目录**解析成了：{real}"
                     f" —— 那不是你的用户目录（`桌面` 这种名字得配 `~` 或完整路径）。")
     bits.append(_hints_text())
     return "\n" + "\n".join(bits)
@@ -961,6 +967,18 @@ def startup_notes(cfg):
 
     r, d = roots(cfg), deny_dirs(cfg)
     notes.append(f"文件能力：{describe_scope(cfg)}")
+    if r:
+        # 换台电脑最常踩的坑：`config.example.yaml` 给的是 `~/Desktop` 这几个，
+        # 而 Win11 上桌面/文档**常常已经被 OneDrive 接管**（`~/OneDrive/Desktop`）——
+        # 于是那些 roots 在新机器上根本不存在。模型只会收到一句「没有这个目录」，
+        # 而用户完全不知道是配置过时了。所以启动就说清，并且指向「问助手要真实路径」。
+        gone = [p for p in r if not os.path.isdir(p)]
+        if gone:
+            notes.append("⚠️ 这些 `files.roots` **在这台电脑上不存在**：" + "、".join(gone) +
+                         " —— `~` 是按**这台机器**的用户目录展开的，而被 OneDrive 接管过的"
+                         "桌面/文档常常不在原位。改成这台机器上的**真实路径**（问助手"
+                         "「看看常用目录有哪些」，它会把真实的列出来），"
+                         "或者只把不存在的那几条删掉、留下确实存在的那些。")
     if not r:
         notes.append("‼️ `files.roots` 是**空的 = 全盘** —— 模型能读写这台电脑上几乎任何"
                      "位置的**任何文件**（系统目录仍挡着）。要收窄就把允许的目录写进 files.roots。")
