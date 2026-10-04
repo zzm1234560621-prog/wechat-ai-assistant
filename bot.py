@@ -24,6 +24,7 @@ import yaml
 import agent_tools
 import assets
 import auto_reply
+import botctl
 import callgate
 import executor
 import file_read
@@ -2406,6 +2407,17 @@ def main():
         sys.exit(1)
     base_cfg = load_config()
     cfg = settings.effective(base_cfg)
+
+    # 配套服务：网上搜索后端（SearXNG）。它是**独立进程**，bot 只通过 HTTP 问它，
+    # 所以「助手起来了、却搜不了」是一种很容易发生的残疾状态。这里 best-effort 带起它。
+    # `wait=0`：拉起就返回、**不等它 HTTP 通**（冷启动十几秒，等它等于白拖慢助手启动）；
+    # 所以下面这句话是「已拉起（启动中）」，**不是**「已可用」。
+    # 起不来只会让搜索不可用，**绝不许拦住助手启动**——ensure 自己兜住所有异常。
+    try:
+        _sok, _smsg = botctl.ensure_search_service(cfg, wait=0)
+        print(f"[bot] 搜索服务：{_smsg}" + ("" if _sok else "（不影响助手运行）"))
+    except Exception:
+        traceback.print_exc()
 
     # 本进程的启动时刻。「重启补齐」判定靠它：**早于它**的消息只可能来自
     # 落盘游标续上来的那批（正常运行时起点就是「最新」，不会造出更早的消息）。

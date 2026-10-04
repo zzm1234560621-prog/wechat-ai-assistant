@@ -10,6 +10,7 @@
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -203,6 +204,255 @@ def t6_status_and_tail():
         botctl.LOG_PATH = old_log
 
 
+def t7_search_service():
+    sec("T7 · 配套搜索服务（SearXNG）：启 / 停 / 看 / 随助手起 —— **绝不真起真停**")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    HOME = os.path.join(BASE_DIR, "..", "searxng")          # 随便一个「像」的目录，只用来看字符串
+    GONE = os.path.join(BASE_DIR, "根本没有这个目录")
+
+    # 所有真实交互都注入假的：认端口的 netstat、HTTP 探针、Popen、日志文件、pid 探活。
+    NAMES = ("search_owner", "search_probe", "search_ready", "search_home",
+             "search_enabled", "search_python", "SEARCH_LOG",
+             "SEARCH_PID_FILE", "pid_alive")
+    saved = {n: getattr(botctl, n) for n in NAMES}
+    saved_popen = botctl.subprocess.Popen
+    saved_run = botctl._run
+    spawned = []
+    # pid 记录指向一个真临时文件（那几个读写函数要真跑一遍），进程探活则注入：
+    # 假实现里只有 9999 算活着，别的 pid 一律当死——**绝不真去 tasklist 查**。
+    PIDF = os.path.join(tempfile.gettempdir(), f"botctl_selftest_{os.getpid()}.pid")
+    botctl.SEARCH_PID_FILE = PIDF
+    botctl.pid_alive = lambda pid: str(pid) == "9999"
+
+    class _Alive:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    class _Dead:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    def _record(*a, **k):
+        spawned.append((a, k))
+        return _Alive()
+
+    try:
+        # ── 目录约定 & 开关判据（纯函数，不注入）──
+        conv = os.path.join(os.path.dirname(botctl.env.BASE), "searxng")
+        check("约定 = 本项目**上一级**的 searxng（不写死盘符/用户名）",
+              botctl.search_home(None) == conv, botctl.search_home(None))
+        check("config 的 search.home 优先",
+              botctl.search_home({"search": {"home": r"E:\tools\searxng"}}) == r"E:\tools\searxng")
+        check("home 是空白串 → 回退约定（不拿空路径去找）",
+              botctl.search_home({"search": {"home": "   "}}) == conv)
+
+        check("autostart 没写 = **开**（默认带起）", botctl.search_autostart_on({}) is True)
+        check("显式 true = 开",
+              botctl.search_autostart_on({"search": {"autostart": True}}) is True)
+        check("显式 false = 关",
+              botctl.search_autostart_on({"search": {"autostart": False}}) is False)
+        check("写歪的字符串 \"false\" → **按关**（fail-safe：宁可不常驻）",
+              botctl.search_autostart_on({"search": {"autostart": "false"}}) is False)
+        check("写歪的 1 → 也按关",
+              botctl.search_autostart_on({"search": {"autostart": 1}}) is False)
+
+        check("端口默认跟 web_read 的 8888 一致", botctl.search_port(None) == 8888)
+        check("端口跟着 search.base_url 走（别只认 8888）",
+              botctl.search_port({"search": {"base_url": "http://127.0.0.1:9999"}}) == 9999)
+
+        e = botctl.search_env(r"D:\proj\searxng")
+        check("SEARXNG_SETTINGS_PATH 指向那个目录的 settings.yml",
+              e["SEARXNG_SETTINGS_PATH"] == os.path.join(r"D:\proj\searxng", "settings.yml"))
+        check("PYTHONPATH 挂 win_shims（少它服务在 Windows 上直接起不来）",
+              e["PYTHONPATH"] == os.path.join(r"D:\proj\searxng", "win_shims"))
+        check("SEARXNG_DISABLE_ETC_SETTINGS=1",
+              e["SEARXNG_DISABLE_ETC_SETTINGS"] == "1")
+
+        # 日志指到 NUL：自测**不许**在真 data/ 里留下东西
+        botctl.SEARCH_LOG = os.devnull
+        # 解释器的存在性也要注入：否则这份自测会**依赖本机真装了 searxng**，
+        # 换台电脑（或打包目录里）就红——测试不能靠环境碰巧成立。
+        botctl.search_python = lambda home=None: (
+            os.path.join(GONE, "python.exe") if home == GONE else sys.executable)
+
+        # ── search_start 的两道守卫：该拦就拦，一次 Popen 都不许发 ──
+        botctl.subprocess.Popen = _record
+        botctl.search_home = lambda cfg=None: HOME
+        botctl.search_ready = lambda home=None: True
+
+        botctl.search_owner = lambda *a, **k: 4242
+        ok, msg = botctl.search_start(cfg=None, home=HOME)
+        check("已经在跑 → 不拉第二个进程（端口会冲突）",
+              ok and "本来就在跑" in msg and spawned == [], msg)
+
+        botctl.search_owner = lambda *a, **k: None
+        ok, msg = botctl.search_start(cfg=None, home=GONE)
+        check("找不到后端解释器 → **不拉进程**，并给两条可照着做的路",
+              (not ok) and spawned == [] and "start.bat" in msg and "search.home" in msg, msg)
+
+        # ── 正常拉起：命令行/工作目录/环境变量 ──
+        botctl.search_probe = lambda cfg=None, timeout=8: (True, "能查（探针拿到 3 条）")
+        spawned.clear()
+        ok, msg = botctl.search_start(cfg=None, home=HOME, wait=10)
+        check("正常拉起 → 报成功，且说的是「能查」", ok and "已启动" in msg, msg)
+        check("确实只拉了一个进程", len(spawned) == 1, len(spawned))
+        args, kwargs = spawned[-1]
+        cmd = list(args[0])
+        check("命令行是 `-m searx.webapp`（**不是** python searx\\webapp.py，那样 import 不到 searx）",
+              cmd[1:] == ["-m", "searx.webapp"], cmd)
+        check("工作目录 = SearXNG 目录", kwargs.get("cwd") == HOME, kwargs.get("cwd"))
+        cenv = kwargs.get("env") or {}
+        check("三个环境变量都带上了（与 start.bat 逐条对齐）",
+              cenv.get("PYTHONPATH") == os.path.join(HOME, "win_shims")
+              and cenv.get("SEARXNG_SETTINGS_PATH") == os.path.join(HOME, "settings.yml")
+              and cenv.get("SEARXNG_DISABLE_ETC_SETTINGS") == "1",
+              {k: cenv.get(k) for k in ("PYTHONPATH", "SEARXNG_SETTINGS_PATH")})
+        check("无窗口 + 脱离父进程（和 botctl.start 同一个姿势）",
+              os.name != "nt" or bool(kwargs.get("creationflags", 0)
+                                      & getattr(botctl.subprocess, "DETACHED_PROCESS", 0)),
+              kwargs.get("creationflags"))
+        check("stdin 是 DEVNULL（别让服务抢/等终端输入）",
+              kwargs.get("stdin") == botctl.subprocess.DEVNULL)
+
+        # ── 「拉起来了」≠「能用了」：这是这个功能最容易骗人的地方 ──
+        botctl.search_probe = lambda cfg=None, timeout=8: (False, "连不上搜索服务")
+        botctl.subprocess.Popen = lambda *a, **k: _Alive()
+        ok, msg = botctl.search_start(cfg=None, home=HOME, wait=5)
+        check("**拉起了进程但一直不能查 → 必须报失败**（绝不报假成功）",
+              (not ok) and "没有报成功" in msg, msg)
+
+        botctl.subprocess.Popen = lambda *a, **k: _Dead()
+        ok, msg = botctl.search_start(cfg=None, home=HOME, wait=10)
+        check("拉起来就退出 → 立刻失败并指向日志（不干等到超时）",
+              (not ok) and "退出了" in msg and botctl.SEARCH_LOG in msg, msg)
+
+        # ── search_stop：试运行绝不动手 ──
+        calls = []
+        botctl._run = lambda cmd, timeout=25: (calls.append(list(cmd)), (0, ""))[1]
+        botctl.search_owner = lambda *a, **k: 777
+        ok, msg = botctl.search_stop(cfg=None, dry_run=True)
+        check("试运行返回成功并说清会停谁", ok and "[试运行]" in msg and "777" in msg, msg)
+        check("试运行**一次 taskkill 都没发**",
+              not any("taskkill" in (c[0] if c else "") for c in calls), calls)
+
+        botctl.search_owner = lambda *a, **k: None
+        ok, msg = botctl.search_stop(cfg=None)
+        check("没在跑 → 幂等 ok 且如实说", ok and "本来就没在跑" in msg, msg)
+
+        # ── ensure_search_service：bot 启动那条路的三道闸 + 绝不拦人 ──
+        spawned.clear()
+        botctl.subprocess.Popen = _record
+        botctl.search_enabled = lambda cfg=None: False
+        ok, msg = botctl.ensure_search_service({"search": {"enabled": False}}, wait=0)
+        check("search.enabled 关着 → 跳过、不常驻进程",
+              ok and "跳过" in msg and spawned == [], msg)
+
+        botctl.search_enabled = lambda cfg=None: True
+        ok, msg = botctl.ensure_search_service(
+            {"search": {"enabled": True, "autostart": False, "home": HOME}}, wait=0)
+        check("autostart=false → 跳过并指路控制台",
+              ok and "跳过" in msg and "搜索服务" in msg and spawned == [], msg)
+
+        botctl.search_ready = lambda home=None: False
+        ok, msg = botctl.ensure_search_service(
+            {"search": {"enabled": True, "home": GONE}}, wait=0)
+        check("没装后端（换台电脑就是这样）→ **安静跳过，不当故障报**",
+              ok and "跳过" in msg and spawned == [], msg)
+
+        botctl.search_ready = lambda home=None: True
+        botctl.search_owner = lambda *a, **k: None
+        spawned.clear()
+        ok, msg = botctl.ensure_search_service(
+            {"search": {"enabled": True, "home": HOME}}, wait=0)
+        check("条件都成立 → 拉起服务", ok and spawned, msg)
+        check("bot 启动这条路的话术是「**启动中**」，不是「已可用」（wait=0 不等 HTTP）",
+              ok and "启动中" in msg and "已可用" not in msg, msg)
+
+        def _boom(cfg=None):
+            raise RuntimeError("boom")
+        botctl.search_enabled = _boom
+        raised = None
+        try:
+            ok, msg = botctl.ensure_search_service({"search": {"enabled": True}}, wait=0)
+        except Exception as e:                    # 这一条**绝不许**发生
+            raised = e
+            ok, msg = True, ""
+        check("内部出错 → **绝不抛**（配套服务不许拦住助手启动）",
+              raised is None and (not ok) and "不影响助手" in msg,
+              raised or msg)
+
+        # ── status：一屏说清，读不出来也不炸 ──
+        botctl.search_home = saved["search_home"]      # 前面为守卫测试注入过，这里换回真的
+        botctl.search_enabled = lambda cfg=None: True
+        botctl.search_owner = lambda *a, **k: None
+        botctl.search_probe = lambda cfg=None, timeout=8: (False, "连不上搜索服务（…）")
+        t = botctl.search_status_text({"search": {"enabled": True, "home": HOME}})
+        check("状态里有端口", "8888" in t, t)
+        check("状态里说清「没有在跑」", "没有在跑" in t, t)
+        check("状态里报出开关与自启两项", "search.enabled" in t and "search.autostart" in t, t)
+        check("状态里给出日志路径", botctl.SEARCH_LOG in t, t)
+        check("探针失败如实显示（不是一句含糊的「异常」）", "连不上搜索服务" in t, t)
+        t2 = botctl.search_status_text({"search": {"home": GONE}}, probe=False)
+        check("目录不存在时点出该写 search.home",
+              "不存在" in t2 and "search.home" in t2, t2)
+
+        # ── 「正在冷启动」那一整段（**真机抓出来的缺陷**：端口还没监听时判据会瞎）──
+        # 现场：bot 启动时拉起 SearXNG，12 秒后状态屏说「没有在跑」——其实进程活得好好的；
+        # 这时候再点一次 [1] 就会起第二个实例（Windows 的 SO_REUSEADDR 允许重复绑同一端口）。
+        botctl._search_pid_clear()
+        check("没记录过 → search_starting() 是 None", botctl.search_starting() is None)
+        botctl._search_pid_write(9999)
+        check("记下 pid 且它还活着 → 认「正在启动」", botctl.search_starting() == 9999,
+              botctl.search_starting())
+        check("pid 能读回（JSON 往返）", botctl._search_pid_read() == 9999)
+        botctl.pid_alive = lambda pid: False
+        check("进程已经没了 → 不再认为「正在启动」", botctl.search_starting() is None)
+        botctl.pid_alive = lambda pid: str(pid) == "9999"
+
+        botctl._search_pid_write(9999)
+        with open(PIDF, "w", encoding="utf-8") as f:
+            f.write("{坏掉的 json")
+        check("pid 文件坏了 → None，不抛", botctl.search_starting() is None)
+        with open(PIDF, "w", encoding="utf-8") as f:
+            f.write('{"pid": 9999, "ts": 0}')
+        check("陈年记录（重启后 pid 会被复用）→ 不认，免得挡住正常启动",
+              botctl.search_starting() is None)
+
+        botctl._search_pid_write(9999)
+        botctl.search_owner = lambda *a, **k: None
+        botctl.subprocess.Popen = _record
+        spawned.clear()
+        ok, msg = botctl.search_start(cfg=None, home=HOME)
+        check("**端口还没监听、但我们拉起的那个还活着 → 绝不起第二个实例**",
+              ok and "已经在启动了" in msg and spawned == [], msg)
+
+        botctl.search_owner = lambda *a, **k: None
+        t3 = botctl.search_status_text({"search": {"enabled": True, "home": HOME}}, probe=False)
+        check("启动中 → 状态说「正在启动」，**不许说成「没有在跑」**",
+              "正在启动" in t3 and "没有在跑" not in t3, t3)
+
+        ok, msg = botctl.search_stop(cfg=None, dry_run=True)
+        check("冷启动中途点「停止」也要认账（试运行说清会停谁）",
+              ok and "9999" in msg, msg)
+        botctl._search_pid_clear()
+        t4 = botctl.search_status_text({"search": {"home": HOME}}, probe=False)
+        check("端口与 pid 双双为空 → 才说「没有在跑」", "没有在跑" in t4, t4)
+    finally:
+        botctl._search_pid_clear()
+        for n, v in saved.items():
+            setattr(botctl, n, v)
+        botctl.subprocess.Popen = saved_popen
+        botctl._run = saved_run
+        try:
+            os.remove(PIDF)
+        except OSError:
+            pass
+
+
 def main():
     print("=" * 60)
     print("botctl.py 自测（**绝不真的启停 bot**；所有真实交互都注入假实现）")
@@ -213,6 +463,7 @@ def main():
     t4_stop_dry_run_never_kills()
     t5_start_guards()
     t6_status_and_tail()
+    t7_search_service()
     print("\n" + "=" * 60)
     print(f"全部通过 ✅ （{_PASS} 项）" if _OK else f"有失败项 ❌ （{_PASS} 项）")
     print("=" * 60)

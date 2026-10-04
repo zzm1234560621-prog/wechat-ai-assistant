@@ -1,4 +1,6 @@
 """控制 bot 进程：谁在跑 / 启动 / 停止 / 重启 / 看日志 / 看健康。
+另外还管**配套服务**（网上搜索后端 SearXNG）的启 / 停 / 看 / 随助手起
+——这是同一类动作（认端口、拉进程、杀进程），所以必须有**唯一**实现，见下面 SEARCH_* 那一节。
 
 ## 为什么需要它
 
@@ -31,12 +33,38 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import envsetup as env
 
 LOCK_PORT = 39001
 STATUS_JSON = os.path.join(env.BASE, "data", "status.json")
 LOG_PATH = os.path.join(env.BASE, "bot.log")
+
+# ── 配套服务：本机搜索后端（SearXNG）────────────────────────────────────
+# 它和 bot 是**两个进程**：bot 只通过 HTTP 问它（web_read.py），从不 import 它。
+# 「助手起来了、搜索却用不了」因此是一种很容易发生的残疾状态——这一节就是为它准备的：
+# 启 / 停 / 看 / 随助手起 的唯一实现在这里，`console.py` 只显示菜单，`bot.py` 启动时也调这里。
+#
+# **为什么不另开一个模块**：本机进程控制的原语（netstat 认端口、taskkill、venv 路径）
+# 全在本文件，抄第二份就会出现**两个「谁在跑」的判据**——项目已经吃过「两处同名不同义」的亏。
+#
+# ⚠️ 三条不许破的规矩：
+#   1. **起不来绝不许拦住 bot 启动**：服务只是让搜索可用，不是助手能跑的前提；
+#   2. **「拉起了进程」不等于「能查了」**：SearXNG 冷启动十几秒，手动启动那条路必须等到
+#      真能查才算成功，**绝不报假成功**；bot 启动那条路不等（会白拖慢启动），
+#      所以它的话术是「已拉起（启动中）」，不是「已可用」；
+#   3. **`search.enabled` 关着就不起它**：没开搜索，没必要为它常驻一个进程。
+SEARCH_PORT = 8888
+SEARCH_LOG = os.path.join(env.BASE, "data", "searxng.log")
+# 我们拉起的那个搜索服务的 pid（JSON）。**只为盖住「还在冷启动」那十几秒**，见 search_starting()。
+SEARCH_PID_FILE = os.path.join(env.BASE, "data", "searxng.pid")
+# 这份记录的可信窗口：超过它就不认（重启后 pid 会被复用，陈年记录会挡住正常启动）。
+SEARCH_PID_TTL = 600
+# 探针查询词：只为证明「服务真能按 bot 那条路返回 JSON」，不关心结果内容。
+_SEARCH_PROBE_Q = "ping"
 
 
 # ── 纯函数（可测，不碰真实进程）──────────────────────────────────────────
@@ -252,13 +280,14 @@ def read_health():
         return None
 
 
-def tail(n=40):
-    """bot.log 末尾 n 行。读不出来就如实说。"""
+def tail(n=40, path=None):
+    """日志末尾 n 行（默认 bot.log；`path` 给配套服务日志这类别的文件用）。读不出来就如实说。"""
+    p = path or LOG_PATH
     try:
-        with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+        with open(p, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except OSError as e:
-        return f"读不到日志（{e}）：{LOG_PATH}"
+        return f"读不到日志（{e}）：{p}"
     return "".join(lines[-max(1, int(n)):])
 
 
@@ -285,6 +314,371 @@ def follow():
             time.sleep(1)
 
 
+# ── 配套服务：网上搜索后端（SearXNG）──────────────────────────────────
+# 判据**只走 web_read**（enabled / base_url / build_url / parse_json）——它才是「能不能搜」
+# 的权威；这里只补它没有的东西（进程、目录、日志、启停）。懒导入是**必须的**：
+# `console.py` 拿系统 python 跑、顶层只许导入标准库 + envsetup，而本模块是被它顶层导入的。
+
+def _search_mod():
+    """懒导入 web_read（它本身只依赖标准库，所以什么时候导都安全）。"""
+    import web_read
+    return web_read
+
+
+def _search_sec(cfg):
+    """config 的 `search:` 段（不是字典就当空）。
+
+    只做这一层防御；**判据本身不许在这儿重写一份**（enabled / base_url 一律走 web_read）。
+    """
+    sec = ((cfg or {}).get("search") or {})
+    return dict(sec) if isinstance(sec, dict) else {}
+
+
+def load_cfg():
+    """读 config.yaml（读不出来/没有/yaml 不在，都返回 `{}`，绝不抛）。
+
+    CLI 与 `console.py` 共用这一份；yaml 延迟导入的理由同上（本模块要被系统 python 导入）。
+    """
+    try:
+        import yaml
+        with open(os.path.join(env.BASE, "config.yaml"), encoding="utf-8") as f:
+            d = yaml.safe_load(f) or {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def search_enabled(cfg=None):
+    """`search.enabled`。判据只有 web_read 那一份。"""
+    return _search_mod().enabled(cfg)
+
+
+def search_url(cfg=None):
+    """bot 问搜索服务的地址（`search.base_url`）。"""
+    return _search_mod().base_url(cfg)
+
+
+def search_port(cfg=None):
+    """搜索服务的端口：**从 search.base_url 里取**，取不到才退回顾约定的 8888。
+
+    别另写一个「只认 8888」的判据——用户把 `base_url` 改到别的端口时，两处会走偏：
+    HTTP 探的是新端口、启停却盯着 8888。
+    """
+    try:
+        u = urllib.parse.urlsplit(search_url(cfg))
+        if u.port:
+            return int(u.port)
+    except Exception:
+        pass
+    return SEARCH_PORT
+
+
+def search_home(cfg=None):
+    """SearXNG 源码目录：config 的 `search.home` 优先，留空按约定 = 本项目**上一级**的 `searxng\\`。
+
+    这条约定和 `web_read._searxng_hint()` 是**同一条**（那句报错文案就是照它算路径的），
+    改一处必须改两处，否则会「报错指向 A、启动去找 B」。**绝不写死盘符/用户名。**
+    """
+    raw = str(_search_sec(cfg).get("home") or "").strip()
+    return raw or os.path.join(os.path.dirname(env.BASE), "searxng")
+
+
+def search_python(home=None):
+    return os.path.join(home or search_home(), ".venv", "Scripts", "python.exe")
+
+
+def search_ready(home=None):
+    """搜索后端的解释器在不在。只看文件在不在，**不实跑**（起服务本身就会说话）。"""
+    return os.path.exists(search_python(home))
+
+
+def search_autostart_on(cfg=None):
+    """`search.autostart`：**没写 = 开**；写了就必须是 `true` 才算开。
+
+    写歪的值（`"false"` / `0` / 手滑）一律按**关**处理——这个开关决定要不要多一个常驻进程，
+    方向要朝「宁可不常驻」倒（和 `image.mode` 写歪就按 `off` 同一条 fail-safe 规矩）。
+    """
+    sec = _search_sec(cfg)
+    if "autostart" not in sec:
+        return True
+    return sec.get("autostart") is True
+
+
+def search_env(home=None):
+    """Windows 上跑原生 SearXNG 必须的三个环境变量——**逐条对应 `searxng\\start.bat`**。
+
+    改这里就必须同步改那个 .bat（反之亦然）：`PYTHONPATH` 挂的是 `win_shims\\pwd.py`
+    兼容层，少了它服务直接起不来（见 docs/web-search-notes.md §2.1）。
+    """
+    home = home or search_home()
+    return {
+        "SEARXNG_SETTINGS_PATH": os.path.join(home, "settings.yml"),
+        "SEARXNG_DISABLE_ETC_SETTINGS": "1",
+        "PYTHONPATH": os.path.join(home, "win_shims"),
+    }
+
+
+def search_owner(port=None):
+    """听着搜索端口的进程号；没在跑返回 None。**这是「在跑」的权威判据**。"""
+    _rc, out = _run(["netstat", "-ano", "-p", "TCP"])
+    return parse_netstat(out, int(port or SEARCH_PORT))
+
+
+# ── 「还在冷启动」那一段：端口权威判据在这里会瞎 ──────────────────────────
+# SearXNG 从拉起到开始监听要十几秒（bot 启动时它正忙着重活，实测能超过 12 秒）。
+# 这段窗口里 `search_owner()` 是 None —— 于是**「正在启动」和「根本没在跑」长得一模一样**：
+#   * 控制台会把「正在启动」显示成「没有在跑」（少说了一半事实）；
+#   * 再点一次 [1] 就会**起第二个实例**（Windows 上 SO_REUSEADDR 允许重复绑同一端口，
+#     本项目为此栽过不止一次）。
+# 所以这里补一份「我们拉起的那个 pid」的记录，**只作辅助**：端口一旦监听，就以端口为准。
+
+def pid_alive(pid):
+    """这个 pid 还活着吗。用系统自带的 `tasklist`。
+
+    ⚠️ **绝不用 `os.kill(pid, 0)`**：Windows 上 Python 的 `os.kill` 只认
+    `CTRL_C_EVENT` / `CTRL_BREAK_EVENT`，**其它值一律 TerminateProcess** ——
+    那句「探活」会**真的把服务杀掉**，是拿判据当凶器。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    rc, out = _run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], timeout=15)
+    if rc != 0:
+        return False
+    return str(pid) in str(out or "")
+
+
+def _search_pid_read():
+    """读我们上次拉起的 pid；没有 / 坏了 / 太旧 → None（**绝不抛**）。"""
+    try:
+        with open(SEARCH_PID_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        pid = int(d.get("pid") or 0)
+        ts = float(d.get("ts") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if pid <= 0:
+        return None
+    if SEARCH_PID_TTL and (time.time() - ts) > SEARCH_PID_TTL:
+        return None                 # 陈年记录：pid 早被复用了，认它反而会挡住启动
+    return pid
+
+
+def _search_pid_write(pid):
+    """记下我们拉起的 pid。**记不下来也只算了**——它只是防重复的辅助判据，不是权威。"""
+    try:
+        os.makedirs(os.path.dirname(SEARCH_PID_FILE), exist_ok=True)
+        with open(SEARCH_PID_FILE, "w", encoding="utf-8") as f:
+            json.dump({"pid": int(pid), "ts": time.time()}, f)
+    except OSError:
+        pass
+
+
+def _search_pid_clear():
+    try:
+        os.remove(SEARCH_PID_FILE)
+    except OSError:
+        pass
+
+
+def search_starting():
+    """我们拉起的那个进程**还活着、但端口还没开始监听**（= 正在冷启动）。返回 pid 或 None。"""
+    pid = _search_pid_read()
+    if pid and pid_alive(pid):
+        return pid
+    return None
+
+
+def search_probe(cfg=None, timeout=8):
+    """按 **bot 走的那条路**真查一次（`/search?...&format=json`），返回 `(能不能查, 一句人话)`。
+
+    ⚠️ 这一步会**真的花一次搜索**（SearXNG 那边会去问引擎）。换来的是「能查」这个断言有证据
+    ——只探「端口开着」是不够的：`settings.yml` 里没开 json 时端口照样开着，一搜就返回网页。
+    解析/判据全部复用 `web_read`，不在这儿另写一套。
+    """
+    w = _search_mod()
+    url = w.build_url(cfg, _SEARCH_PROBE_Q)
+    base = w.base_url(cfg)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "wechat-ai-assistant/botctl",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=max(2, int(timeout))) as r:
+            body = r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return False, f"搜索服务返回 HTTP {e.code}（{base}）"
+    except Exception as e:
+        return False, f"连不上搜索服务（{base}）：{type(e).__name__}"
+    results, err = w.parse_json(body)
+    if err:
+        return False, err
+    return True, f"能查（探针拿到 {len(results)} 条，{base}）"
+
+
+def search_start(cfg=None, home=None, wait=40):
+    """起搜索服务（无窗口、detached），返回 `(ok, 一句人话)`。
+
+    和 bot 自己的 `start()` 同一个姿势：拉进程 → **等它真能用** → 才算成功。
+    差别在「能用」的判据：bot 是「拿到 39001 锁」，这里是「HTTP 真能查」（见 search_probe）。
+    `wait=0` = 拉起就返回，不等（给 bot 启动用，见 ensure_search_service）。
+    """
+    home = home or search_home(cfg)
+    port = search_port(cfg)
+    pid = search_owner(port)
+    if pid is not None:
+        _search_pid_clear()          # 端口已经监听了，那份 pid 记录没用了
+        return True, f"搜索服务本来就在跑（pid {pid}，端口 {port}）。"
+    boot = search_starting()
+    if boot is not None:
+        # 端口还没监听、但我们拉起的那个还活着 —— **绝不能再起第二个**。
+        return True, (f"搜索服务**已经在启动了**（pid {boot}，端口 {port} 还没开始监听）——"
+                      f"冷启动十几秒是正常的，别起第二个。看状态：助手.bat → [8] 更多 → [9] → [3]。")
+    py = search_python(home)
+    if not os.path.exists(py):
+        return False, (
+            f"找不到搜索后端的解释器：{py}\n"
+            f"  SearXNG 要单独装：源码放在本项目**上一级**、跑那个目录里的 start.bat 装依赖；\n"
+            f"  装在别处就在 config.yaml 里写 `search.home` 指过去。")
+    child_env = dict(os.environ)
+    child_env.update(search_env(home))
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        os.makedirs(os.path.dirname(SEARCH_LOG), exist_ok=True)
+    except OSError:
+        pass
+    try:
+        log = open(SEARCH_LOG, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        log = None
+    try:
+        proc = subprocess.Popen([py, "-m", "searx.webapp"], cwd=home, env=child_env,
+                                creationflags=flags, stdin=subprocess.DEVNULL,
+                                stdout=(log if log is not None else subprocess.DEVNULL),
+                                stderr=subprocess.STDOUT, close_fds=True)
+    except OSError as e:
+        return False, f"启动失败：{type(e).__name__}: {e}"
+    finally:
+        if log is not None:
+            log.close()
+    # 记下「这是我们拉起的那个」——只为盖住下面这段「端口还没监听」的冷启动窗口。
+    _search_pid_write(getattr(proc, "pid", 0) or 0)
+    if int(wait) <= 0:
+        return True, f"已拉起搜索服务（**启动中**，十几秒后能查）。日志：{SEARCH_LOG}"
+    deadline = time.time() + max(5, int(wait))
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            if proc.poll() is not None:      # 我们拉起来的那个已经退出了 → 别再干等
+                _search_pid_clear()
+                return False, (f"搜索服务启动后就退出了（exit={proc.returncode}）。"
+                               f"原因看日志 {SEARCH_LOG} 的末尾：\n{tail(8, SEARCH_LOG)}")
+        except Exception:
+            pass
+        ok, detail = search_probe(cfg)
+        if ok:
+            _search_pid_clear()
+            return True, f"搜索服务已启动，{detail}。日志：{SEARCH_LOG}"
+    return False, (f"进程拉起来了，但 {wait} 秒内还不能查——**没有报成功**。\n"
+                   f"  看日志：{SEARCH_LOG}\n{tail(8, SEARCH_LOG)}")
+
+
+def search_stop(cfg=None, dry_run=False, wait=20):
+    """停搜索服务。没在跑也算 ok（幂等），但会如实说。"""
+    port = search_port(cfg)
+    pid = search_owner(port)
+    if pid is None:
+        # 端口权威判据在这里会瞎：冷启动中途还没监听。顺手也把那个停掉，
+        # 否则用户点了「停止」却被回一句「本来就没在跑」，而进程其实正在起。
+        pid = search_starting()
+    if pid is None:
+        return True, f"搜索服务本来就没在跑（端口 {port} 没人占）。"
+    if dry_run:
+        return True, f"[试运行] 会停止搜索服务 pid {pid}（端口 {port}）。"
+    rc, out = _run(["taskkill", "/T", "/F", "/PID", str(pid)], timeout=30)
+    if rc != 0:
+        return False, f"停止失败（rc={rc}）：{out.strip()[:160]}"
+    _search_pid_clear()
+    deadline = time.time() + max(3, int(wait))
+    while time.time() < deadline:
+        if search_owner(port) is None:
+            return True, (f"已停止搜索服务 pid {pid}。"
+                          f"（如果它是从 start.bat 的窗口起的，那个窗口会显示「已退出」，"
+                          f"按任意键关掉即可。）")
+        time.sleep(1)
+    return False, (f"发了停止命令但端口 {port} 还占着——可能还有别的进程持有它。"
+                   f"查：netstat -ano | findstr {port}")
+
+
+def search_status_text(cfg=None, probe=True):
+    """搜索服务的一屏：进程 / 能不能查 / 开关 / 自启 / 目录 / 日志。**读不出来就说读不出来。**"""
+    port = search_port(cfg)
+    url = search_url(cfg)
+    home = search_home(cfg)
+    pid = search_owner(port)
+    boot = None if pid else search_starting()
+    lines = [f"搜索服务（网上搜索后端 SearXNG）：{url}"]
+    if pid:
+        lines.append(f"  进程：**在跑**（pid {pid}，端口 {port}）")
+    elif boot:
+        # 端口权威判据在这段窗口里是瞎的：**「正在启动」不许被说成「没有在跑」**。
+        lines.append(f"  进程：**正在启动**（pid {boot}，端口 {port} 还没开始监听）"
+                     f"——冷启动十几秒是正常的，**别再点一次启动**。")
+    else:
+        lines.append(f"  进程：**没有在跑**（端口 {port} 没人占）")
+    if probe:
+        ok, detail = search_probe(cfg)
+        lines.append(f"  能不能查：{'✅ ' if ok else '❌ '}{detail}")
+    try:
+        on = search_enabled(cfg)
+        lines.append(f"  开关：config.yaml 的 search.enabled = {str(on).lower()}"
+                     + ("" if on else "（**关着**，助手不会用搜索；要开就写 true）"))
+    except Exception as e:
+        lines.append(f"  开关：**读不出来**（{type(e).__name__}）")
+    lines.append("  随助手自启：" + ("开（search.autostart）" if search_autostart_on(cfg)
+                                  else "**关**（search.autostart）"))
+    exists = os.path.isdir(home)
+    lines.append(f"  目录：{home}（{'存在' if exists else '**不存在**'}）")
+    if exists and not search_ready(home):
+        lines.append("  ⚠️ 目录里没有 .venv\\Scripts\\python.exe：依赖还没装"
+                     "（见 README「网上搜索」）。")
+    if not exists:
+        lines.append("     按约定它该和本项目**平级**；装在别处就在 config.yaml 写 search.home。")
+    lines.append(f"  日志：{SEARCH_LOG}")
+    return "\n".join(lines)
+
+
+def ensure_search_service(cfg=None, wait=0):
+    """bot 启动时带起配套搜索服务 —— **best-effort，绝不抛、绝不拦住 bot**。
+
+    只在三件事都成立时才动手：
+      * `search.enabled` 为真（没开搜索就没必要常驻一个进程）；
+      * `search.autostart` 没被显式关掉；
+      * 解释器真在（换台电脑/没装后端时本来就该安静跳过，那不是故障）。
+
+    返回 `(ok, 一句人话)`；跳过时也是 ok=True + 一句「跳过」，让 bot.log 不出现假警报。
+    """
+    try:
+        if not search_enabled(cfg):
+            return True, "网上搜索没开启（search.enabled），跳过——没开就不为它常驻进程。"
+        if not search_autostart_on(cfg):
+            return True, "search.autostart 关着，跳过（要起：助手.bat → 更多 → 搜索服务）。"
+        home = search_home(cfg)
+        if not search_ready(home):
+            return True, (f"没找到 SearXNG（{home}），跳过——没装后端时不吵。"
+                          f"装在别处就在 config.yaml 写 search.home。")
+        return search_start(cfg=cfg, home=home, wait=wait)
+    except Exception as e:
+        # 这一条是**故意的**：配套服务起不来只该让搜索不可用，绝不该让微信助手起不来。
+        return False, f"带起搜索服务时出错（已忽略，不影响助手）：{type(e).__name__}: {e}"
+
+
 def main():
     arg = (sys.argv[1].lower() if len(sys.argv) > 1 else "status")
     if arg == "status":
@@ -308,8 +702,19 @@ def main():
         ok, msg = restart()
         print(("[√] " if ok else "[!] ") + msg)
         sys.exit(0 if ok else 1)
+    elif arg in ("search-status", "search"):
+        print(search_status_text(load_cfg()))
+    elif arg == "search-start":
+        ok, msg = search_start(cfg=load_cfg())
+        print(("[√] " if ok else "[!] ") + msg)
+        sys.exit(0 if ok else 1)
+    elif arg == "search-stop":
+        ok, msg = search_stop(cfg=load_cfg(), dry_run="--dry-run" in sys.argv)
+        print(("[√] " if ok else "[!] ") + msg)
+        sys.exit(0 if ok else 1)
     else:
-        print("用法：python botctl.py status|health|log [行数]|follow|start|stop|restart")
+        print("用法：python botctl.py status|health|log [行数]|follow|start|stop|restart"
+              "|search-status|search-start|search-stop")
         sys.exit(2)
 
 

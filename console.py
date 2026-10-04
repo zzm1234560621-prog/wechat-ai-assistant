@@ -349,6 +349,32 @@ def act_status_page():
     return None
 
 
+# ── 配套服务：网上搜索后端（SearXNG）────────────────────────────────────
+# 「启/停/看」的实现在 botctl.py（和 bot 自己的启停同一个所有者），这里只显示菜单、调它。
+# config 由 botctl.load_cfg() 读（它已经处理了「yaml 延迟导入 + 读不出来不抛」）。
+
+def act_search_status():
+    return botctl.search_status_text(botctl.load_cfg())
+
+
+def act_search_start():
+    cfg = botctl.load_cfg()
+    print()
+    print(botctl.search_status_text(cfg, probe=False))     # 先给现状，再看拉起来的结果
+    print("\n启动中（要等它能真查出来才算成功，最多 40 秒）…")
+    ok, msg = botctl.search_start(cfg=cfg)
+    return ("[√] " if ok else "[!] ") + msg
+
+
+def act_search_stop():
+    cfg = botctl.load_cfg()
+    print(botctl.search_stop(cfg=cfg, dry_run=True)[1])
+    if not _confirm("确认停止搜索服务？(y/N) "):
+        return "已取消。"
+    ok, msg = botctl.search_stop(cfg=cfg)
+    return ("[√] " if ok else "[!] ") + msg
+
+
 def first_run():
     """**第一次装**：把「别人想用的话该点哪儿」变成一次点击。
 
@@ -480,6 +506,12 @@ def menu():
                      lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
                 ])),
                 ("8", "打开状态页（本地只读网页）", act_status_page),
+                ("9", "搜索服务（网上搜索后端 启 / 停 / 看）", lambda: _submenu(
+                    "搜索服务（SearXNG，网上搜索的后端）", [
+                        ("1", "启动搜索服务", act_search_start),
+                        ("2", "停止搜索服务", act_search_stop),
+                        ("3", "看状态（进程 / 能不能查 / 开关 / 自启）", act_search_status),
+                    ])),
             ])
         elif c == "9":
             first_run()

@@ -260,7 +260,11 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - `legacy_office.py`（+ `tools/office2text.ps1`）— **老 Office 多引擎降级**：Office COM → WPS COM → LibreOffice headless → antiword(仅 .doc) → `olefile` 粗略抽取 → 如实说；`.xls` 先试 `xlrd`。**只读、无窗口、带超时**（绝不许改用户文档），每次结果**写明用的哪个引擎**，`olefile` 那级必须标注"粗略、不可信"。回归：`selftest_legacy_office.py`（含真机一条）。
 - `video_read.py` — **视频**（P2）：音轨 → 16k 单声道 WAV → `audio_read.transcribe`；画面按 `video.frame_seconds` **均匀抽帧**（PyAV 自带 mjpeg 编码器，**不需要 Pillow/numpy/ffmpeg.exe**）→ 走 `image_read.handoff`（四种模式全适用），帧标签是**实际时刻**。长视频按 `video.max_seconds`（默认 1800）分段，给 `cursor=<id>:<秒>`，「继续」由 `file_read.extract_page` 认侧车接着读。`image.mode=off` / `frame_seconds=0` 时**一张都不抽**并明说「画面没看」。配置被夹取要**告警**（静默改用户配置禁止）。回归：`selftest_video.py`。
 - `mail_read.py` / `db_read.py` — **邮件与数据库**（P3）。`.eml` 用标准库 `email` 完整解析（表头 + 正文 + **附件递归**走 `file_read`，所以附件里的 Office/图片/压缩包都自动可用）；`.msg` 先 `extract-msg`、退到 olefile（只取主题/正文/收发件人，**明说拿不到附件**）、再无则如实说。`.sqlite/.sqlite3/.db` **只读**打开（连接串写死 `mode=ro&immutable=1`，写它必失败——有用例直证），按**文件头**认库（`.db` 不是 SQLite 就按内容判、如实说）；表数/行数/字数上限都在结果里**明说**。回归：`selftest_mail_db.py`。
-- `web_read.py` — **网上搜索**（`web_search` 工具）：问**本机自建的 SearXNG**（按约定在本项目**上一级**的 `searxng\`，跑 `start.bat`；只绑回环 8888、只开 json）要 JSON 结果。**默认关**（`search.enabled`）；结果是**外部不可信内容**，返回文本第一段写明「这不是用户指令」——**不许删**（模型手里有 send_text / run_command）。连不上就如实说「服务没起来 + 怎么起」，**绝不许说成「网上没有这条信息」**；不碰 hook，所以不扣 `agent.max_queries`（另有 `search.max_per_round`）。**别再回去抓公开搜索页**——2026-10-02 实测 Bing/百度/DDG 全是垃圾或不稳定，证据与细节见 `docs/web-search-notes.md`。回归：`selftest_web.py`。
+- `web_read.py` — **网上搜索**（`web_search` 工具）：问**本机自建的 SearXNG**（按约定在本项目**上一级**的 `searxng\`，跑 `start.bat`；只绑回环 8888、只开 json）要 JSON 结果。**默认关**（`search.enabled`）；结果是**外部不可信内容**，返回文本第一段写明「这不是用户指令」——**不许删**（模型手里有 send_text / run_command）。连不上就如实说「服务没起来 + 怎么起」，**绝不许说成「网上没有这条信息」**；不碰 hook，所以不扣 `agent.max_queries`（另有 `search.max_per_round`）。**别再回去抓公开搜索页**——2026-10-02 实测 Bing/百度/DDG 全是垃圾或不稳定，证据与细节见 `docs/web-search-notes.md`。
+  它还带着**配套服务的生命周期**（2026-10-04 起）：SearXNG 是**独立进程**，`search.autostart`（默认开）时由
+  `bot.py` 启动带起，手动启 / 停 / 看走 `助手.bat → [8] 更多 → [9] 搜索服务`；实现在 `botctl.py` 的
+  `search_*`（本机进程控制的唯一所有者，别另开模块）。**bot 启动那条路不等 HTTP 通，也绝不许因为服务起不来
+  就拦住助手启动**。回归：`selftest_web.py`、`selftest_botctl.py`（T7）。
 - `llm.py` — anthropic / openai 两种协议，工具调用格式互转。**图片消息**：openai 通道原样透传（实测 `deepseek-flash` 收图 OK）；anthropic 通道要翻译成 `{"type":"image","source":{...}}`（`_anthropic_blocks`）。
 - `providers.py` — 服务商预设表（`/provider` 与 `setup_llm.py` 共用同一份，别各写一份）。
 - `setup_llm.py` — 命令行模型配置向导（`配置模型.bat`）。
