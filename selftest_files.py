@@ -23,6 +23,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
+import agent_tools    # noqa: E402  （确认队列的所有者）
 import file_read        # noqa: E402
 import files            # noqa: E402
 import plugins          # noqa: E402
@@ -133,8 +134,13 @@ def test_path_model():
 
 # ─────────────────────────────────────────────── 2. 读类动作
 
-def _run(args, cfg):
-    return files.handler(args, {"cfg": cfg})
+def _run(args, cfg, chat=None):
+    """跑一次 `computer_files`。**`chat` 只在需要确认的动作上才重要** ——
+    没有它，确认类动作会如实拒绝（队列是按会话分的），那个分支本身也有断言。"""
+    ctx = {"cfg": cfg}
+    if chat is not None:
+        ctx["chat"] = chat
+    return files.handler(args, ctx)
 
 
 def test_read_actions():
@@ -269,6 +275,127 @@ def test_switch_and_contract():
     return ok
 
 
+def test_write_gate():
+    print("\n── 5 · 写类：默认只新建 / 覆盖要确认 / 已存在不静默盖 ──")
+    ok = True
+    chat = "selftest_files_write"
+    agent_tools._PENDING.pop(chat, None)
+    cfg = {"files": {}}
+
+    with tempfile.TemporaryDirectory() as td:
+        f1 = _mk(os.path.join(td, "a.txt"), "old")
+        sub = os.path.join(td, "sub")
+        os.makedirs(sub, exist_ok=True)
+
+        out = _run({"action": "write", "path": os.path.join(td, "new.txt"), "text": "hi"}, cfg)
+        ok &= check("write **新建** → 免确认，直接写", "已写入" in out, out)
+
+        out = _run({"action": "write", "path": f1, "text": "NEW"}, cfg)
+        with open(f1, encoding="utf-8") as fh:
+            keep = fh.read()
+        ok &= check("write 命中**已存在**且没给 overwrite → 如实拒绝、**内容没动**",
+                    "已经存在" in out and keep == "old", (out, keep))
+
+        # 拿不到会话时：确认类动作**必须拒绝**，绝不「因为登不上就顺手执行了」
+        out = _run({"action": "write", "path": f1, "text": "NEW", "overwrite": True}, cfg)
+        with open(f1, encoding="utf-8") as fh:
+            keep = fh.read()
+        ok &= check("需要确认但没有会话 → **拒绝、没执行、也没登记**",
+                    "没有执行" in out and keep == "old", (out, keep))
+
+        out = _run({"action": "write", "path": f1, "text": "NEW", "overwrite": True},
+                   cfg, chat=chat)
+        pend = agent_tools.list_pending(chat, 300)
+        with open(f1, encoding="utf-8") as fh:
+            keep = fh.read()
+        ok &= check("覆盖已存在文件 → **进确认队列、还没写**（不可逆的一步）",
+                    "还没有执行" in out and len(pend) == 1 and keep == "old",
+                    (out, len(pend), keep))
+        ok &= check("覆盖的菜单里**明说是覆盖**（用户要知道这份会被盖掉）",
+                    "覆盖" in agent_tools.describe_pending(pend[0]),
+                    agent_tools.describe_pending(pend[0]))
+        n, err = agent_tools.send_pending(None, pend[0], cfg=cfg)
+        with open(f1, encoding="utf-8") as fh:
+            keep = fh.read()
+        ok &= check("确认后**真的覆盖了**", n == 1 and err is None and keep == "NEW",
+                    (n, err, keep))
+
+        out = _run({"action": "append", "path": f1, "text": "!"}, cfg)
+        with open(f1, encoding="utf-8") as fh:
+            ok &= check("append 是追加、不是覆盖", "已追加" in out and fh.read() == "NEW!")
+        out = _run({"action": "mkdir", "path": os.path.join(td, "d1", "d2")}, cfg)
+        ok &= check("mkdir 建多级目录", os.path.isdir(os.path.join(td, "d1", "d2")), out)
+
+        out = _run({"action": "copy", "src": f1, "dst": os.path.join(td, "c.txt")}, cfg)
+        ok &= check("copy 复制文件", "已复制" in out and os.path.exists(os.path.join(td, "c.txt")), out)
+        out = _run({"action": "copy", "src": f1, "dst": os.path.join(td, "c.txt")}, cfg)
+        ok &= check("copy 到**已存在**的目标 → 拒绝、不静默盖掉", "已经存在" in out, out)
+        out = _run({"action": "move", "src": f1, "dst": sub}, cfg)
+        ok &= check("move 到目录 → 搬进去（保留原文件名）",
+                    os.path.exists(os.path.join(sub, "a.txt")), out)
+        out = _run({"action": "rename", "path": os.path.join(sub, "a.txt"),
+                    "new_name": "b.txt"}, cfg)
+        ok &= check("rename 改名", os.path.exists(os.path.join(sub, "b.txt")), out)
+        out = _run({"action": "rename", "path": os.path.join(sub, "b.txt"),
+                    "new_name": "x\\y.txt"}, cfg)
+        ok &= check("rename 的 new_name 带路径分隔符 → 拒绝并指路 move",
+                    "路径分隔符" in out and "move" in out, out)
+
+        # 路径准入对写类同样生效（写不是「内部操作」，一样要过闸）
+        out = _run({"action": "write", "path": r"C:\Windows\_probe.txt", "text": "x"}, cfg)
+        ok &= check("写类也受 `files.deny` 约束（系统目录写不进去）",
+                    "系统目录" in out and not os.path.exists(r"C:\Windows\_probe.txt"), out)
+    return ok
+
+
+def test_delete_recycle():
+    print("\n── 6 · 删除：强制确认 + 进回收站（不可逆那一步不给配置留后门）──")
+    ok = True
+    chat = "selftest_files_del"
+    agent_tools._PENDING.pop(chat, None)
+
+    with tempfile.TemporaryDirectory() as td:
+        v1 = _mk(os.path.join(td, "victim1.txt"), "bye")
+        v2 = _mk(os.path.join(td, "victim2.txt"), "bye")
+        # ⚠️ 关键：**即使把 delete 从 files.confirm 里删掉也必须拦住**
+        cfg = {"files": {"confirm": []}}
+        out = files.handler({"action": "delete", "path": v1}, {"cfg": cfg, "chat": chat})
+        ok &= check("`files.confirm: []` 时 delete **仍强制确认**（配置说了不算）",
+                    "还没有执行" in out and os.path.exists(v1), out)
+        ok &= check("…`warn_forced` 明说「已强制加回」",
+                    "强制加回" in files.warn_forced(cfg), files.warn_forced(cfg))
+        ok &= check("…并且菜单显示的是**原样路径**（不是文件名）",
+                    td in agent_tools.describe_pending(
+                        agent_tools.list_pending(chat, 300)[0]),
+                    agent_tools.describe_pending(agent_tools.list_pending(chat, 300)[0]))
+        ok &= check("消息里说清是**回收站**、还能恢复",
+                    "回收站" in agent_tools.describe_pending(
+                        agent_tools.list_pending(chat, 300)[0]))
+
+        files.handler({"action": "delete", "path": v2}, {"cfg": cfg, "chat": chat})
+        pend = agent_tools.list_pending(chat, 300)
+        ok &= check("删**另一个**文件 → **不判重**、队列里两条（key_fields 直证）",
+                    len(pend) == 2, len(pend))
+
+        n, err = agent_tools.send_pending(None, pend[0], cfg=cfg)
+        ok &= check("确认后真的删了：原路径消失", n == 1 and err is None
+                    and not os.path.exists(v1), (n, err, os.path.exists(v1)))
+        ok &= check("另一个还没动（只管确认的那一条）", os.path.exists(v2))
+
+    src = open(os.path.join(BASE, "files.py"), "r", encoding="utf-8").read()
+    ok &= check("删除用 `FOF_ALLOWUNDO`（**唯一**让删除可恢复的旗标，不许删）",
+                "FOF_ALLOWUNDO | FOF_NOCONFIRMATION" in src)
+    ok &= check("用 ctypes + SHFileOperationW（零依赖、不起子进程）",
+                "SHFileOperationW" in src
+                and "import send2trash" not in src
+                and "import winshell" not in src
+                and "subprocess" not in src)
+    # 「真的进了回收站」自测**证不了**（要枚举回收站得走 Shell COM，代价过大）——
+    # 自动测只证「旗标对 + 原路径消失」，人工确认归 verify_real.py。不许把
+    # 没验证的说成验证过了。
+    return ok
+
+
 def main():
     print("电脑文件能力回归（`files.py`）")
     print("=" * 66)
@@ -276,6 +403,8 @@ def main():
     test_read_actions()
     test_reextract_kernel()
     test_switch_and_contract()
+    test_write_gate()
+    test_delete_recycle()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

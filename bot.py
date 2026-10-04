@@ -3303,6 +3303,27 @@ def main():
                         # 失败也记：已经发出去的那 n 条收不回来，重来一遍会重复发
                         remember_executed(item, cfg)
                         continue
+                    if item and item.get("kind") == "fileop":
+                        # 文件操作（`computer_files`，见 docs/computer-files-spec.md）：
+                        # 用户回「确认」才真做。
+                        #
+                        # **它必须有自己的分支**：这个待确认项**没有收件人**，
+                        # 落到下面那条通用的发送分支就会报「已发送给 」
+                        # 这种胡说八道。
+                        #
+                        # 返回的第二个值是「要说给用户听的一句话」：删除/覆盖这类
+                        # 改文件的动作成功时是 None，失败时是原因，读类动作是内容。
+                        # 所以这里一律**有话就说、没话就报完成**。
+                        n, msg = agent_tools.send_pending(wcf, item, 0.0, cfg=cfg)
+                        desc = agent_tools.describe_pending(item)
+                        if msg:
+                            print(f"[bot] 文件操作（{n}）：{msg}")
+                            send(f"{msg}", sender)
+                        else:
+                            print(f"[bot] 文件操作完成：{desc}")
+                            send(f"已完成：{desc}", sender)
+                        remember_executed(item, cfg)
+                        continue
                     if item and item.get("kind") == "shell":
                         # 本地执行：用户回「确认」才真跑。shell 没有收件人——绝不走
                         # send_pending、也绝不发给 item["to_wxid"]（它是空的），
