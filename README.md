@@ -127,6 +127,49 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_package.ps1
 
 ## 把别的软件接进微信（比如 vibe coding 的工具）
 
+两条路：**接进本助手**（让它多一个工具或事件）走 ①，这是**本项目自己提供的接口**；
+**接微信本身**（任何语言、任何进程）走 ②，那是 hook 提供的本地 HTTP，本项目也建在它上面。
+
+### ① 本助手的接口：插件契约（`plugins/`，2026-10-04 落地）
+
+**往 `plugins/` 放一个 `.py`、重启助手，就多了一个功能**，不用改项目里任何代码：
+
+```python
+# plugins/我的插件.py   文件名不要以 _ 开头；入口必须叫 setup(reg)
+def setup(reg):
+    def notify(args, ctx):            # ctx 只读：chat / cfg / from_self …
+        return f"已记下待通知：{(args or {}).get('text', '')}（会话 {ctx.get('chat')}）"
+
+    reg.register_tool({                # ① 给模型加一个工具
+        "name": "notify_build",
+        "description": "示例工具：记下一条构建结果（演示用）。",
+        "parameters": {"type": "object",
+                       "properties": {"text": {"type": "string", "description": "内容"}},
+                       "required": ["text"]},
+        "handler": notify,
+        "guidance": "用户说「构建完通知我」时调用 notify_build。",   # 必填：模型指导随定义走
+        # "confirm": "always",         # 发消息 / 删文件这类不可逆动作就打开它
+    })
+
+    reg.register_event("on_message", lambda ctx: print("来了条消息", ctx.get("chat")))  # ② 事件
+    # ③ reg.register_pending_kind(...) 还能自己加一类「等你回确认」的动作
+```
+
+- 六个事件：`on_start` / `on_message` / `before_reply` / `after_reply` / `on_tool` / `on_tick`；
+  **只有 `before_reply` 能改行为**（改回复文本），其余只观察——路由只能有一个所有者。
+- 工具和事件都跑在**收消息那条线程**上，所以必须快（超 `plugins.slow_ms`（默认 500ms）告警，
+  连续 `plugins.disable_after`（默认 5）次**自动停用并说明原因**），而且**绝不许碰 hook**；
+  插件工具的不可逆动作走**同一条确认闸**，没有例外通道。
+- 加载失败只告警跳过、**绝不拦住 bot 启动**；重名工具在加载期失败；注册到一半**整份回滚**。
+  `plugins.enabled: false` 关全部，`plugins.disabled: [名字]` 关单个；改完要**重启**才生效。
+- 模板 `plugins/_example.py`，权威契约 [docs/plugin-contract-spec.md](docs/plugin-contract-spec.md)。
+
+⚠️ **网络型连接器（MCP server、IDE 桥）这一版只钉了契约、没写实现**：它们需要的
+`mode="worker"`（丢给后台线程）**声明即在加载期失败**——宁可起不来，也不许它悄悄按就地模式跑、
+一边卡着收微信一边声称没卡。所以现在要把网络软件接进来，先用下面的 ②。
+
+### ② 微信本身的接口：hook 的本地 HTTP（任何语言都能用）
+
 **这套接口不是本项目专用的。** hook 在微信进程里起的是一个**本地 HTTP 服务**，任何会发 HTTP
 的程序都能用它**读写微信**：Node / Python / Go 脚本、IDE 插件、命令行 AI 编码工具……
 只要它跑在**同一台电脑**上（服务在 `127.0.0.1:30001`，别暴露到局域网或公网）。
@@ -166,13 +209,16 @@ print(q("message_fts.db",
 - **没有推送，只能轮询**：查询间隔别低于 5 秒，查太勤会把微信拖死（这个 hook 的查询是内存扫描 + SQLite）。
 - **不要并发**：hook 不支持并发，两个进程同时查或同时发会让微信崩。本项目用单实例锁
   （回环端口 39001）兜底；你接的软件请串行调用。
-- **发送是不可逆的**：本项目里所有发送都先走"待确认"再发；你自己的脚本接上去时，
+- **发送是不可逆的**：本项目里所有发送都先走「待确认」再发；你自己的脚本接上去时，
   请别绕过这道闸（微信消息发出去就收不回来了）。
 
-另外，如果你想接的是**本助手**（而不是直接打 hook），也有一条路：往 `plugins/` 放一个 `.py`
-就是一个新工具或事件，不用改项目代码，契约见 `docs/plugin-contract-spec.md`。
-需要后台线程的网络型连接器（`mode="worker"`）这一版**声明会在加载时失败**——
-宁可起不来，也不许它悄悄卡住收微信的那条线程。
+### ③ 顺带：同一天落地的另一条接口 —— 让助手反过来操作你电脑上的文件
+
+微信里说「读一下那份报告」「建个目录」「把那个文件删了」，助手会真的去动磁盘上的文件
+（列 / 搜 / 读 / 写 / 复制 / 移动 / **删到回收站**）。**删除和覆盖每次都要你回「确认」**，
+系统目录（Windows / Program Files / ProgramData）默认挡住，默认只认你自己发的消息
+（放开要改 `files.who`，那等于让对方能改你硬盘上的文件）。规格
+[docs/computer-files-spec.md](docs/computer-files-spec.md)。
 
 ## 更多文档
 
