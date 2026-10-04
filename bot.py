@@ -105,23 +105,62 @@ def drain_notices():
     return out
 
 
-def _try_selfheal(client):
+def _try_selfheal(client, min_interval=None):
     """库句柄疑似掉了 → 触发一次重扫。返回一句**如实**的话。
 
     ⚠️ `live_history.force_rescan` 返回的是「**这次有没有真的触发重扫**」
-    （它自带 45s 限流，别人刚扫过就返回 False），**不是「修好了没」**。
-    所以这里绝不说「已修好」——到底修好没有，由**接下来的轮询**告诉我们
-    （游标动了就是好了，`Health.recovered_from_stall` 会给一次性信号）。
-    这也是「没跑就是没跑」的同一条规矩：只报自己真做过的事。
+    （它自带限流，别人刚扫过就返回 False），**不是「修好了没」**。
+    所以这里绝不说「已修好」——到底修好没有，由**接下来的那一轮**告诉我们
+    （游标动了 / 下一次 ping 通了，就是好了；停滞那条路另有 `Health.recovered_from_stall`
+    给一次性信号）。这也是「没跑就是没跑」的同一条规矩：只报自己真做过的事。
+
+    `min_interval` 透传给 `force_rescan`：调用方自己定「这条路值不值得为它重扫」
+    （默认仍是它的 45 秒；闸门那条路要松得多，见 `_GATE_HEAL_INTERVAL`）。
     """
     try:
-        triggered = live_history.force_rescan(client)
+        triggered = live_history.force_rescan(client, min_interval=min_interval)
     except Exception as e:
         return f"试着重扫时抛了异常：{type(e).__name__}: {e}"
     if triggered:
         return ("我已经自己触发了一次重扫（force_rescan）。接下来几轮游标要是动了，"
                 "就说明**数据又能读到了**；要是一直不动，再按下面做。")
-    return ("刚才 45 秒内已经重扫过（限流中），这次没有重复扫。")
+    try:
+        gap = int(min_interval or live_history.RESCAN_MIN_INTERVAL)
+    except (TypeError, ValueError):
+        gap = int(live_history.RESCAN_MIN_INTERVAL)
+    return (f"刚才 {gap} 秒内已经重扫过（限流中），这次没有重复扫。")
+
+
+# 启动闸门里自愈的最小间隔（秒）。**故意比 force_rescan 默认的 45 秒松得多**：
+# GetAllDBName 是 700MB 进程里的全内存扫描，「调勤了会把微信拖死」（见 live_history 顶部那段），
+# 而闸门是「不知道要等多久」的场景——用户扫码可能要等几分钟。首次照扫（限流比的是
+# 「距上次」，初值 0），之后最多 5 分钟一次。
+_GATE_HEAL_INTERVAL = 300.0
+# 只有**连不上 hook** 才计数放弃。掉登录、库打不开都**不放弃**——用户在扫码的那一刻，
+# 我们得还在（旧实现 30 次之后 sys.exit(1)，扫了码也救不回来）。
+# 30 次 × 10 秒 = 约 5 分钟；连不上时这一轮还会先花掉一次探针超时（默认 15 秒），
+# 所以卡死的 hook 下实际会更久——**这里不写死「几分钟」**，只说次数。
+_GATE_HARD_FAIL_LIMIT = 30
+
+
+def _gate_retry_step(client, hard_fails):
+    """启动闸门里「这一次 ping 失败之后」要做什么。返回 `(hard_fails, 要打的一行字)`。
+
+    ⚠️ 三种失败**必须分开处理**（2026-10-05 真机：混成一种就会让 bot 永远起不来）：
+      * hook 说**已登录**、却连库都打不开 → 句柄表被重建了，**自愈一次**（重扫，2.7 秒修好）；
+      * hook **连不上** → 那才是真起不来，计一次数（到 `_GATE_HARD_FAIL_LIMIT` 如实放弃）；
+      * hook 说**没登录**（`IsLogin: 0`）→ 等用户扫码就好，**绝不重扫**
+        （扫了也白扫，还得白花一次 700MB 进程的全内存扫描）。
+
+    抽成独立函数是为了**不用 sleep 也测得到**（和 `handle_cursor_stall` 同一个理由：
+    判断本身必须能被自测钉住，不能只测零件）。
+    """
+    state, _why = _probe_login(client)      # 只读探针，不碰句柄表；失败原因用 ping() 那句更全的
+    if state is True:
+        return hard_fails, _try_selfheal(client, min_interval=_GATE_HEAL_INTERVAL)
+    if state is None:
+        return hard_fails + 1, ""
+    return hard_fails, ""
 
 
 def _stall_threshold(cfg):
@@ -2093,17 +2132,29 @@ def connect_wcferry():
 
 
 def connect_aixed(base_url):
-    """连 aixed/WeChat-Hook 起的本地 HTTP 服务。失败返回 None。"""
+    """连 aixed/WeChat-Hook 起的本地 HTTP 服务。失败返回 None。
+
+    ⚠️ 2026-10-05 真机：微信掉登录、用户重新扫码之后，hook 自报 `IsLogin: 1`，
+    可三个库的句柄**全是空的**（`get database handle which named … failed`）。
+    旧实现只探不修，于是它每 10 秒刷一行「请扫码登录」，**30 次之后 sys.exit(1)**——
+    用户明明已经扫码了，助手却再也起不来（那是「发消息没反应」的真正原因）。
+    现在：失败先走 `_gate_retry_step`（该自愈的自愈），而且**只有连不上 hook 才放弃**。
+    """
     print(f"[bot] 正在连接 aixed HTTP 服务 {base_url} ...")
     client = AixedClient(base_url)
-    for _ in range(1, 31):
+    hard_fails = 0
+    while True:
         ok, info = client.ping()
         if ok:
             print(f"[bot] 自己的 wxid = {info}")
             return client
+        hard_fails, note = _gate_retry_step(client, hard_fails)
+        if note:
+            print(f"[bot] {note}")
+        if hard_fails >= _GATE_HARD_FAIL_LIMIT:
+            return None
         print(f"[bot] {info}，10 秒后重试 ...")
         time.sleep(10)
-    return None
 
 
 class _Ticker:

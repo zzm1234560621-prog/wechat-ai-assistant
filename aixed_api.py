@@ -350,7 +350,7 @@ class AixedClient:
         改成直接探两个真实存在的库：查得通就说明已登录、hook 正常。
         """
         try:
-            self.db_status()
+            st = self.db_status()
         except AixedError as e:
             return False, str(e)
         # 4.x 探 session/contact.db，3.9.x 探 MicroMsg.db——两种后端都要覆盖，
@@ -364,6 +364,18 @@ class AixedClient:
                 return True, who or "(已登录，但取不到 wxid)"
             except AixedError:
                 continue
+        # 库全打不开时**必须分清**「没登录」和「已登录但句柄表是空的」（2026-10-05 真机）：
+        # 两种都查不出东西，修法却完全相反——掉登录只能人工扫码（重扫也白搭），
+        # 而「IsLogin=1 + 库全打不开」是掉登录再登录之后 hook 的句柄表被重建了，
+        # **重扫一次（force_rescan）就修好**。旧实现两种都报「微信没登录？请扫码登录」，
+        # 把日志和排查方向一起指错：真机上用户明明已经扫码登录了，还在被叫去扫码。
+        try:
+            logged = int((st or {}).get("IsLogin", 0)) == 1
+        except (TypeError, ValueError, AttributeError):
+            logged = False
+        if logged:
+            return False, ("hook 在、微信也显示已登录（IsLogin=1），但数据库句柄打不开"
+                           "——掉登录再登录后常见，重扫一次通常就修好")
         return False, "hook 已加载，但数据库打不开（微信没登录？请在微信里扫码登录）"
 
     # ---------- 轮询收消息（这套接口没有收消息回调） ----------

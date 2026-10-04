@@ -380,6 +380,11 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
      微信会**自己重启到登录界面**（换 PID、内存掉到 ~148MB、30001 仍在监听但 `IsLogin: 0`）——
      表现和 fts 静默失效几乎一样，但**恢复只能人工扫码**，`force_rescan` 没用还白花一次全内存扫描。
      判据：掉登录 → `is_login()` 为 False、`self_profile()` 全空；fts 失效 → 两者都正常、只是查不出行。
+     ⚠️ 2026-10-05 真机更正：本机这份自编 DLL 的 `g_IsLogin` **只置 1、从不置回 0**
+     （`docs/hook-login-gate-notes.md`），所以上面这条判据会骗人——**真正管用的是「库能不能查」**：
+     `IsLogin: 1` + 三个库全 `get database handle which named … failed` = 句柄表被重建，
+     这种状态**重扫是有用的**（实测 2.7 秒修好），别再当成「只能扫码」。启动闸门里已接自愈
+     （`bot._gate_retry_step`）；闸门也**只在连不上 hook 时才放弃**。
   1. 再看 `bot.log` 的轮询心跳（`[bot] 轮询心跳 #N，游标=X`）。游标不动就是 fts 那条。
   2. 才手工 `force_rescan`。
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。

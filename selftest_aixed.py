@@ -48,6 +48,10 @@ DB_NAMES_RESP = [{"dbHandle": 1000 + i, "dbName": n} for i, n in enumerate(DB_NA
 
 
 class Stub(BaseHTTPRequestHandler):
+    # /QueryDB/status 里报什么。自测要摆出「已登录但句柄空」和「真没登录」两种，
+    # 子类只改这一个数字（2026-10-05：这两种以前 ping() 的说法是一样的，害人）。
+    is_login = 1
+
     def log_message(self, *a):
         pass  # 静音
 
@@ -84,7 +88,7 @@ class Stub(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/QueryDB/status":
-            self._send({"IsLogin": 1, "hWeixin": 123456})
+            self._send({"IsLogin": type(self).is_login, "hWeixin": 123456})
         else:
             self._send({"error": "not found"})
 
@@ -143,10 +147,10 @@ class Stub(BaseHTTPRequestHandler):
 
 
 class _NoDbStub(Stub):
-    """模拟未登录：查任何库都拿不到句柄。
+    """库句柄全空，但 /QueryDB/status **报已登录**（IsLogin=1）。
 
-    真实返回就是这个形状——微信没登录时 aixed 会回
-    {"status": -1, "desc": "get database handle which named X failed"}。
+    这正是 2026-10-05 真机的形态：微信掉登录、用户重新扫码之后，hook 认为已登录，
+    可三个库的句柄全被重建掉了。`IsLogin: 0` 那种要在 `_NotLoggedInStub` 里摆。
     """
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -161,6 +165,11 @@ class _NoDbStub(Stub):
                         "desc": f"get database handle which named {db} failed"})
         else:
             self._send({"data": []})
+
+
+class _NotLoggedInStub(_NoDbStub):
+    """真·没登录：`/QueryDB/status` 自己就报 IsLogin=0（这时候重扫没用，只能扫码）。"""
+    is_login = 0
 
 
 # ---------- 4.x：fts 句柄失效，只有 session.db 是好的 ----------
@@ -814,14 +823,30 @@ def main():
     live_history.set_rescan_interval(300)
     srv3.shutdown()
 
-    print("\n── 未登录时必须判定为「未就绪」，不能硬闯 ──")
+    print("\n── 库句柄全空：**已登录**和**真没登录**的说法必须分开（2026-10-05 真机）──")
+    # 现场：微信掉登录、用户重新扫码之后，hook 报 IsLogin=1，可三个库的句柄全是空的。
+    # 旧实现两种都报「微信没登录？请在微信里扫码登录」——用户明明已经登录了，还在被叫去扫码，
+    # 而真正该做的是重扫一次句柄表（见 selftest_bot_loop 的闸门用例）。
     srv2 = ThreadingHTTPServer(("127.0.0.1", 0), _NoDbStub)
     threading.Thread(target=srv2.serve_forever, daemon=True).start()
     nli = aixed_api.AixedClient(base_url=f"http://127.0.0.1:{srv2.server_address[1]}")
     okp, msg = nli.ping()
-    ok &= check("未登录时 ping 返回 False", okp is False, okp)
-    ok &= check("未登录时提示里包含「登录」", "登录" in str(msg), msg)
+    ok &= check("库全空时 ping 返回 False", okp is False, okp)
+    ok &= check("★ IsLogin=1 + 库全空 → 说清是**句柄**打不开", "句柄" in str(msg), msg)
+    ok &= check("★ 这种时候**不许**叫用户去扫码（他已经登录了）",
+                "扫码" not in str(msg) and "没登录" not in str(msg), msg)
     srv2.shutdown()
+
+    srv4 = ThreadingHTTPServer(("127.0.0.1", 0), _NotLoggedInStub)
+    threading.Thread(target=srv4.serve_forever, daemon=True).start()
+    nli2 = aixed_api.AixedClient(base_url=f"http://127.0.0.1:{srv4.server_address[1]}")
+    okp2, msg2 = nli2.ping()
+    ok &= check("真没登录时 ping 返回 False", okp2 is False, okp2)
+    ok &= check("IsLogin=0 → 才说「没登录 / 扫码登录」",
+                "没登录" in str(msg2) and "扫码" in str(msg2), msg2)
+    ok &= check("IsLogin=0 时不许说成句柄问题（那是另一条路，扫也白扫）",
+                "句柄" not in str(msg2), msg2)
+    srv4.shutdown()
 
     print("\n── 连不上时的报错 ──")
     dead = aixed_api.AixedClient(base_url="http://127.0.0.1:1", timeout=2)

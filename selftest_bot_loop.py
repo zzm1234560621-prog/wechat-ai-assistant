@@ -1179,6 +1179,87 @@ def t_stall_selfheal():
         bot.live_history.fts_alive = old_alive
 
 
+def t_gate_selfheal():
+    sec("启动闸门：已登录但句柄空 → 自愈；掉登录不白扫；连不上才放弃")
+    # 2026-10-05 真机：微信掉登录 → 用户重新扫码 → hook 自报 IsLogin=1，
+    # 可三个库的句柄全空。旧闸门只探不修，刷 30 次「请扫码登录」后 sys.exit(1)，
+    # 用户扫了码也起不来（=「发消息没反应」）。这几条钉住三态分开处理。
+
+    class _GateCli:
+        """假 client：login / reachable / 第几次 ping 之后算通，全都可摆布。"""
+
+        def __init__(self, login=True, reachable=True, ping_ok_after=None):
+            self.login = login
+            self.reachable = reachable
+            self.ping_ok_after = ping_ok_after
+            self.pings = 0
+
+        def ping(self):
+            self.pings += 1
+            if self.ping_ok_after is not None and self.pings > self.ping_ok_after:
+                return True, "wxid_selftest"
+            return False, "（假）库打不开"
+
+        def db_status(self):
+            if not self.reachable:
+                raise aixed_api.AixedError("拒绝连接")
+            return {"IsLogin": 1 if self.login else 0}
+
+        def is_login(self):
+            return int(self.db_status().get("IsLogin", 0)) == 1
+
+    old_rescan = bot.live_history.force_rescan
+    old_sleep = bot.time.sleep
+    old_client = bot.AixedClient
+    calls = []
+    try:
+        bot.live_history.force_rescan = lambda c, min_interval=None: calls.append(min_interval) or True
+
+        # ① 已登录 + 库全打不开 → **必须扫**，而且用闸门那条更松的间隔（不是 45 秒）
+        n, note = bot._gate_retry_step(_GateCli(login=True), 0)
+        chk(len(calls) == 1 and calls[0] == bot._GATE_HEAL_INTERVAL,
+            f"已登录但句柄空 → 重扫一次、用闸门间隔 {bot._GATE_HEAL_INTERVAL}s（实际 {calls}）")
+        chk(n == 0, "这不算「连不上」，不许计数放弃")
+        chk("触发了一次重扫" in note, f"如实报自己真做过的事：{note[:40]!r}")
+        chk("修好" not in note, "**绝不许**说「已修好」")
+
+        # ② 真掉登录（IsLogin=0）→ **一次都不许扫**（重扫没用，白花一次全内存扫描）
+        calls.clear()
+        n2, note2 = bot._gate_retry_step(_GateCli(login=False), 0)
+        chk(calls == [] and note2 == "", f"掉登录不重扫（重扫修不了掉登录）：{calls}")
+        chk(n2 == 0, "掉登录也不放弃——用户可能正在扫码，我们得还在")
+
+        # ③ 连不上 hook → 那才是真起不来，计数（且不白扫）
+        calls.clear()
+        n3, _note3 = bot._gate_retry_step(_GateCli(reachable=False), 5)
+        chk(n3 == 6 and calls == [], f"连不上 hook 才计数（5→{n3}），且不白扫")
+
+        # ④ 被限流时照旧说实话，且报的秒数要跟真正传下去的间隔一致（不许写死 45）
+        bot.live_history.force_rescan = lambda c, min_interval=None: False
+        msg = bot._try_selfheal(_GateCli(), min_interval=300)
+        chk("限流" in msg and "300 秒" in msg, f"限流文案的秒数跟实际间隔一致：{msg!r}")
+
+        # ⑤ 端到端：闸门不许因为「已登录但库空」就退出，自愈后要真接上
+        bot.live_history.force_rescan = lambda c, min_interval=None: calls.append(min_interval) or True
+        calls.clear()
+        bot.AixedClient = lambda url: _GateCli(login=True, ping_ok_after=1)
+        bot.time.sleep = lambda s: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            c = bot.connect_aixed("http://127.0.0.1:1")
+        chk(c is not None, "自愈一次之后 ping 通了 → 返回 client（不再 sys.exit）")
+        chk(len(calls) == 1, f"端到端里确实重扫了 1 次（实际 {len(calls)}）")
+
+        # ⑥ 连不上 hook：到上限就如实放弃，不无限等
+        bot.AixedClient = lambda url: _GateCli(reachable=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            c2 = bot.connect_aixed("http://127.0.0.1:1")
+        chk(c2 is None, "连不上 hook → 到上限返回 None（交给上层如实报错）")
+    finally:
+        bot.live_history.force_rescan = old_rescan
+        bot.time.sleep = old_sleep
+        bot.AixedClient = old_client
+
+
 def t_bot_console():
     sec("/bot 控制台：一屏总览 + 控制动作复用既有命令（不另写一套逻辑）")
     import inspect
@@ -1605,6 +1686,7 @@ def main():
     t_usage_cmd()
     t_selfcheck()
     t_stall_selfheal()
+    t_gate_selfheal()
     t_bot_console()
     t_check_ret()
     t_own_image()
