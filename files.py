@@ -163,6 +163,51 @@ def describe_scope(cfg):
     return f"范围：{scope}{tail}"
 
 
+# ────────────────────────────────────────────────────────────── 触发者闸门
+
+def who_list(cfg):
+    """`files.who`：**另外**允许触发控制类能力的会话（名单）。"""
+    raw = _cfg(cfg).get("who") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for x in raw if isinstance(raw, (list, tuple)) else []:
+        s = str(x or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def who_allows(ctx, cfg):
+    """这个会话/这条消息能不能用控制类能力。返回 `(允许?, 拒绝原因)`。
+
+    判据（用户 2026-10-04 的口径：「只能说我的对话，加指定对话」）：
+
+    * 会话在 `files.who` 名单里 → 允许。**名单是「指定对话」的唯一含义** ——
+      放进去的会话里，**别人**发的消息也算（那正是用户点名授权的意思）。
+    * 否则必须 `from_self is True`（这条消息是**我自己**发的）。
+    * 两者都不满足 → 拒绝，并说清怎么放开。
+
+    ⚠️ `from_self` 是 **`None` = 「不知道」**时**不算通过**。
+    把「不知道」当成「是我自己发的」等于**静默放宽权限** —— 这正是这个字段
+    在契约里默认 `None` 而不是 `False` 的原因（见 `plugins.make_ctx`）。
+    """
+    chat = str((ctx or {}).get("chat") or "")
+    listed = who_list(cfg)
+    if chat and chat in listed:
+        return True, ""
+    if (ctx or {}).get("from_self") is True:
+        return True, ""
+    how = ("这个会话不在 `files.who` 名单里，而且这条消息**不是我自己发的**"
+           if chat else "这一轮拿不到会话")
+    opened = f"；名单里现在有：{'、'.join(listed)}" if listed else ""
+    return False, (f"**不能用**：{how}{opened}。"
+                   f"现在只允许「我自己发的消息」{'+ 名单里的会话' if listed else ''}。"
+                   f"要放开就在 config.yaml 的 `files.who` 里加上那个会话"
+                   f"（但**别**把不认识的人或群加进去 —— 加进去就等于让他能改你硬盘上的文件）。")
+
+
+
 def path_ok(path, cfg):
     """**路径准入的唯一所有者**。返回 `(解析后的真实路径, 错误文本)`。
 
@@ -754,6 +799,13 @@ def handler(args, ctx):
     if not on:
         return note
 
+    # 触发者闸门（规格第四节）：**只认我自己发的 + 点名授权的会话**。
+    # 闸门设在**工具层**，判据（`from_self`）由 bot 主循环传进来 ——
+    # 事实留在有事实的那一层，工具层不去猜。
+    allowed, why = who_allows(ctx, cfg)
+    if not allowed:
+        return why
+
     action = str(args.get("action") or "").strip()
     if action not in ACTIONS:
         return (f"不认识的 action「{action}」。可用的有：{'、'.join(ACTIONS)}"
@@ -836,6 +888,64 @@ def tool_spec():
         "handler": handler,
         "guidance": GUIDANCE,
     }
+
+
+_OUR_KEYS = {"enabled", "roots", "deny", "who", "confirm", "find_max_dirs"}
+
+
+def startup_notes(cfg):
+    """启动时要打出来的几条告警。返回字符串列表（空 = 没什么要说的）。
+
+    为什么必须有：这一版的默认值是**宽**的（用户口径：默认全盘、读写免确认）。
+    本项目既有的规矩是「**边界可以宽，但用户必须知道它宽在哪**」
+    （`agent.send_image_dirs` 那次真机教训）—— 静默地宽是最坏的一种。
+    """
+    notes = []
+    if enabled(cfg) is not True:
+        notes.append("文件能力：**关着**（`files.enabled` 不是 true）。要开就写 enabled: true。")
+        return notes
+
+    r, d = roots(cfg), deny_dirs(cfg)
+    notes.append(f"文件能力：{describe_scope(cfg)}")
+    if not r:
+        notes.append("‼️ `files.roots` 是**空的 = 全盘** —— 模型能读写这台电脑上几乎任何"
+                     "位置的**任何文件**（系统目录仍挡着）。要收窄就把允许的目录写进 files.roots。")
+    if not d:
+        notes.append("‼️ `files.deny` 是**空的** —— 连系统目录都不挡了。"
+                     "除非你确定要这样，否则把它删掉恢复默认。")
+
+    acts = confirm_actions(cfg)
+    need = sorted(a for a in (ACTIONS_WRITE + ACTIONS_DANGER) if a in acts)
+    if "overwrite" in acts:
+        # `overwrite` 不是 action，是「覆盖已存在文件」这个**情况** —— 它同样要确认，
+        # 打印时不能漏（用户要一眼看清到底哪些操作会被拦一道）。
+        need.append("覆盖已存在文件")
+    if not need:
+        notes.append("‼️ `files.confirm` 里没有任何动作 —— 写入和删除**都不需要确认**了。")
+    else:
+        notes.append("要用户确认的：" + "、".join(need))
+
+    forced = warn_forced(cfg)
+    if forced:
+        notes.append("‼️ " + forced)
+
+    w = who_list(cfg)
+    notes.append("能用文件能力的会话：**我自己发的消息**"
+                 + (f" + 名单：{'、'.join(w)}" if w else "（`files.who` 是空的）"))
+    if w:
+        notes.append("‼️ `files.who` 名单里的会话，**别人**发的消息也算 —— "
+                     "对方说一句话就能改你硬盘上的文件。确认名单里都是可信的人。")
+
+    # ⚠️ `file:`（读文件的上限）与 `files:`（本能力的范围）**只差一个字母**。
+    # 写错段名不会报错，只会让配置**静默失效** —— 那种失效最难查，所以喊出来。
+    fr = (cfg or {}).get("file")
+    if isinstance(fr, dict):
+        stray = sorted(set(fr) & _OUR_KEYS)
+        if stray:
+            notes.append(f"‼️ `file:` 段里出现了本能力的键（{'、'.join(stray)}）—— "
+                         f"`file` 和 `files` **只差一个字母**，这多半是段名写错了，"
+                         f"那几项设置**没有生效**。")
+    return notes
 
 
 def register(registry=None):

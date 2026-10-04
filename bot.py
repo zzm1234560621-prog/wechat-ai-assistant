@@ -2722,6 +2722,15 @@ def main():
     # 「环境就绪了」，比如去连 MCP server 拉 tools/list）。异常由 emit 兜住。
     plugins.REGISTRY.emit("on_start", cfg, cfg=cfg)
 
+    # 文件能力开机自报（`docs/computer-files-spec.md` 第三节）。默认值是**宽**的
+    # （用户口径：默认全盘、读写免确认），所以必须让用户看见宽在哪 ——
+    # 本项目的既有规矩是「边界可以宽，但用户必须知道它宽在哪」，**静默地宽最坏**。
+    try:
+        for _note in files.startup_notes(cfg):
+            print(f"[files] {_note}")
+    except Exception:
+        traceback.print_exc()
+
     # 只读状态页（默认关闭，见 config.yaml 的 status 段）。
     # **只渲染内存快照、绝不查库**，所以它不违反「hook 不支持并发」那条铁律。
     # 只允许绑回环地址；status_page 自己会拒绝其它地址。
@@ -2816,8 +2825,12 @@ def main():
             # `before_reply`：定时的「提问」也是一次**模型答复**，同样要过一遍。
             # 挂在「模型答复」这一层而不是挂在 send()，理由见主循环那处
             # —— 确认菜单和群发预览必须原样直发。
+            #
+            # `from_self=True`：定时任务是**用户自己**在控制会话里建的（`/定时`），
+            # 那句话是用户的指令、不是别人发来的消息，所以它算「我自己发的」。
+            # 不给这个事实的话，控制类能力（文件）会把定时任务判成「不是我的消息」而拒绝。
             answer = plugins.REGISTRY.before_reply(
-                answer, plug_ctx(control_chat, query=question), cfg=cfg)
+                answer, plug_ctx(control_chat, from_self=True, query=question), cfg=cfg)
             dialog_append(control_chat, "user", question, cfg)
             dialog_append(control_chat, "assistant", answer, cfg)
             if changed:

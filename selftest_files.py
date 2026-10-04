@@ -134,10 +134,14 @@ def test_path_model():
 
 # ─────────────────────────────────────────────── 2. 读类动作
 
-def _run(args, cfg, chat=None):
-    """跑一次 `computer_files`。**`chat` 只在需要确认的动作上才重要** ——
-    没有它，确认类动作会如实拒绝（队列是按会话分的），那个分支本身也有断言。"""
-    ctx = {"cfg": cfg}
+def _run(args, cfg, chat=None, from_self=True):
+    """跑一次 `computer_files`。
+
+    默认 `from_self=True` —— 模拟「**我自己**在微信里说的这句话」，那是最常见的
+    正常用法。触发者闸门的拒绝路径有专门一组断言（见第 7 节），它们显式传别的值。
+    `chat` 只在需要确认的动作上才重要：没有它，确认类动作会如实拒绝（队列按会话分）。
+    """
+    ctx = {"cfg": cfg, "from_self": from_self}
     if chat is not None:
         ctx["chat"] = chat
     return files.handler(args, ctx)
@@ -359,7 +363,8 @@ def test_delete_recycle():
         v2 = _mk(os.path.join(td, "victim2.txt"), "bye")
         # ⚠️ 关键：**即使把 delete 从 files.confirm 里删掉也必须拦住**
         cfg = {"files": {"confirm": []}}
-        out = files.handler({"action": "delete", "path": v1}, {"cfg": cfg, "chat": chat})
+        out = files.handler({"action": "delete", "path": v1},
+                            {"cfg": cfg, "chat": chat, "from_self": True})
         ok &= check("`files.confirm: []` 时 delete **仍强制确认**（配置说了不算）",
                     "还没有执行" in out and os.path.exists(v1), out)
         ok &= check("…`warn_forced` 明说「已强制加回」",
@@ -372,7 +377,8 @@ def test_delete_recycle():
                     "回收站" in agent_tools.describe_pending(
                         agent_tools.list_pending(chat, 300)[0]))
 
-        files.handler({"action": "delete", "path": v2}, {"cfg": cfg, "chat": chat})
+        files.handler({"action": "delete", "path": v2},
+                      {"cfg": cfg, "chat": chat, "from_self": True})
         pend = agent_tools.list_pending(chat, 300)
         ok &= check("删**另一个**文件 → **不判重**、队列里两条（key_fields 直证）",
                     len(pend) == 2, len(pend))
@@ -396,6 +402,87 @@ def test_delete_recycle():
     return ok
 
 
+def test_who_gate():
+    print("\n── 7 · 触发者闸门：只认我发的 + 点名授权的会话 ──")
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        f = _mk(os.path.join(td, "a.txt"), "x")
+        args = {"action": "list", "path": td}
+
+        # 「我自己发的消息」→ 允许（默认口径）
+        out = _run(args, {}, chat="filehelper", from_self=True)
+        ok &= check("我自己发的消息 → 允许", "a.txt" in out, out[:120])
+
+        # 名单里的会话 → 允许（哪怕不是我自己发的）——这就是「指定对话」的含义
+        cfg = {"files": {"who": ["wxid_someone"]}}
+        out = _run(args, cfg, chat="wxid_someone", from_self=False)
+        ok &= check("`files.who` 名单里的会话 → 允许（哪怕消息不是我发的）",
+                    "a.txt" in out, out[:120])
+
+        # 不在名单、又不是我发的 → 拒绝，且**说清怎么放开**
+        out = _run(args, {}, chat="wxid_stranger", from_self=False)
+        ok &= check("不在名单、又不是我发的 → **拒绝**", "不能用" in out, out)
+        ok &= check("…并说清怎么放开（files.who）", "files.who" in out, out)
+        ok &= check("…并提醒别把不可信的人加进去",
+                    "改你硬盘上的文件" in out, out)
+
+        # ⚠️ from_self = None（「不知道」）**绝不许当成 True**
+        out = _run(args, {}, chat="wxid_stranger", from_self=None)
+        ok &= check("`from_self` 是 None（不知道）→ **照样拒绝**，不许当 True",
+                    "不能用" in out, out)
+
+        # 闸门在最前面：被拒时**不会**碰文件系统
+        out = _run({"action": "write", "path": os.path.join(td, "nope.txt"), "text": "x"},
+                   {}, chat="wxid_stranger", from_self=False)
+        ok &= check("被拒的写请求**一个字都没写**",
+                    not os.path.exists(os.path.join(td, "nope.txt")), out)
+
+        # 没有 from_self 这个键（老调用方）→ 也是拒绝，不是放行
+        out = files.handler(args, {"cfg": {}, "chat": "wxid_x"})
+        ok &= check("ctx 里根本没有 `from_self` 时也是拒绝（fail-safe）",
+                    "不能用" in out, out)
+    return ok
+
+
+def test_startup_notes():
+    print("\n── 8 · 启动告警：默认值很宽，必须让用户看见宽在哪 ──")
+    ok = True
+
+    notes = files.startup_notes({"files": {"roots": [], "who": []}})
+    text = "\n".join(notes)
+    ok &= check("全盘 → **‼️ 明说「全盘 = 几乎任何文件都能读写」**",
+                "全盘" in text and "任何文件" in text, text)
+    ok &= check("…并指路怎么收窄（files.roots）", "files.roots" in text, text)
+    ok &= check("…报出要确认的动作清单", "要用户确认的" in text, text)
+    ok &= check("…报出能用文件能力的会话", "我自己发的消息" in text, text)
+
+    notes = files.startup_notes({"files": {"roots": ["C:/x"], "deny": []}})
+    text = "\n".join(notes)
+    ok &= check("deny 置空 → ‼️ 明说连系统目录都不挡了",
+                "连系统目录都不挡" in text, text)
+    ok &= check("roots 非空 → 不打「全盘」那条", "全盘" not in text, text)
+
+    notes = files.startup_notes({"files": {"confirm": []}})
+    ok &= check("confirm 里没有 delete → ‼️ 明说「已强制加回」",
+                any("强制加回" in n for n in notes), notes)
+    ok &= check("…并且仍然报出 delete 要确认（强制项）",
+                any("delete" in n and "要用户确认的" in n for n in notes), notes)
+
+    notes = files.startup_notes({"files": {"who": ["wxid_friend"]}})
+    ok &= check("who 非空 → ‼️ 明说「名单里别人发的也算」",
+                any("别人" in n and "改你硬盘上的文件" in n for n in notes), notes)
+
+    # ⚠️ `file:`（读文件上限）与 `files:`（本能力范围）只差一个字母
+    notes = files.startup_notes({"file": {"roots": ["C:/x"]}, "files": {}})
+    ok &= check("段名写错（把本能力的键写进了 `file:`）→ ‼️ 告警说**没有生效**",
+                any("只差一个字母" in n and "没有生效" in n for n in notes), notes)
+
+    ok &= check("关着时不打一堆范围告警，只说「关着 + 怎么开」",
+                len(files.startup_notes({"files": {"enabled": False}})) == 1,
+                files.startup_notes({"files": {"enabled": False}}))
+    return ok
+
+
 def main():
     print("电脑文件能力回归（`files.py`）")
     print("=" * 66)
@@ -405,6 +492,8 @@ def main():
     test_switch_and_contract()
     test_write_gate()
     test_delete_recycle()
+    test_who_gate()
+    test_startup_notes()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")
