@@ -1483,6 +1483,47 @@ def t_help_matches_reality():
             f"{must} 既能发、也写进了 /help")
 
 
+def t_help_args_really_work():
+    """帮助里 promote 的**参数写法**必须真的被接受。
+
+    为什么单独立一条：上面那条只查得到**命令词**，查不到参数。而这次改英文时
+    我在参数上连踩两次，都属于「看起来对」：
+
+    * `/groups append ...` —— 没有 append（`add` 本身就是「不存在就建」）；
+    * `/bot features` —— 不认，接受的是 `功能 / 菜单 / menu / help / ? / 列表`。
+
+    判据用「回了没认出来 / 回了用法」而不是比对具体文案 —— 这样措辞改了不会假红，
+    但「promote 了做不到的写法」一定会红。**只挑只读的调用**，
+    会改配置的子命令（add/del/on/off）不在这里跑。
+    """
+    sec("帮助里 promote 的参数写法都真的被接受")
+    # ⚠️ **必须换掉 DIALOG_PATH**：`/clear all` 会清空并写盘，照真实路径跑就会把
+    # 用户**现有**的对话记忆清掉。第一版就是照真实路径跑的 —— 只是当时记忆恰好是空的
+    # 才没出事（真数据，不是测试夹具；不能靠运气）。
+    tmp = tempfile.mkdtemp(prefix="bot_helpargs_selftest_")
+    saved_path, saved_mem = bot.DIALOG_PATH, bot._DIALOG
+    bot.DIALOG_PATH = os.path.join(tmp, "dialog.json")
+    bot._DIALOG = None
+    try:
+        cases = (
+            ("/bot menu", {}),
+            ("/groups labels", {}),
+            ("/watch keyword", {}),
+            ("/usage 7", {}),
+            ("/budget", {}),
+            ("/assets", {}),
+            ("/schedule", {}),
+            ("/clear all", {}),
+        )
+        for text, cfg in cases:
+            reply, _ = bot.handle_command(text, None, cfg, False, [])
+            bad = (not reply) or ("没认出来" in reply) or (reply.strip().startswith("用法："))
+            chk(not bad, f"{text} 真的被接受（实际：{str(reply)[:60]!r}）")
+    finally:
+        bot.DIALOG_PATH, bot._DIALOG = saved_path, saved_mem
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_clear_command():
     """`/clear` 清对话记忆 —— **只清记忆，别的什么都不许动**。
 
@@ -1571,6 +1612,7 @@ def main():
     t_from_self_reaches_toolbox()
     t_clear_command()
     t_help_matches_reality()
+    t_help_args_really_work()
 
     print("\n" + "=" * 60)
     if _FAIL:

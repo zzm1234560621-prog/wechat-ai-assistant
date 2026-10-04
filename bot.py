@@ -216,7 +216,7 @@ HELP_TEXT = (
     "`/素材`=`/assets`），参数里的中文（时间、人名、内容）照旧。\n"
     "\n"
     "/bot            **控制台**：一屏看全部功能的当前状态（还能 /bot <功能名> 直接控制）\n"
-    "/bot features   列出所有可控制的功能\n"
+    "/bot menu       列出所有可控制的功能（等价写法：/bot 功能 / /bot 菜单）\n"
     "/provider       列出可选服务商（DeepSeek / Claude / 通义 / Kimi / GLM …）\n"
     "/provider <编号> 选一个服务商，自动配好协议+接口+模型\n"
     "/api <key>      设置 API Key（会自动测一次连通性）\n"
