@@ -218,7 +218,9 @@ authority = 用户未要求 strict TDD、项目也未规定 test-first。
   - 不在名单里 → **如实拒绝并说清**，绝不静默降级
   - 两份 config：本机按用户口径（全盘 / 控制会话+指定 / `[delete, overwrite]`）；
     **示例**用保守默认（桌面/文档/下载、只控制会话、全部写类要确认）
-  - 两份 config **都要加 `files:` 段和教 `computer_files` 的 system_prompt 指导**
+  - 两份 config **只加 `files:` 段**。⚠️ **`computer_files` 的模型指导不抄进
+    system_prompt** —— 它用契约的 `guidance` 随工具定义走（`bot.system_now()` 拼进去）。
+    抄两份正是「同一个指导存两处、漏一处就静默失效」那个老 bug 的形状
   - 边界放宽时启动打告警
 - **兼容**：`selftest_tool_registry.py` 第 4 项查的是**段对齐**不是值相等，两份用不同默认值合规
 - **验证**：扩展 `selftest_files.py` + 跑 `selftest_tool_registry.py`

@@ -2580,8 +2580,13 @@ def main():
 
         为什么是函数：`system` 只在启动和 reload_cfg 时更新，而 bot 会连跑好几天
         ——把那行时间缓存进 `system` 就等于给它一个会过期的假时间。
+
+        插件/契约注册的工具**自带的 `guidance`** 在这里拼进去 —— 拼在**时间之前**：
+        时间必须留在末尾（既有回归钉着这一点），而指导是静态的、放前面即可。
+        `inject_guidance` 在没有自带指导时**逐字返回原文**，所以没有插件时
+        这段提示和以前完全一样。
         """
-        return with_now(system)
+        return with_now(plugins.REGISTRY.inject_guidance(system))
 
     # 自动回复：代替我本人回这些会话
     auto_on = auto_reply.enabled(cfg)

@@ -599,6 +599,34 @@ def test_pending_kind():
     return ok
 
 
+def test_guidance_reaches_model():
+    print("\n── 10 · guidance 必须**真的**送出去（存了不送比不存更坏）──")
+    ok = True
+
+    reg = plugins.Registry()
+    ok &= check("没有自带指导时，系统提示**逐字不变**（零行为变化）",
+                reg.inject_guidance("原文") == "原文"
+                and reg.guidance_text() == "", reg.guidance_text())
+    ok &= check("非字符串的 system 不炸（当空串）",
+                reg.inject_guidance(None) == "")
+
+    reg.register_tool(_good_plugin_spec("g_tool", guidance="用户问天气时必须调用本工具。"),
+                      source="p1")
+    txt = reg.inject_guidance("原文")
+    ok &= check("自带指导被拼进系统提示，且**带工具名**（模型要知道是哪个工具）",
+                "原文" in txt and "g_tool" in txt
+                and "用户问天气时必须调用本工具。" in txt, txt)
+
+    # 接线点只有一个：`bot.system_now()`。用源码级断言钉住（本项目既有惯例，
+    # 见 selftest_bot_loop 里「四条调用路都走 system_now()」那条）。
+    src = open(os.path.join(BASE, "bot.py"), "r", encoding="utf-8").read()
+    ok &= check("`bot.system_now()` 确实调了 inject_guidance（唯一的注入点）",
+                "plugins.REGISTRY.inject_guidance(system)" in src)
+    ok &= check("注入点在**时间之前**（时间必须留在末尾，既有回归钉着）",
+                "with_now(plugins.REGISTRY.inject_guidance(system))" in src)
+    return ok
+
+
 def main():
     print("插件契约回归（`plugins.py`）")
     print("=" * 66)
@@ -611,6 +639,7 @@ def main():
     test_scoped_source()
     test_events()
     test_pending_kind()
+    test_guidance_reaches_model()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

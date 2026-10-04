@@ -246,6 +246,37 @@ class Registry:
         """内置工具的名字（按注册顺序）。给自测做「零行为变化」比对用。"""
         return [n for n in self._order if self._tools[n]["source"] == "builtin"]
 
+    # ------------------------------------------------------------ 模型指导
+
+    def guidance_text(self):
+        """把各工具自带的 `guidance` 拼成一段给模型看的文字。
+
+        **这就是 `guidance` 存在的全部意义** —— 只把它存进注册表、不送出去，
+        等于**装作处理了**那个老 bug：2026-10-02 `send_asset` 的 8 行指导只加进了
+        本机 `config.yaml`，`config.example.yaml` 一个字都没有，于是开发机上好用、
+        发布包里静默失效。存了不送**比不存更坏**：看代码的人会以为这条路是通的。
+
+        内置工具的 `guidance` 是空的（它们的指导在两份 config 的 `system_prompt` 里，
+        那是既有设计、用户能自己改措辞）；这段文字只装**自带指导的工具**
+        （插件 + 走契约注册的核心模块，如 `files.py`）。
+        """
+        lines = [f"【{n}】{self._tools[n]['guidance']}"
+                 for n in self._order if self._tools[n]["guidance"]]
+        if not lines:
+            return ""
+        return ("\n\n# 工具用法（由工具定义自带，别手改这一节）\n" + "\n".join(lines))
+
+    def inject_guidance(self, system):
+        """把 `guidance_text()` 接到系统提示后面。没有自带指导时**逐字不变**。
+
+        调用方（`bot.system_now`）会把**真实时间**再拼到最后 —— 时间必须留在
+        末尾（既有回归钉着「拼在系统提示末尾，原文一个字不动」），而且它是最
+        容易过期的一条，放最后最不容易被忽略。
+        """
+        base = system if isinstance(system, str) else ""
+        g = self.guidance_text()
+        return (base + g) if g else base
+
     def rollback_source(self, source):
         """把某个 `source` 注册的东西**全部**撤掉（工具 + 事件 + 待确认种类），
         返回被撤掉的工具名。

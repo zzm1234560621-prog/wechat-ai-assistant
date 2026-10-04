@@ -271,6 +271,7 @@ MCP 客户端 / IDE 桥恰好就是「注册工具 + 读自己的配置 + 做 I/
 | 慢插件自动停用 | 连续超 `slow_ms` 达 `disable_after` 次 → 该插件被停用且**明说原因** |
 | 插件走确认闸 | `confirm="always"` 的插件工具 → 只 `set_pending`，**一个字都不执行** |
 | guidance 必须非空 | 缺 `guidance` 的插件工具 → 加载失败（不是静默无指导） |
+| guidance **真的送出去** | 注册了自带指导的工具 → `inject_guidance(原文)` 里出现该工具名与指导；**没有自带指导时逐字不变**（零行为变化）；`bot.system_now()` 是唯一注入点、且拼在**时间之前** |
 | 判重键并入 | 声明了 `key_fields` 的 kind：两条**不同**动作不判重、两条**逐字相同**的仍判重 |
 | `key_fields` 必填 | `register_pending_kind` 不给 `key_fields` → 加载失败（不许静默套用旧元组） |
 | `worker` 模式 | 声明 `mode="worker"` 的插件 → **加载失败并明说「本轮未实现」**；反向证明它**没有**被静默当成 `inline` 跑 |

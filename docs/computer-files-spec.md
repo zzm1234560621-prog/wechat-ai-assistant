@@ -199,7 +199,7 @@
 | `agent_tools.send_pending` | 新增 `fileop` 分支 → `files.apply(item, cfg)`；`kind=="file"` 分支的 `allowed_dirs` 二次校验要**同时认 `files.path_ok`**（登记到确认之间配置可能变） |
 | `agent_tools.t_send_file` | 定位口径放宽为 `msg/file/` ∪ `files.path_ok`；**磁盘来源一律进确认队列、跳过名单直发那条分支**（2.1） |
 | `bot.py` 主循环 | 把「这条消息是否 `from_self`」与 `files.who` 判定结果传进 `run_agent`/`ToolBox` |
-| `config.yaml` + `config.example.yaml` | 两份都要加 `files:` 段**和**教 `computer_files` 的 system_prompt 指导 |
+| `config.yaml` + `config.example.yaml` | 两份都要加 `files:` 段。⚠️ **`computer_files` 的模型指导不抄进 system_prompt**：它随工具定义走（`plugins` 契约的 `guidance`，由 `bot.system_now()` 拼进系统提示）—— 抄两份正是「同一个工具指导存两处」那个老 bug 的形状 |
 | `CLAUDE.md` | ⚠️ **先腾空间**（现 65156/65536 字节，只剩 380）—— 见插件规格第八节 |
 
 > ⚠️ **`restore_pending` 的坑再强调一次**：它是**逐字段白名单**传参的
