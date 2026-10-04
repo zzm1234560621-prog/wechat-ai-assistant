@@ -44,42 +44,55 @@
 
 ## 部署说明
 
-**环境**：Windows 10/11 64 位 · 微信 PC **4.1.10.27** · Python **3.11**（3.8~3.12 可用）
+**环境**：Windows 10/11 64 位 · 微信 PC **4.1.10.27** · **64 位 Python 3.11**（3.8~3.12 可用）
 
 ```powershell
 git clone https://github.com/zzm1234560621-prog/wechat-ai-assistant.git
 cd wechat-ai-assistant
 ```
 
-### 第一步：装 hook（需要管理员权限）
+### 一键部署：双击 `助手.bat`，按 `9`，一路回车
 
-**最省事**：右键 `助手.bat` → 以管理员身份运行 → 按 `[9]`「一键配置」，然后**一路回车**：
-装 hook → 装依赖 → 启动 → 配模型，四件事一次走完。
+**就这三个动作。** 按 `[9]`「一键配置」后它按真实顺序自己做完四件事：
 
-想分步做：
+```
+双击 助手.bat  →  按 9  →  一路回车
+                   │
+                   ├─ ① 装 hook 进微信（会弹 UAC，点「是」）
+                   ├─ ② 装 Python 依赖（自动建虚拟环境，要联网，第一次几分钟）
+                   ├─ ③ 启动助手
+                   └─ ④ 就地配模型（选服务商 + 填 API Key，不用去微信里打字）
+```
+
+- **唯一的前提**：这台电脑要有 **64 位 Python**（`助手.bat` 找不到 `python` 会直接报错）。
+  没装就跑 `winget install -e --id Python.Python.3.11`（装的时候勾上 **Add to PATH**）。
+- 微信版本要是 **4.1.10.27**（微信里「设置 → 关于微信」看一眼）。不是就先装仓库自带的那份
+  `installers\wechat-4.1.10.27\WeChatWin_4.1.10.27.exe`。
+- 装完**重启微信**，浏览器打 `http://127.0.0.1:30001/QueryDB/status`，返回 JSON 就说明 hook 通了
+  （`IsLogin: 1` = 已登录）。然后去微信「文件传输助手」发一句话就能用。
+
+### 分步做（一键失败、或想自己控制每一步）
+
+<details>
+<summary>点开：手动装 hook / 装依赖 / 起 bot / 配模型</summary>
+
+**① 装 hook（这一步要管理员）** —— 以管理员身份打开 PowerShell，再跑：（一键配置那条路不用自己提权，它会弹 UAC）
 
 ```powershell
 Set-Location installers\wechat-4.1.10.27
 
-# 微信版本不是 4.1.10.27 时，先装仓库里自带的那份（静默安装，日志 install-log.txt）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\do_install.ps1
-
-# 把 version.dll 放进微信安装目录，并用 ACL 挡住微信自动更新（日志 hook-install-log.txt）
+# 放 version.dll + 用 ACL 挡住微信自动更新（日志 hook-install-log.txt）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\do_hook_install.ps1
+
+# 微信不是 4.1.10.27 时才需要：静默安装仓库自带的那份（日志 install-log.txt）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\do_install.ps1
 ```
 
-这组脚本会**自动探测**微信安装目录和登录用户，换电脑、换盘都不用改。
-**重启微信**，然后确认 hook 已经加载：
+脚本自动探测微信安装目录和登录用户，换电脑、换盘都不用改。装完**重启微信**，
+打 `http://127.0.0.1:30001/QueryDB/status` 能返回 JSON 就成了（连不上：DLL 没放对 / 微信版本不对 /
+被安全软件拦了）。想摘掉 hook：`do_remove_hook.ps1`，或把微信目录里的 `version.dll` 改名后重启微信。
 
-```
-GET http://127.0.0.1:30001/QueryDB/status
-```
-
-返回 JSON 就是加载成功（`IsLogin: 1` 表示已登录）。连不上就是 hook 没生效：DLL 没放对 /
-微信版本不对 / 被安全软件拦了。
-想临时摘掉 hook：跑 `do_remove_hook.ps1`，或把微信目录里的 `version.dll` 改名后重启微信。
-
-### 第二步：装 Python 环境
+**② 装 Python 依赖**
 
 ```powershell
 # 双击 install.bat：建虚拟环境 → 按 requirements.txt 装依赖 → 生成 启动助手.bat
@@ -88,12 +101,10 @@ py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### 第三步：启动
+**③ 启动**：双击 `启动助手.bat`（窗口关了就停）；后台常驻用 `助手.bat` → `[3]`，
+开机自启用 `助手.bat` → `[8]` → `[6]`。
 
-双击 **`启动助手.bat`**（窗口关了就停）；想后台常驻就用 `助手.bat` → `[3] 启动`，
-再在 `[8] 更多` 里开开机自启。
-
-### 第四步：配模型（在微信「文件传输助手」里发）
+**④ 配模型**：`助手.bat` → `[8]` → `[1]`，或双击 `配置模型.bat`；也可以在微信「文件传输助手」里发：
 
 ```
 /provider         列出可选服务商
@@ -102,6 +113,8 @@ py -3.11 -m venv .venv
 ```
 
 配完直接在微信里发消息提问即可。全部命令发 `/help` 看。
+
+</details>
 
 ### 给别的电脑装
 
