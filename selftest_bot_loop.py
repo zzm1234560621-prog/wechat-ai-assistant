@@ -12,8 +12,10 @@
 跑法：.venv/Scripts/python.exe selftest_bot_loop.py
 """
 import contextlib
+import inspect
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1441,6 +1443,46 @@ def t_from_self_reaches_toolbox():
         plugins.REGISTRY.rollback_source("_selftest_bot_loop")
 
 
+def t_help_matches_reality():
+    """`/help` 里写的每个命令都必须**真的能发** —— 文档不许写没实现的东西。
+
+    ## 为什么专门钉这一条
+
+    2026-10-04 把命令词换成英文时，我第一版就写错两处，而且都是**看起来对**的：
+
+    * 编了一个 `/groups append ...`（实际只有 `add`/`create`，而 `add` 本身就是
+      「不存在就建」）；
+    * 写了 `/groups` 和 `/assets`（复数），而分派里当时只有 `/group`、`/asset`
+      —— **复数根本发不出去**。
+
+    这种错最坏的地方在于它**不报错**：用户照着敲，得到一句「没懂」，
+    然后以为是自己的问题。所以这里把「帮助里出现的每个 `/xxx`」和
+    「`handle_command` 真正分派的命令字面量」对一遍。
+    """
+    sec("`/help` 与实现一致（文档不许写不存在的东西）")
+    src = inspect.getsource(bot.handle_command)
+    known = set(re.findall(r'"(/[^"]*)"', src))
+    # ⚠️ 从**行首**取命令。两个坑都踩过：
+    # ① 别满篇找 `/xxx` —— 正文里的「分片/hook/发送」会被当成 `/hook`（假阳性）；
+    # ② 别拿 `"/xxx` 去匹配 —— `HELP_TEXT` 在**运行期是拼接后的值**，
+    #    里面一个 `"` 都没有（引号只在源码里），那样会匹配到 0 个命令、
+    #    于是「不存在的：[]」是**空列表通过**（空的回归比没有更坏）。
+    documented = set()
+    for line in bot.HELP_TEXT.splitlines():
+        m = re.match(r"/([a-z][a-z0-9_]*)", line.strip())
+        if m:
+            documented.add(m.group(1))
+    documented = sorted(documented)
+    chk(len(documented) >= 15, f"真的从帮助里取到了命令（取到 {len(documented)} 个）")
+    missing = [w for w in documented if "/" + w not in known]
+    chk(not missing, f"/help 里的英文命令都真的能发（不存在的：{missing}）")
+
+    # 反向：新加命令时别让它悄悄不出现在帮助里（用户永远发现不了它）
+    for must in ("/clear", "/schedule", "/watch", "/groups", "/assets", "/selfcheck"):
+        chk(must in known and must[1:] in bot.HELP_TEXT,
+            f"{must} 既能发、也写进了 /help")
+
+
 def t_clear_command():
     """`/clear` 清对话记忆 —— **只清记忆，别的什么都不许动**。
 
@@ -1528,6 +1570,7 @@ def main():
     t_now_line()
     t_from_self_reaches_toolbox()
     t_clear_command()
+    t_help_matches_reality()
 
     print("\n" + "=" * 60)
     if _FAIL:
