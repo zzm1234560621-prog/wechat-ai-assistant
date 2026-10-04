@@ -627,6 +627,29 @@ def test_guidance_reaches_model():
     return ok
 
 
+def test_plugins_dir_name():
+    print("\n── 11 · `plugins.py` 与 `plugins/` 目录同名 —— 必须解析成那个模块 ──")
+    ok = True
+    # 同目录下既有 `plugins.py`（模块）又有 `plugins/`（目录，无 __init__.py）。
+    # CPython 的 FileFinder 让**普通模块**胜出，所以现在是对的 —— 但这够脆：
+    # 谁哪天往 `plugins/` 里放一个 `__init__.py`，`import plugins` 就会变成那个包，
+    # 而报错会以「REGISTRY 不见了」这种**很费解**的形式出现。钉住它。
+    ok &= check("import plugins 拿到的是 plugins.py（不是同名的命名空间包）",
+                str(getattr(plugins, "__file__", "")).endswith("plugins.py")
+                and not hasattr(plugins, "__path__"),
+                getattr(plugins, "__file__", None))
+    ok &= check("`REGISTRY` 在（确认是我们那个模块）", hasattr(plugins, "REGISTRY"))
+
+    d = plugins.plugins_dir()
+    ok &= check("插件目录存在，且放着 `_example.py` 模板",
+                os.path.isdir(d) and os.path.isfile(os.path.join(d, "_example.py")), d)
+    ok &= check("模板**不**被加载（`_` 前缀）",
+                "_example" not in plugins.REGISTRY.names())
+    ok &= check("`plugins/` 里**不许**有 `__init__.py`（会让上面的解析翻车）",
+                not os.path.isfile(os.path.join(d, "__init__.py")))
+    return ok
+
+
 def main():
     print("插件契约回归（`plugins.py`）")
     print("=" * 66)
@@ -640,6 +663,7 @@ def main():
     test_events()
     test_pending_kind()
     test_guidance_reaches_model()
+    test_plugins_dir_name()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

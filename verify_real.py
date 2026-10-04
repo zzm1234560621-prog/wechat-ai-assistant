@@ -309,9 +309,15 @@ def main():
     # ---------- 收尾 ----------
     print("\n" + "=" * 66)
     print(f"查询次数：约 {len(QUERY_BUDGET_NOTE)} 次（{ '、'.join(QUERY_BUDGET_NOTE) }）")
-    print("还有两件只能你本人做的：")
+    print("还有三件只能你本人做的：")
     print("  1) 起 bot，在文件传输助手里发一句话，再发 /用量 和 /status 看有没有数据")
     print("  2) 用真 hook 发一张**聊天里已有的图**（先按上面提示把 send_image_dirs 清成 []）")
+    # 第 3 项是**人工确认项**（`docs/computer-files-spec.md` 第九节）：
+    # 「删除真的进了回收站」这一条**自测证不了** —— 要枚举回收站得走 Shell COM，
+    # 代价过大。自动测只能证「FOF_ALLOWUNDO 旗标对 + 原路径消失」。
+    # 所以不假装验证过，而是**明确列出来让人看一眼**。
+    print("  3) 删一个不重要的测试文件（在微信里对它说「把 xxx 删了」，回「确认」），")
+    print("     然后**去回收站看一眼它在不在** —— 这一条自测证不了（见 docs/computer-files-spec.md）。")
     print("=" * 66)
     return _summary()
 

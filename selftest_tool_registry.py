@@ -146,13 +146,52 @@ def main():
             check("开发机这份 system_prompt 也教到了每个工具",
                   not miss_live, f"本地缺：{miss_live}")
 
+    # ── 5 · 按**契约**注册的工具（插件 + `files.py` 这类核心消费者）──────────
+    #
+    # 为什么和上面四项**分开查**：示例 config 的 system_prompt 不可能预先写上一个
+    # 第三方插件的名字，所以第 3 项那条检查对它们天然不适用。这不是放松 ——
+    # 契约要求它们的指导**随定义自带**（`guidance`），比写在示例 config 里
+    # **更靠近定义**，而这条正是 `send_asset` 那次静默失效的根治办法。
+    print("── 5 · 按契约注册的工具：自带 guidance + 不与内置重名 ──")
+    try:
+        import files            # noqa: F401  导入即注册 computer_files
+    except ImportError:
+        print("  ℹ️  没有 files.py（这一项跳过）")
+    import plugins
+
+    contract = [t for t in plugins.REGISTRY.tools()
+                if plugins.REGISTRY.get(t["name"])["source"] != "builtin"]
+    if not contract:
+        skill("没有任何按契约注册的工具")
+    else:
+        no_g = [t["name"] for t in contract
+                if not (plugins.REGISTRY.get(t["name"]).get("guidance") or "").strip()]
+        check(f"{len(contract)} 个契约工具都自带 guidance（示例 config 不可能预先教到它们）",
+              not no_g,
+              f"缺 guidance：{no_g}（插件名不可能预先写在 config.example.yaml 里，"
+              f"所以指导必须随定义走）")
+
+        clash = sorted({t["name"] for t in contract} & set(names))
+        check("契约工具没有和内置 TOOLS 重名", not clash, f"撞名：{clash}")
+
+        shape = {tuple(sorted(t.keys())) for t in contract}
+        check("契约工具的形状与内置同形（name/description/parameters）",
+              shape <= {("description", "name", "parameters")}, shape)
+
+        # ⚠️ **存了必须真的送出去**：`guidance_text()` 就是那条送出的路
+        # （`bot.system_now()` 把它拼进系统提示）。只存不送等于**装作处理了**
+        # 那个老 bug，而且比不存更坏 —— 看代码的人会以为这条路是通的。
+        sent = plugins.REGISTRY.guidance_text()
+        miss = [t["name"] for t in contract if t["name"] not in sent]
+        check("这些 guidance **真的会进系统提示**（存了不送比不存更坏）",
+              not miss, f"送不出去的：{miss}")
+
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")
         return 0
     print("有失败项 ❌")
     return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
