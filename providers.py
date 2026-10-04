@@ -45,13 +45,15 @@ PROVIDER_PRESETS = [
     },
     {
         "short": "智谱 GLM",
-        "name": "智谱 GLM",
+        "name": "智谱 GLM（glm-4-flash-250414 免费）",
         "provider": "openai",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "model": "glm-4-flash",
-        "models": ["glm-4-flash", "glm-4-plus"],
+        "model": "glm-4-flash-250414",
+        "models": ["glm-4-flash-250414", "glm-4.7-flash"],
         "key_url": "https://open.bigmodel.cn",
-        "note": "glm-4-flash 有免费额度",
+        "note": "**这两个都免费**（官方定价页标「免费」，2026-10-04 核）。默认 250414：实测连打 6 次全成功、"
+                "0.2~0.5s、工具调用正常。glm-4.7-flash 更聪明但**限流严重**（实测 6 次里 4 次 429），"
+                "且默认开思考会把输出预算吃光。⚠️ 都**只收文本、不收图**",
     },
     {
         "short": "OpenAI",
@@ -72,6 +74,25 @@ PROVIDER_PRESETS = [
         "models": ["qwen2.5", "llama3.1", "gemma2"],
         "key_url": "无需 key（随便填 ollama）",
         "note": "需先装 Ollama 并 ollama pull 一个模型",
+    },
+    {
+        # 追加在**末尾**：中间的编号动了，已经记住「/provider 6 = OpenAI」的手就会配错。
+        "short": "OpenRouter",
+        "name": "OpenRouter（聚合，含免费档）",
+        "provider": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "models": ["nvidia/nemotron-3-ultra-550b-a55b:free",
+                   "qwen/qwen3.8-27b:free",
+                   "openrouter/free"],
+        "key_url": "https://openrouter.ai/settings/keys",
+        "note": "一个 key 通吃多家模型（key 形如 sk-or-v1-）。"
+                "⚠️ 免费档（id 以 :free 结尾）：**20 次/分、50 次/天**"
+                "（账号历史累计充值 ≥10 刀才放宽到 1000/天）；"
+                "免费上游多数会**拿提示词去训练**，而本助手每次请求里装的都是用户真实聊天记录"
+                "——要用免费档，先在 OpenRouter 账号里关掉训练授权，并建议打开 privacy.redact。"
+                "模型页把路由切成「highest tool-calling accuracy」：本助手全靠模型自己调工具，"
+                "路由太图便宜会把功能静默省没（自测判据：bot.log 里有没有 `[bot] 工具 …`）。",
     },
 ]
 

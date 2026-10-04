@@ -185,6 +185,17 @@ def t_pending_persist(tmp):
         chk(bot.restore_pending([chat], {"agent": {"confirm_ttl": ttl}}) == 0,
             "不在控制会话里的条目不恢复（不跨会话串台）")
 
+        # 盘上有**两条一模一样**的（旧版本留下的重复入队，2026-10-04 修）：只恢复一条。
+        # 不拦的话，用户重启后照着两条一样的菜单各确认一次，对方收到两份。
+        agent_tools._PENDING.pop(chat, None)
+        dup = {"to_wxid": "wxid_dup", "to_name": "王五", "text": "回执",
+               "kind": "agent", "count": 1, "ts": time.time()}
+        bot.state_set("pending", {chat: [dict(dup), dict(dup)]})
+        n_dup = bot.restore_pending([chat], {"agent": {"confirm_ttl": ttl}})
+        chk(n_dup == 1 and len(agent_tools.list_pending(chat, ttl)) == 1,
+            f"盘上两条一模一样的 → 只恢复一条（恢复 {n_dup} 条，"
+            f"队列 {len(agent_tools.list_pending(chat, ttl))} 条）")
+
         # 群发批次与素材指代必须**整条恢复**：只恢复 8 个基础字段的话，
         # 群发批次会变成「没有 items」，然后按文本分支把**给人看的预览**
         # 往一个**空 wxid** 发出去（真机上最难查的那种错）。
@@ -702,6 +713,40 @@ def t_broadcast_preview_note():
         bot.with_broadcast_preview("就一句话", "") == "就一句话")
     chk("没有预览且答复为空 -> 空串（别造出一条空消息）",
         bot.with_broadcast_preview("", "") == "")
+
+
+def t_auto_reply_truth_note():
+    """模型说「自动回复已关闭/已开启」而本轮**没改任何配置**时，必须追一句真话。
+
+    真机（2026-10-04）：用户连着说两次「关闭自动回复」「关闭王小明的自动回复啊」，
+    模型**没调 auto_reply 工具**，只回了一句「自动回复功能已经关闭。…」——
+    而 settings.json 里 `enabled` 一直是 true，于是它**继续**替用户回对方。
+    这里钉四件事：① 真没改 → 必须追加；② 真改了 → 一个字都不加；
+    ③ 如实解释现状 / 反问 → 不许追加（否则自相矛盾）；④ 空答复不造空消息。
+    """
+    sec("声称改了自动回复但没改 → 追一句真话（真机就是这么骗到用户的）")
+    lie = "自动回复功能已经关闭。如果您有其他需要帮助的地方，请告诉我。"
+    out = bot.with_auto_reply_truth_note(lie, False)
+    chk("说的和做的不一致 → 追加真话",
+        out.startswith(lie) and "其实没有改动自动回复" in out)
+    chk("真话里给出**能用**的命令（全局 / 单个）",
+        "/auto off" in out and "/auto del" in out)
+    chk("本轮真改过配置 → 一个字都不加",
+        bot.with_auto_reply_truth_note(lie, True) == lie)
+    chk("如实解释现状（「自动回复现在是关闭状态」）→ 不追加",
+        bot.with_auto_reply_truth_note("自动回复现在是关闭状态。", False)
+        == "自动回复现在是关闭状态。")
+    chk("反问 / 疑问（「你是想关闭自动回复吗」）→ 不追加",
+        bot.with_auto_reply_truth_note("你是想关闭自动回复吗？", False)
+        == "你是想关闭自动回复吗？")
+    chk("空答复 → 空串（别造出一条空消息）",
+        bot.with_auto_reply_truth_note("", False) == "")
+
+    sec("同一个姿势：声称「已提交命令」但没登记 → 追一句真话（老规矩，别删）")
+    shell = "好的，我已经提交这条命令，等你回「确认」后才真跑。"
+    chk("声称已提交而没登记 → 追加真话",
+        "还没有登记任何本地命令" in bot.with_shell_truth_note(shell, False))
+    chk("真登记过 → 一个字都不加", bot.with_shell_truth_note(shell, True) == shell)
 
 
 def _tiny_png(path):
@@ -1358,6 +1403,7 @@ def main():
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()
+    t_auto_reply_truth_note()
     t_now_line()
 
     print("\n" + "=" * 60)

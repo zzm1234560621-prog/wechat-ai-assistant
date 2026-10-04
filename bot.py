@@ -30,6 +30,7 @@ import executor
 import file_read
 import groups
 import live_history
+import plugins
 import settings
 import providers
 import read_worker
@@ -243,7 +244,8 @@ HELP_TEXT = (
     "/auto address <谁> [称呼]  你平时怎么叫他；不带=看，清空=不套称呼\n"
     "/auto address <谁> 学习    只学称呼，不动人设\n"
     "/auto persona 全局 [描述]  没单独设的人用的默认语气\n"
-    "（学到的称呼也是别名：「给老张发消息」能认出来）\n"
+    "（学到的称呼也是别名：「给老张发消息」能认出来；\n"
+    "  ⚠️ 称呼**不用**先把人加进名单——名单外的人也能设，设了不影响自动回复）\n"
     "/auto review on|off [谁] 开审核（草稿先发你，回「确认」才发）\n"
     "/auto ctx <1~30>         上下文条数\n"
     "\n"
@@ -273,6 +275,9 @@ HELP_TEXT = (
     "· 你只给出**意思** -> 按每个人的语气和称呼分别写一条。\n"
     "「所有人」= 你的所有好友，会**先确认范围**（那步一个字都不发），\n"
     "确认后才生成内容：免确认名单里的人直接收到，其余的人等你看过再发。\n"
+    "想**单独发给某个群里的每个人**：说「发给同学会群里每个人」就行\n"
+    "（助手用 to=\"群:同学会\"：那个群的成员一人一条，**不会**在群里发）。\n"
+    "⚠️ 而「在同学会群里发一条」是另一回事——整群可见的一条，不是一人一条。\n"
     "单次人数上限见 config.yaml 的 agent.broadcast_max（默认 100）。\n"
     "\n"
     "—— 分组（把联系人分好组，群发直接按组发）——\n"
@@ -1127,10 +1132,9 @@ def save_pending(chats, cfg=None):
     否则「用户已确认并执行/已发送」和「盘上还记着这条」之间就有个窗口，
     崩溃重启后那条会被恢复出来，可能被再执行一次。
     """
-    try:
-        ttl = int(((cfg or {}).get("agent") or {}).get("confirm_ttl", 300))
-    except (TypeError, ValueError):
-        ttl = 300
+    # 时效和「确认」分支、判重窗口**同一个解析**（agent_tools.confirm_ttl_of）：
+    # 几处不一致就会出现「盘上还记着、内存里已经过期」这种最难查的错。
+    ttl = agent_tools.confirm_ttl_of(cfg)
     snap = {}
     for c in list(chats or []):
         try:
@@ -1155,10 +1159,7 @@ def restore_pending(chats, cfg):
     data = state_get("pending")
     if not isinstance(data, dict):
         return 0
-    try:
-        ttl = int((cfg.get("agent") or {}).get("confirm_ttl", 300))
-    except (TypeError, ValueError):
-        ttl = 300
+    ttl = agent_tools.confirm_ttl_of(cfg)
     allowed = {str(c) for c in (chats or [])}
     now = time.time()
     n = 0
@@ -1174,7 +1175,9 @@ def restore_pending(chats, cfg):
             except (TypeError, ValueError):
                 continue
             try:
-                agent_tools.set_pending(
+                # `ttl` 传进去：恢复时也要判重（旧版本可能往盘上写了两条一样的）。
+                # 判重命中 = 这一份**没有**恢复（队列里已经有同一条了），不能算一条。
+                dupe = agent_tools.set_pending(
                     chat, it.get("to_wxid") or "", it.get("to_name") or "",
                     it.get("text") or "", kind=it.get("kind") or "agent",
                     count=it.get("count") or 1, image=it.get("image"),
@@ -1186,8 +1189,13 @@ def restore_pending(chats, cfg):
                     # wxid 发一段预览文字（真机上是「发出去了但没人收到」这种最难查的错）。
                     # 少了 file，发文件的待确认项会退化成「发一段文字」。
                     label=it.get("label"), items=it.get("items"), spec=it.get("spec"),
-                    file=it.get("file"))
-                n += 1
+                    file=it.get("file"), ttl=ttl)
+                if dupe:
+                    # 盘上有两条一模一样的（旧版本留下的）：只恢复一条，并**明说**。
+                    print(f"[bot] 恢复待确认队列：第 {dupe} 条已经一模一样，"
+                          f"这一份没有重复恢复")
+                else:
+                    n += 1
             except Exception:
                 traceback.print_exc()
     return n
@@ -1224,7 +1232,10 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
         # 这样图只花一次 token；而且永远不进 messages / dialog 记忆。
         pending = box.take_images() if hasattr(box, "take_images") else []
         call_messages = attach_images(messages, pending) if pending else messages
-        result = llm.chat_with_tools(system, call_messages, agent_tools.TOOLS)
+        # 工具清单走**注册表**（内置 + 插件），不再直接读 `agent_tools.TOOLS`
+        # —— 注册表是唯一真源，见 `docs/plugin-contract-spec.md` 2.2。
+        # 形状一字未变（仍是 name/description/parameters，MCP 的 tool 形状）。
+        result = llm.chat_with_tools(system, call_messages, plugins.REGISTRY.tools())
         last_text = result.text or last_text
         if not result.tool_calls:
             if state is not None:
@@ -1809,6 +1820,62 @@ def with_shell_truth_note(answer, shell_queued):
     return text
 
 
+# 真机踩过（2026-10-04）：用户在控制会话连着说了两次「关闭自动回复」「关闭王小明的
+# 自动回复啊」，模型**没有调 auto_reply 工具**，直接回了一句「自动回复功能已经关闭。
+# 如果您有其他需要帮助的地方，请告诉我。」——而 settings.json 里 `enabled` 一直是
+# true，于是它**继续**替用户回对方（日志里紧接着还有 `自动回复 -> 王小明: …`）。
+# 用户以为关了，其实一个字都没改。和 run_command 那次**同源**：提示词是建议，不是保证。
+#
+# 判据（宁可少触发）：提到「自动回复」**并且**带完成态的开关说法才算；
+# 出现否定/疑问/假设词一律不追加（模型在如实解释现状、或反问用户时不能被打岔）。
+_AUTO_REPLY_WORDS = ("自动回复", "代回复", "代回")
+_AUTO_REPLY_DONE = (
+    "已关闭", "已经关闭", "关闭了", "已关掉", "已经关掉",
+    "已开启", "已经开启", "开启了", "已打开", "已经打开", "打开了", "已开",
+)
+_AUTO_REPLY_NEG = (
+    "没有", "没关", "没开", "未关闭", "未开启", "不确定",
+    "是不是", "要不要", "怎么", "为什么", "想关", "要关", "需要关",
+)
+# 没有真改配置时固定追加的真话。**别删** —— 真机上就是它拦住「模型自己演一句已关闭」。
+AUTO_REPLY_NOT_CHANGED_NOTE = (
+    "\n\n（补充：我这一轮**其实没有改动自动回复的开关**，刚才那句是我自己说的、不算数。"
+    "要真关：全局发 `/auto off`；只关某个人发 `/auto del 王小明`。"
+    "想先看当前状态发 `/auto`。）")
+
+
+def looks_like_auto_reply_claim(text):
+    """这句话像不像在声称「我已经把自动回复开/关了」。
+
+    宁可少触发：光提「自动回复」不算（可能只是解释现状）；
+    必须同时出现完成态的开关说法，而且整段没有否定/疑问/假设词。
+    """
+    t = str(text or "")
+    if not t:
+        return False
+    if any(w in t for w in _AUTO_REPLY_NEG):
+        return False
+    if not any(w in t for w in _AUTO_REPLY_WORDS):
+        return False
+    return any(w in t for w in _AUTO_REPLY_DONE)
+
+
+def with_auto_reply_truth_note(answer, cfg_changed):
+    """回答里声称改了自动回复、而本轮**没有任何配置改动**时，追一句真话。
+
+    ⚠️ `cfg_changed` 是**粗判据**（它覆盖所有改配置的工具，不只是 auto_reply）。
+    这是有意的：宁可漏报（他真改过别的、我们不多嘴），
+    也绝不冤枉一个真改了的 —— 和 shell 那条同一个取舍。
+    """
+    text = str(answer or "")
+    if not text or cfg_changed:
+        return text
+    if looks_like_auto_reply_claim(text):
+        print("[bot] 回答声称改了自动回复，但本轮 cfg_changed=False → 追加真话")
+        return text.rstrip() + AUTO_REPLY_NOT_CHANGED_NOTE
+    return text
+
+
 def with_image_notes(answer, notes):
     """把「这一轮的图片没给成」之类的**如实说明**追加在答复后面。
 
@@ -1924,6 +1991,8 @@ def do_auto_reply(wcf, llm, cfg, chat, rec, contacts, control_chat, send):
 
     _LAST_AUTO[chat] = time.time()
     if auto_reply.review_on(rec, cfg):
+        # ⚠️ 这里**故意不判重**（`set_pending` 也对 kind="auto" 关了判重）：草稿是响应
+        # **某一条消息**生成的，两条一样的草稿对应两条不同的消息，合并＝第二条没人回。
         agent_tools.set_pending(control_chat, chat, label, reply, kind="auto")
         send(f"【自动回复待确认】给 {label}：\n{reply}\n\n"
              f"回「确认」发出，回「不发」取消。", control_chat)
@@ -2527,9 +2596,9 @@ def main():
             print(f"[bot] 从盘上恢复了 {n_back} 条待确认动作（还在时效内）")
             try:
                 items = []
+                ttl_back = agent_tools.confirm_ttl_of(cfg)
                 for c in pending_chats:
-                    items += agent_tools.list_pending(
-                        c, int((cfg.get("agent") or {}).get("confirm_ttl", 300)))
+                    items += agent_tools.list_pending(c, ttl_back)
                 lines = [f"重启后还有 {n_back} 条待确认的动作（还在时效内）："]
                 for i, it in enumerate(items, 1):
                     lines.append(f"{i}) {agent_tools.describe_pending(it)}")
@@ -2678,6 +2747,8 @@ def main():
                 # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
                 # 本轮其实没登记时，同样要追一句真话（否则用户回「确认」白等）。
                 answer = with_shell_truth_note(answer, run_state.get("shell_queued", False))
+                # 同上：声称改了自动回复但本轮没改配置 → 追一句真话。
+                answer = with_auto_reply_truth_note(answer, changed)
                 answer = with_image_notes(answer, run_state.get("image_notes"))
                 # 群发预览**原样**带上（模型转述十条例文必走样）。
                 answer = with_broadcast_preview(
@@ -3053,7 +3124,10 @@ def main():
                 #      不再限定 agent_enabled：审核模式下的自动回复草稿也要走这里。
                 pending_sel = pending_index_of(query)
                 if is_confirm(query) or is_cancel(query) or pending_sel is not None:
-                    ttl = int((cfg.get("agent") or {}).get("confirm_ttl", 300))
+                    # 「确认」的有效期：和判重窗口、save/restore 用**同一个解析**
+                    # （agent_tools.confirm_ttl_of），几处不一致会让「这条还在不在」
+                    # 在不同地方给出不同答案。
+                    ttl = agent_tools.confirm_ttl_of(cfg)
                     item = None
 
                     # 「不发」= 取消该会话全部待确认项
@@ -3295,6 +3369,9 @@ def main():
                         # 固定追一句真话。**别删**——真机上就是这么骗到用户的。
                         answer = with_shell_truth_note(
                             answer, run_state.get("shell_queued", False))
+                        # 同一条规矩：模型说「自动回复已关闭/已开启」而本轮一个配置都
+                        # 没改时，追一句真话（真机踩过：它说关了、其实还开着，继续回别人）。
+                        answer = with_auto_reply_truth_note(answer, cfg_changed)
                         # 图片那边的如实说明（比如"这一轮已经给了 3 张，这张没给"）
                         answer = with_image_notes(answer, run_state.get("image_notes"))
                         # 群发预览**原样**带上（模型转述十条例文必走样）。

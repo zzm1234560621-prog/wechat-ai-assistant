@@ -389,27 +389,123 @@ def address_rule(addr):
     return _ADDRESS_RULE.format(addr=addr)
 
 
+# ============================================================
+#  称呼的独立存储（2026-10-04：和自动回复名单解绑）
+# ============================================================
+#
+# 用户 2026-10-04 拍的：**称呼和自动回复必须分开**。
+# 以前称呼借住在 `auto_reply.chats[].address` 里，而 `chats` 就是「自动回复名单」，
+# 于是「给某人设/学称呼」先得把他加进名单——名单外的人（比如群友）根本做不到，
+# 顺手加人又等于替用户决定要不要让 AI 代他回话（CLAUDE.md 明令禁止）。
+#
+# 现在称呼有自己的家：`settings.json` 顶层 `addresses`
+#     {"wxid_xxx": {"address": "老张", "name": "张三",
+#                   "source": "manual|learned", "at": 1234567890}}
+# 规矩：
+#   * **读**只走 `address_of()`（唯一出口）；**写**只走 `set_address()` / `clear_address()`；
+#   * 旧记录里的 `chats[].address` **只作只读兜底**（2026-10-04 之前写进去的），
+#     任何一次写入都会把它清掉，所以它只会越来越少、不会和称呼表打架；
+#   * 人设（persona）**仍然只对名单里的人生效**——那是「替你回话」的语气，
+#     和「你平时怎么叫他」是两件事，别把这条也一起放开。
+
+def address_book(cfg=None):
+    """`{wxid: {"address","name","source","at"}}`。cfg 里没有就回落到 settings.json。"""
+    src = (cfg or {}).get("addresses")
+    if not isinstance(src, dict):
+        src = settings.load().get("addresses")
+    if not isinstance(src, dict):
+        return {}
+    out = {}
+    for wxid, rec in src.items():
+        if not isinstance(rec, dict):
+            continue
+        a = _clean_address(rec.get("address"))
+        if not a:
+            continue
+        out[str(wxid)] = {"address": a,
+                          "name": str(rec.get("name") or "").strip(),
+                          "source": str(rec.get("source") or "manual"),
+                          "at": rec.get("at")}
+    return out
+
+
+def address_record(cfg, wxid):
+    """这个人在称呼表里的那一条（没有就 None）。"""
+    return address_book(cfg).get(str(wxid or ""))
+
+
+def address_of(cfg, wxid, rec=None):
+    """这个人我平时怎么叫。**唯一读取出口**。
+
+    顺序：独立称呼表 > 旧记录 `chats[].address`（只读兜底）。
+    传 `rec` 只是为了兜住旧数据；新代码不必传。
+    """
+    hit = address_record(cfg, wxid)
+    if hit:
+        return hit["address"]
+    return address_for(rec)
+
+
+def set_address(wxid, addr, source="manual", name=""):
+    """写称呼（唯一写入口）。`addr` 空串 = 删掉这一条（= 没称呼）。
+
+    基准取自**磁盘现值**（不是传进来的 cfg）：cfg 可能是上一条命令之前的快照。
+    """
+    wxid = str(wxid or "").strip()
+    if not wxid:
+        return False
+    book = settings.load().get("addresses")
+    data = dict(book) if isinstance(book, dict) else {}
+    a = _clean_address(addr)
+    if not a:
+        data.pop(wxid, None)
+    else:
+        old = data.get(wxid) if isinstance(data.get(wxid), dict) else {}
+        data[wxid] = {"address": a,
+                      "name": str(name or old.get("name") or "").strip(),
+                      "source": str(source or "manual"),
+                      "at": int(time.time())}
+    settings.set_value("addresses", data or None)
+    return True
+
+
+def clear_address(wxid):
+    """删掉这个人的称呼（不会碰到自动回复名单）。"""
+    return set_address(wxid, "")
+
+
 def address_aliases(cfg):
     """`{称呼: [候选, ...]}` —— 给联系人解析当别名用（`resolve_contacts`）。
 
     **一个称呼可能对上多个人**（两个人都被叫「老张」），所以值是候选列表，
     调用方必须照旧走重名保护，**绝不能静默取第一个**（CLAUDE.md 铁律）。
 
-    数据只有一份真源：`auto_reply.chats[].address`。代价是**只有自动回复名单里的人
-    才有别名**——学习就是从「加进名单」触发的。别在别处再存一份称呼。
+    两个来源，**称呼表为准**：
+      1. `settings.json` 的 `addresses`（2026-10-04 起唯一的写入目标）；
+      2. 旧记录 `auto_reply.chats[].address`（只读兜底，同一 wxid 已被称呼表
+         覆盖时就不再看它）。
     """
     out = {}
-    for r in chat_list(cfg):
-        a = address_for(r)
+
+    def add(a, wxid, name):
         if not a:
-            continue
+            return
         out.setdefault(a, []).append({
-            "wxid": r.get("wxid"),
-            "name": r.get("name") or r.get("wxid"),
-            "remark": r.get("name") or "",
+            "wxid": wxid,
+            "name": name or wxid,
+            "remark": name or "",
             "alias": "",
             "_by": "称呼",
         })
+
+    book = address_book(cfg)
+    for wxid, item in book.items():
+        add(item["address"], wxid, item.get("name"))
+    for r in chat_list(cfg):
+        wxid = str(r.get("wxid") or "")
+        if wxid in book:
+            continue                  # 称呼表里已经有一份更新的
+        add(address_for(r), wxid, r.get("name"))
     return out
 
 
@@ -424,7 +520,8 @@ def make_reply(llm, rec, msgs, names, cfg, group=False):
 
     system = persona_for(rec, auto_cfg) + "\n" + _COMMON_RULES
     # 称呼**独立于 persona** 注入：用户重写人设、或者手写一份时，称呼不该跟着丢。
-    addr = address_for(rec)
+    # 它也不要求这个人在自动回复名单里（2026-10-04 解绑），所以走 address_of。
+    addr = address_of(cfg, (rec or {}).get("wxid"), rec)
     if addr:
         system += address_rule(addr)
     if group:
@@ -552,7 +649,7 @@ def _resolve(client, who, can_lookup=True, cfg=None):
     return str(c.get("wxid")), str(c.get("remark") or c.get("name") or c.get("wxid")), cands
 
 
-def _find(recs, who):
+def _find(recs, who, cfg=None):
     """按 wxid 精确、显示名精确、称呼精确、最后名字包含，找一条记录。
 
     **称呼也要认**：用户心里那个人就叫「老张」，让他为了改审核/身份先想起
@@ -569,7 +666,9 @@ def _find(recs, who):
     for r in recs:
         if str(r.get("name") or "") == who:
             return r
-    by_addr = [r for r in recs if address_for(r) and address_for(r) == who]
+    addr_of = (lambda r: address_of(cfg, r.get("wxid"), r)) if cfg is not None \
+        else address_for
+    by_addr = [r for r in recs if addr_of(r) and addr_of(r) == who]
     if len(by_addr) == 1:
         return by_addr[0]
     if len(by_addr) > 1:
@@ -586,7 +685,7 @@ def _persona_disk_override(key):
     return key in saved
 
 
-def _split_rec_target(rest, recs):
+def _split_rec_target(rest, recs, cfg=None):
     """把 `<谁> <内容>` 的 rest 拆成 (记录, 是否全局, mode, 内容)。
 
     persona 和 address 两条命令共用它——两边的「谁」是同一套名字。
@@ -613,7 +712,8 @@ def _split_rec_target(rest, recs):
     for r in recs:
         for key in (str(r.get("name") or "").strip(),
                     str(r.get("wxid") or "").strip(),
-                    address_for(r)):
+                    address_of(cfg, r.get("wxid"), r) if cfg is not None
+                    else address_for(r)):
             if not key:
                 continue
             if rest == key or rest.startswith(key + " "):
@@ -633,6 +733,48 @@ def _split_rec_target(rest, recs):
                 tail = bits[1].strip() if len(bits) > 1 else ""
         return None, True, mode, tail
     return None, False, None, None
+
+
+def _split_address_target(rest, cfg, client, can_lookup, name_hint=None):
+    """`<谁> <称呼>` 里，**谁可能不在自动回复名单里**（2026-10-04 解绑）。
+
+    名单里的人有 `_split_rec_target` 那张可枚举的名字表（名单是已知的）；
+    名单外的人没有，所以改用「**最长前缀能唯一认出一个联系人**」来切：
+
+        李四 阿四            → 前缀「李四」认出来 → 称呼=「阿四」
+        Johny 黄 儿子 阿黄    → 前缀「Johny 黄 儿子」→ 称呼=「阿黄」
+        wxid_xxx 阿四        → 前缀「wxid_xxx」（id 直接透传）
+
+    探针有上限（最多试 5 个词的前缀），因为每探一次就是一次联系人查询——
+    这条路是给人手打命令用的，不该因为它把 hook 压上去。
+    `can_lookup=False`（没连上库、也没在称呼表里）时只能认 wxid/roomid。
+
+    返回 `(wxid, 显示名, 内容, 错误文本)`；错误文本非空 = 调用方原样回给用户。
+    前缀**匹配到多个人**时如实报重名、**绝不挑一个**（CLAUDE.md 铁律）。
+    """
+    words = str(rest or "").split()
+    if not words:
+        return None, "", "", "用法：/auto address <昵称|wxid> [称呼]"
+    for k in range(min(len(words) - 1, 5), 0, -1):
+        prefix = " ".join(words[:k])
+        tail = " ".join(words[k:])
+        wxid, disp, cands = _resolve(client, prefix, can_lookup, cfg=cfg)
+        if not wxid:
+            continue
+        if len(cands) > 1:
+            names = "；".join(f"{c.get('remark') or c.get('name')}({c.get('wxid')})"
+                              for c in cands[:5])
+            return None, "", "", (f"「{prefix}」匹配到多个人，请用更全的名字、"
+                                  f"或者直接给 wxid：\n{names}")
+        return wxid, str(name_hint or disp or wxid), tail, ""
+
+    # 整串就是一个人的名字 = 不带称呼的「查看 / 学 / 清空」用法
+    wxid, disp, cands = _resolve(client, rest, can_lookup, cfg=cfg)
+    if wxid and len(cands) == 1:
+        return wxid, str(name_hint or disp or wxid), "", ""
+    return (None, "", "",
+            (f"没认出「{rest}」里哪一段是人名。用法：/auto address <昵称|wxid> [称呼]；"
+             f"名字带空格也行，例：/auto address Johny 黄 儿子 阿黄"))
 
 
 def _persona_clear(text):
@@ -827,8 +969,12 @@ def _store_learned(rec, data, fields, n):
         rec["persona_at"] = int(time.time())
         rec["persona_n"] = int(n)
     if "address" in fields and data["address"] is not None:
-        rec["address"] = data["address"]
-        rec["address_source"] = "learned"
+        # ⚠️ 称呼**不再写回聊天记录**（2026-10-04 解绑）：它有自己那份存储，
+        # 写这儿等于又造了第二个真源。顺手把旧字段清掉，旧数据只会越来越少。
+        set_address(rec.get("wxid"), data["address"], "learned",
+                    name=rec.get("name"))
+        rec.pop("address", None)
+        rec.pop("address_source", None)
 
 
 def _maybe_learn(rec, recs, cfg, client, llm_factory, force, fields=None):
@@ -850,7 +996,7 @@ def _maybe_learn(rec, recs, cfg, client, llm_factory, force, fields=None):
     blocked = []
     if "persona" in fields and str(rec.get("persona") or "").strip() and not force:
         blocked.append("人设")
-    if "address" in fields and address_for(rec) and not force:
+    if "address" in fields and address_of(cfg, rec.get("wxid"), rec) and not force:
         blocked.append("称呼")
     if blocked:
         return False, (f"\n（{'、'.join(blocked)}没动：{name} 已经设过了。"
@@ -906,6 +1052,7 @@ def status_text(cfg):
         "人设：每个人可以单独一份（整体替换默认）；没单独设的用全局默认",
         "     看/改：/auto persona <昵称> [描述]   学语气：/auto persona <昵称> 学习",
         "     称呼：/auto address <昵称> [称呼]    学称呼：/auto address <昵称> 学习",
+        "     ⚠️ 称呼和自动回复名单**是分开的**：名单外的人也能设/学/清，不必先 /auto add",
         f"名单（{len(recs)}）：",
     ]
     if not recs:
@@ -921,14 +1068,26 @@ def status_text(cfg):
             tone = f"人设=学到[{r.get('persona_n') or '?'}条]:{_short(own, 14)}"
         else:
             tone = f"人设=你设的:{_short(own, 14)}"
-        addr = address_for(r)
+        addr = address_of(cfg, r.get("wxid"), r)
         if addr:
-            src = "学到" if r.get("address_source") == "learned" else "你设的"
+            hit = address_record(cfg, r.get("wxid"))
+            src = "学到" if ((hit or {}).get("source")
+                            or r.get("address_source")) == "learned" else "你设的"
             tone += f"  称呼={src}:{addr}"
         else:
             tone += "  称呼=（无）"
         lines.append(f"  · {r.get('name') or r.get('wxid')}{kind}  "
                      f"身份={r.get('mode') or 'self'}  审核={'开' if rev else '关'}  {tone}")
+
+    # 称呼**不要求在名单里**（2026-10-04 解绑），所以名单外那些也要看得到——
+    # 否则用户设完了在状态里找不到，会以为没生效。
+    book = address_book(cfg)
+    names = {str(r.get("wxid") or "") for r in recs}
+    extra = [(w, v) for w, v in book.items() if w not in names]
+    if extra:
+        shown = "、".join(f"{v.get('name') or w}＝{v['address']}" for w, v in extra[:8])
+        more = f" 等 {len(extra)} 个" if len(extra) > 8 else ""
+        lines.append(f"另外 {len(extra)} 个人的称呼（**不在名单里**，只用来称呼）：{shown}{more}")
     return "\n".join(lines)
 
 
@@ -943,6 +1102,8 @@ _USAGE = (
     "/auto persona <昵称> 学习     从你和他的历史对话里学语气+称呼（覆盖已有的）\n"
     "/auto address <昵称> [称呼]   你平时怎么叫他；不带=看，清空=不套称呼\n"
     "/auto address <昵称> 学习     只从历史里学称呼，**一个字都不动人设**\n"
+    "  ⚠️ 称呼**不要求**他在自动回复名单里（名单外的人也能设/学/清）；\n"
+    "     名字带空格也行：/auto address Johny 黄 儿子 阿黄\n"
     "/auto persona 全局 [self|assistant] [描述]   没单独设的人用的默认人设\n"
     "/auto review on|off [昵称|wxid]   不带对象则改全局\n"
     "/auto ctx <1~30>         上下文条数\n"
@@ -1095,7 +1256,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
 
     if sub in ("del", "delete", "remove", "删", "删除"):
         who, _ = _split_target(rest)
-        rec = _find(recs, who)
+        rec = _find(recs, who, cfg)
         if rec is None:
             return f"名单里没有「{who}」。发 /auto 看名单。", False
         _save(chats=[r for r in recs if r is not rec])
@@ -1105,7 +1266,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
         who, mode = _split_target(rest)
         if not who or not mode:
             return "用法：/auto mode <昵称|wxid> self|assistant", False
-        rec = _find(recs, who)
+        rec = _find(recs, who, cfg)
         if rec is None:
             return f"名单里没有「{who}」。", False
         rec["mode"] = mode
@@ -1119,22 +1280,35 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
     if sub in ("address", "称呼", "叫法", "称谓"):
         if not rest.strip():
             return _USAGE, False
-        rec, glob, _am, text = _split_rec_target(rest, recs)
+        rec, glob, _am, text = _split_rec_target(rest, recs, cfg)
+        in_list = rec is not None
+        if rec is None and not glob:
+            # **名单外的人也要能设/学/清称呼**（2026-10-04 解绑，用户拍的）：
+            # 不必为了一个称呼先把他加进自动回复名单——那等于替用户决定
+            # 要不要让 AI 代他回话。这里只认人，不碰名单。
+            wxid, disp, text, err = _split_address_target(rest, cfg, client,
+                                                          can_lookup, name_hint)
+            if err:
+                return err, False
+            rec = {"wxid": wxid, "name": disp}
 
         if text is None:
             who = str(name_hint or "").strip() or (rest.split(maxsplit=1)[0]
                                                    if rest.strip() else "")
-            return (f"名单里没有「{who}」。称呼是**每个人一份**、只对自动回复名单里的人"
-                    f"生效——先发 /auto add {who} 把他加进来。"), False
+            return (f"没找到「{who}」。请用完整的昵称/备注，或者直接给 wxid。"), False
         if glob:
             return ("称呼是**按人**的，没有「全局」那一份（只有语气人设有全局默认）。"
                     "发 /auto address <昵称> <称呼>。"), False
 
-        name = rec.get("name") or rec.get("wxid")
-        cur = address_for(rec)
+        wxid = str(rec.get("wxid") or "")
+        name = rec.get("name") or wxid
+        hit = address_record(cfg, wxid)
+        cur = address_of(cfg, wxid, rec)
         if not text:                      # 不带内容 = 查看
             if cur:
-                src = ("你手写的" if rec.get("address_source") == "manual"
+                src = ("你手写的"
+                       if ((hit or {}).get("source")
+                           or rec.get("address_source")) == "manual"
                        else "从历史学到的")
                 return (f"{name} 的称呼＝{src}：{cur}\n"
                         f"改：/auto address {name} <称呼>   从历史学："
@@ -1147,22 +1321,33 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
         if _persona_learn(text):
             changed, note = _maybe_learn(rec, recs, cfg, client, llm_factory,
                                          force=True, fields=("address",))
+            if in_list:
+                rec.pop("address", None)
+                rec.pop("address_source", None)
+                _save(chats=recs)
             return note.lstrip("\n"), changed
         if _persona_clear(text):
             if not cur:
                 return f"{name} 本来就没称呼，没动。", False
-            rec["address"] = ""
-            rec.pop("address_source", None)
-            _save(chats=recs)
+            clear_address(wxid)
+            if in_list:
+                rec.pop("address", None)
+                rec.pop("address_source", None)
+                _save(chats=recs)
             return f"{name} 的称呼已清空（回消息时不套称呼）。", True
         bad = _address_too_long(text)
         if bad:
             return bad, False
-        rec["address"] = _clean_address(text)
-        rec["address_source"] = "manual"
-        _save(chats=recs)
-        return (f"{name} 的称呼已设为「{rec['address']}」——回复时会自然这么叫，"
-                f"你说「给{rec['address']}发消息」也能认出是他。"
+        addr = _clean_address(text)
+        set_address(wxid, addr, "manual", name=name)
+        if in_list:
+            # 旧字段（2026-10-04 之前存这儿）清掉：称呼只能有一份真源
+            rec.pop("address", None)
+            rec.pop("address_source", None)
+            _save(chats=recs)
+        return (f"{name} 的称呼已设为「{addr}」——回复时会自然这么叫，"
+                f"你说「给{addr}发消息」也能认出是他"
+                f"（**不用**把他加进自动回复名单）。"
                 f"想取消发 /auto address {name} 清空"), True
 
     # ⚠️ 命令词分家（2026-10-01）：「人设」这个别名以前挂在 mode（self/assistant）上，
@@ -1172,14 +1357,16 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
     if sub in ("persona", "人设", "语气", "口吻"):
         if not rest.strip():              # 裸 /auto persona → 用法（别拿空串去查名单）
             return _USAGE, False
-        rec, glob, pmode, text = _split_rec_target(rest, recs)
+        rec, glob, pmode, text = _split_rec_target(rest, recs, cfg)
 
         # text 为 None = 目标没认出来（不是名单里的人，也不是全局范围词）
         if text is None:
             who = str(name_hint or "").strip() or (rest.split(maxsplit=1)[0]
                                                    if rest.strip() else "")
             return (f"名单里没有「{who}」。人设是**每个人一份**、只对自动回复名单里的人"
-                    f"生效——先发 /auto add {who} 把他加进来。"), False
+                    f"生效——先发 /auto add {who} 把他加进来。\n"
+                    f"（只要**称呼**的话不用进名单：/auto address {who} 学习 "
+                    f"或 /auto address {who} <称呼>。）"), False
 
         if glob:
             m = pmode or "self"
@@ -1265,7 +1452,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
                     f"默认值（不只某一个），单独设过的会话不受影响。"
                     + ("草稿会先发给你，你回「确认」才发出去。" if on
                        else "自动回复直接发给对方。")), True
-        rec = _find(recs, who)
+        rec = _find(recs, who, cfg)
         if rec is None:
             return f"名单里没有「{who}」。", False
         rec["review"] = on

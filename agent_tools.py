@@ -31,6 +31,7 @@ import file_read
 import groups
 import image_cache
 import live_history
+import plugins
 import read_worker
 import scheduler
 import semantic
@@ -563,11 +564,15 @@ TOOLS = [
                         "count 用来连发同一条内容多次——只在用户明确说「发 N 次」时才填。"
                         "用户让你给谁发消息时**必须调用本工具**，不要只口头回复"
                         "『我准备发』——要不要用户确认由本工具判断并返回。"
-                        "返回里说『尚未发送』时，就是把内容复述给用户、请他回「确认」。"),
+                        "返回里说『尚未发送』时，就是把内容复述给用户、请他回「确认」。"
+                        "如果对方是**群里的成员**，先调 group_members 拿到 wxid 再填 to"
+                        "——群昵称不是联系人，直接用会「找不到」或撞重名。"),
         "parameters": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "收件人的昵称/备注/微信号/wxid"},
+                "to": {"type": "string",
+                       "description": "收件人的昵称/备注/微信号/wxid；"
+                                      "群成员用 group_members 给回来的 wxid"},
                 "text": {"type": "string", "description": "要发送的内容"},
                 "count": {"type": "integer",
                           "description": "连发几次，默认 1。只在用户明确要求发多次时填。"},
@@ -590,8 +595,17 @@ TOOLS = [
             "  to 的写法：「所有人」「大家」= 我的所有好友；不填或「名单」= 自动回复名单里的人；"
             "「大学同学」这种**分组名**（或 to=\"分组:大学同学\"）"
             "= 用 group 工具建的那份分组的成员；"
+            "「群:同学会」= **那个微信群的成员**，一人一条"
+            "（用户说「发给同学会群里每个人」就用这个：范围由群定义，一次到位，"
+            "**不用**先调 group_members 再拼一堆 wxid）；"
             "「亲人」这种**微信标签名**（或 to=\"标签:亲人\"）"
             "= 微信自带标签下的好友；也可以点名 to=\"张三、李四、王五\"。\n"
+            "  ⚠️ **裸群名（to=\"同学会\"）是「发一条到群里」（整群可见），不是群发成员**——"
+            "两种语义差得很远：用户说「在群里发一条」就用裸群名（或让 send_text 发），"
+            "说「单独发给群里每个人」才写 to=\"群:同学会\"。\n"
+            "  ⚠️ **点名「某个群里的成员」时**：先调 group_members 拿到每个人的 wxid，"
+            "再 to=\"wxid_1、wxid_2、…\"。群昵称（如「a」「Ken」）不是联系人、"
+            "在整个账号里还常常重名，直接点名会被如实拒绝。你自己会被自动跳过。\n"
             "  ⚠️ 用户提的组名/标签名**不确定是哪一个**时，先调 group 工具 "
             "action=status 看分组；微信标签可以用 group 工具 action=labels 看。"
             "错一个字会被如实拒绝（不会瞎发），但会白跑一趟。\n"
@@ -606,8 +620,12 @@ TOOLS = [
             "properties": {
                 "to": {"type": "string",
                        "description": "「所有人」/「名单」/分组名（或「分组:X」）/ "
-                                      "微信标签名（或「标签:X」）/ 点名的昵称（多个用、隔开）；"
-                                      "不填=自动回复名单里的人"},
+                                      "**「群:X」= 某个微信群的成员，一人一条**（例：群:同学会）/ "
+                                      "微信标签名（或「标签:X」）/ 点名的昵称或 wxid"
+                                      "（多个用、隔开；**群成员请用 group_members "
+                                      "给回来的 wxid**，或者直接用「群:X」）；"
+                                      "不填=自动回复名单里的人。"
+                                      "⚠️ 裸群名（不带「群:」）是**发一条到群里**，不是群发成员"},
                 "text": {"type": "string",
                          "description": "用户**给出的原话**，一字不改发给所有人（与 intent 二选一）"},
                 "intent": {"type": "string",
@@ -811,6 +829,9 @@ TOOLS = [
             "**称呼（action=address）**：用户平时叫对方什么。它独立于人设存在，"
             "回消息时会被单独告诉模型（所以用户重写人设也不会把称呼弄丢），"
             "**而且会被当成别名**——用户说「给老张发消息」时解析得到那个人。"
+            "⚠️ **称呼和自动回复名单是分开的**：名单外的人（群友、只发过一次消息的人）"
+            "照样能设/学/清称呼，工具会自己按昵称找到人——**不必先 action=add**，"
+            "更不许为了设个称呼就把人加进名单（那等于替用户决定要不要让 AI 代他回话）。"
             "⚠️ 所以**称呼必须写对**：用户说「叫他老张」就写 address=老张，"
             "**不要自己发挥、不要把人家的备注或全名当称呼写进去**，"
             "也不要猜（猜错会让用户说「给老张发消息」发错人）。"
@@ -962,15 +983,23 @@ TOOLS = [
             "读某张图片的内容（识别图里的文字）。"
             "contact + local_id 从 find_images 的结果里拿。\n"
             "只能读**有本地缓存**的图；没缓存的会明确告诉你读不了，"
-            "这时候要如实告诉用户「这张图没缓存，我这边看不到」，不要编内容。"
+            "这时候要如实告诉用户「这张图没缓存，我这边看不到」，不要编内容。\n"
+            "⚠️ **用户刚把图发到控制会话**（他随后问「这张图里写的什么」「图片里的价格」）时，"
+            "**不用 contact/local_id**：直接调本工具（两个参数都不填）就能读那张图——"
+            "控制会话收到的图会进素材暂存区，里面存着本地明文副本；"
+            "能读就读，读不了一律如实说，**绝不编图里的内容**。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "contact": {"type": "string", "description": "昵称/备注/微信号/wxid"},
-                "local_id": {"type": "string", "description": "find_images 返回的 local_id"},
+                "contact": {"type": "string",
+                            "description": "昵称/备注/微信号/wxid；"
+                                           "读「刚发到控制会话的那张图」时**不填**"},
+                "local_id": {"type": "string",
+                             "description": "find_images 返回的 local_id；"
+                                            "读「刚发到控制会话的那张图」时**不填**"},
             },
-            "required": ["contact", "local_id"],
+            "required": [],
         },
     },
     {
@@ -1141,8 +1170,16 @@ TOOLS = [
     {
         "name": "group_members",
         "description": (
-            "列出一个**群**的成员（含群昵称，群主已标出）。"
+            "列出一个**群**的成员（含群昵称、群主、你自己，以及每个人的 wxid）。"
             "用户问「这个群里有谁」「群里那个 XXX 是什么人」时用。\n"
+            "⚠️ 用户要**单独给群里的某个人/每个人发消息**时，**先调本工具**："
+            "群昵称不是联系人（不少群友根本不是你好友），直接拿群昵称去发会被"
+            "「找不到」或「重名」挡住；把这里给回来的 **wxid 原样填进** "
+            "send_text / broadcast 的 to 才发得准。\n"
+            "要**群发给这个群的每个人**时更省事的写法：broadcast 的 "
+            "to=\"群:<群名或 roomid>\"（一次到位，不用拼 wxid 名单）。\n"
+            "标着「我」的是用户自己，不要发；群里可能有不是好友的人，"
+            "他们不一定收得到私聊——发失败就如实说。\n"
             "群必须用 roomid（形如 xxx@chatroom）指定——昵称匹配不到群。"
         ),
         "parameters": {
@@ -1401,7 +1438,16 @@ class _Budget:
 # 用**列表**而不是单个：同一个控制会话里可能同时压着好几条待确认
 # （比如你让助手发给 A、同时审核模式下又有一条自动回复给 B），
 # 只存一条会互相覆盖，回「确认」时发错人。
+#
+# ⚠️ 但**同一个动作绝不许在列表里出现两次**（2026-10-04 真机）。「确认」的语义就是
+# 「把这一条发出去」，两条逐字相同的条目 = 用户确认两次就收到两份。判重在**入队**
+# 那一头做（`set_pending` 是唯一写 `_PENDING` 的地方）；读侧去重是下策：它得猜
+# 「哪条才算数」，而菜单编号和实际执行的必须还是同一条。
 _PENDING = {}
+
+# 「确认」的有效期缺省值（秒）。与 agent.confirm_ttl 的默认值一致：bot 那条路
+# 一律把配置里的实际值传进来，这个常量只是**没传时**的兜底，也用来给队列判活。
+_DEFAULT_CONFIRM_TTL = 300.0
 
 # 发图白名单「兜底放宽」的告警只打一次：这不是会重复的噪音，
 # 而是一条**必须让用户看见**的事实（默认白名单被放宽到整个微信数据根目录）。
@@ -1561,9 +1607,101 @@ def _alive(chat, ttl):
     return items
 
 
+def _action_key(item):
+    """一条待确认项「要做的动作」的身份。**不含 ts**——时间不是动作的一部分。
+
+    ⚠️ 这是**判重**用的，不是给人看的。为什么必须有它（2026-10-04 真机）：
+    用户连着三遍说「发给我」（「最新的发给我吧」→「吧文件发给我」→「发给我吧」），
+    模型每一遍都照做、各登记一次，队列里于是压着**两条逐字相同**的发文件
+    （第 2、3 条都是同一份课表发给文件传输助手）。用户确认第 2 条收到一份，
+    再确认第 3 条**又收到一份**。
+
+    「同一个动作」= 收件人 + kind + 真正要发的那份东西全一样。`count` 也算：
+    count=2 是「发两次」，和 count=1 **不是**同一件事，合并掉就是静默少发一条。
+    """
+    def _canon(v):
+        try:
+            return json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return repr(v)
+
+    def _paths(v):
+        """路径列表：能 realpath 就 realpath（同一个文件写成两种路径也算同一条）。"""
+        if not v:
+            return ()
+        if isinstance(v, str):
+            v = [v]
+        out = []
+        for p in v:
+            s = str(p or "")
+            try:
+                s = os.path.realpath(s) if s else ""
+            except OSError:
+                pass      # 解不动就用原字符串比：宁可漏判重，不可误判重
+            out.append(s)
+        return tuple(out)
+
+    try:
+        count = int(item.get("count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return (str(item.get("kind") or "agent"),
+            str(item.get("to_wxid") or ""),
+            count,
+            _paths(item.get("file")),
+            _paths(item.get("image")),
+            str(item.get("xml") or ""),
+            str(item.get("cmd") or ""),
+            _canon(item.get("items")),
+            _canon(item.get("spec")),
+            str(item.get("text") or ""))
+
+
+def _dupe_index(chat, key, ttl=None):
+    """队列里有没有「同一条动作」？有就返回它的**菜单编号**（1 起），没有返回 None。
+
+    三条规矩：
+
+    * 只认**还没过期**的条目。一条早就过期、谁也确认不了的旧条目，拿它去拦用户的
+      新请求＝把新请求**静默吞掉**（工具回「请回确认」，用户回确认时队列是空的）。
+      判活的 ttl 必须和 bot 确认分支用的**同一个值**（agent.confirm_ttl，调用方传
+      进来），否则两边对「这条还在不在」的判断会分叉。
+    * 过期项**只跳过、不删**。删队列项是读侧（`_alive`）的事，入队这边顺手删就等于
+      在别人看不见的地方改队列。
+    * 命中的那条把 `ts` **刷新成现在**：用户刚刚又说了一遍同一件事，确认窗口就该按
+      最后一次请求重新起算。不刷新的话，一条还剩 3 秒过期、内容相同的旧条目会把
+      这次请求「吃掉」，3 秒后用户回「确认」时它已经过期了——请求凭空消失。
+    """
+    items = _PENDING.get(str(chat)) or []
+    if not items:
+        return None
+    try:
+        ttl = _DEFAULT_CONFIRM_TTL if ttl is None else float(ttl)
+    except (TypeError, ValueError):
+        ttl = _DEFAULT_CONFIRM_TTL
+    now = time.time()
+    live = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            age = now - float(it.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if age > ttl:
+            continue
+        live += 1
+        if _action_key(it) == key:
+            it["ts"] = now
+            print(f"[bot] 待确认项重复（第 {live} 条），没有再登记一份："
+                  f"{describe_pending(it)}")
+            return live
+    return None
+
+
 def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
                 image=None, xml=None, cmd=None, timeout=None, label=None,
-                items=None, spec=None, file=None):
+                items=None, spec=None, file=None, ttl=None):
     """登记一条待确认发送。kind 区分来源：agent（用户让助手发的）/ auto（自动回复草稿）。
 
     bot 对两者要求不一样：自动回复草稿只认明确的中文确认词，避免用户在控制
@@ -1593,13 +1731,65 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
         的 `[{wxid, name, text}]`；`text` 是同一份内容的预览。用户回「确认」后
         `send_pending` 逐条发出。
     两者都**只有一条**待确认项（不是 N 条）——用户看一次、回一个「确认」。
+
+    **返回值**（2026-10-04 加）：
+      * 正常登记上 → None；
+      * 队列里**已经有一条一模一样的动作** → 那一条的**菜单编号**（1 起），
+        并且**不重复入队**（见 `_action_key` / `_dupe_index`）。
+        调用方要把 `dupe_note(编号)` 接在自己的返回文本后面：用户说第二遍
+        「发给我」时，模型得知道**没有**新排一条，否则它会说成「又排了一条」，
+        而用户菜单里只有一条。
+    `ttl` 只在判重时用来判断旧条目还活不活，**必须是 agent.confirm_ttl 的那个值**
+    （和 bot 确认分支、save_pending 用同一个）；不传就用默认 300 秒。
     """
-    _PENDING.setdefault(str(chat), []).append(
-        {"to_wxid": to_wxid, "to_name": to_name, "text": text,
-         "image": image, "xml": xml, "file": file,
-         "cmd": cmd, "timeout": timeout, "label": label,
-         "items": items, "spec": spec,
-         "kind": kind, "count": int(count or 1), "ts": time.time()})
+    item = {"to_wxid": to_wxid, "to_name": to_name, "text": text,
+            "image": image, "xml": xml, "file": file,
+            "cmd": cmd, "timeout": timeout, "label": label,
+            "items": items, "spec": spec,
+            "kind": kind, "count": int(count or 1), "ts": time.time()}
+    # ⚠️ **kind="auto" 不判重**（有意为之，别顺手加回来）：它和别的 kind 不是一类东西。
+    # 那些是「用户/模型要求的一个动作」，重复要求 = 同一条动作；而自动回复草稿是
+    # **响应某一条消息生成的一份回复**，两条一模一样的草稿对应的是**两条不同的消息**。
+    # 合并掉就等于「第二条消息没人回」——那是静默少发，比重复更坏。
+    # 真机上防止刷屏靠的是 auto_reply 自己的冷却（`_LAST_AUTO` / `auto.cooldown`），
+    # 不是这里。
+    if str(kind or "agent") != "auto":
+        idx = _dupe_index(chat, _action_key(item), ttl)
+        if idx:
+            return idx
+    _PENDING.setdefault(str(chat), []).append(item)
+    return None
+
+
+def dupe_note(index):
+    """「这条已经在队列里了」的补充说明。**空串 = 正常登记上了，一个字都不用加。**
+
+    给**模型**看的（接在工具返回文本后面）：用户说第二遍「发给我」时它得知道
+    这次没有新排一条，否则它会对用户说「我又给你排了一条」——而用户眼前的菜单
+    只有一条，对不上。
+    """
+    if not index:
+        return ""
+    return (f"（⚠️ 队列里**已经有一条一模一样**的待确认项了（第 {index} 条），"
+            f"这次**没有再登记一份**——别对用户说成「又排了一条」；"
+            f"让他回「确认」就行（队里还有别的条目时 bot 会回菜单让他点编号）。）")
+
+
+def confirm_ttl_of(cfg):
+    """从配置里取「确认」的有效期（秒）。
+
+    **唯一一处解析**：bot 的确认分支、`save_pending` / `restore_pending` 和这里的
+    判重窗口必须是同一个数——不然「这条待确认项还在不在」在几处会给出不同答案
+    （判重窗口比读侧大＝拿过期条目把用户的新请求吞掉；比读侧小＝同一条又能重复入队，
+    也就是 2026-10-04 那个 bug 换个窗口复发）。
+    读不出来/写歪了一律退回 `_DEFAULT_CONFIRM_TTL`（和 `_alive` 的兜底一致）。
+    """
+    try:
+        return float(((cfg or {}).get("agent") or {}).get("confirm_ttl",
+                                                          _DEFAULT_CONFIRM_TTL))
+    except (TypeError, ValueError):
+        return _DEFAULT_CONFIRM_TTL
+
 
 
 def pop_pending(chat, ttl=300):
@@ -1620,7 +1810,7 @@ def peek_pending(chat, ttl=300):
     return items[0] if items else None
 
 
-def list_pending(chat, ttl=300):
+def list_pending(chat, ttl=_DEFAULT_CONFIRM_TTL):
     """该会话**未过期**的待确认项，顺序就是 FIFO 顺序。**不出队。**
 
     为什么需要它：待确认队列是「待发送(agent/auto)」和「待执行本地命令(shell)」
@@ -1634,7 +1824,7 @@ def list_pending(chat, ttl=300):
     return list(_alive(chat, ttl))
 
 
-def pop_pending(chat, ttl=300, index=None):
+def pop_pending(chat, ttl=_DEFAULT_CONFIRM_TTL, index=None):
     """取出并清除一条待确认动作；没有/全过期/越界返回 None。
 
     * `index is None`：**保持原有行为**——取队头（最早的）。
@@ -2043,9 +2233,42 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None, cfg=None):
                          item.get("count") or 1, interval)
 
 
+def _roster_hits(roster, name, contacts):
+    """在**群成员花名册**里精确找一个人；返回联系人形状的候选（可能多条）。
+
+    花名册元素来自 `live_history.decode_room_members`：`{wxid, name(群昵称), ...}`。
+    匹配三个键：群昵称 / wxid / 该 wxid 在联系人表里的备注-昵称-微信号。
+    命中时优先用联系人表里那条记录（备注/昵称是真的），查不到才用群昵称——
+    和 `aliases` 那一档同一个做法。
+    """
+    if not roster:
+        return []
+    by = {str(c.get("wxid") or ""): c for c in (contacts or [])}
+    out = []
+    for m in roster:
+        wxid = str(m.get("wxid") or "")
+        if not wxid:
+            continue
+        c = by.get(wxid) or {}
+        keys = (m.get("name"), wxid, c.get("remark"), c.get("name"),
+                c.get("alias"))
+        if not any(k and str(k) == name for k in keys):
+            continue
+        if any(str(x.get("wxid")) == wxid for x in out):
+            continue
+        cand = dict(c) if c else {}
+        cand["wxid"] = wxid
+        if not (cand.get("remark") or cand.get("name")):
+            cand["name"] = str(m.get("name") or "")
+        out.append(cand)
+    return out
+
+
 def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None,
-                     aliases=None):
-    """昵称/备注/微信号/**学到的称呼** -> 候选列表。先精确匹配，没有再退到包含匹配。
+                     aliases=None, roster=None):
+    """昵称/备注/微信号/**学到的称呼**/**群成员花名册** -> 候选列表。
+
+    先精确匹配，没有再退到包含匹配。
 
     抽成模块级是为了让 bot 的 /定时 命令也能用**同一套**解析：重名处理必须一致，
     不能一边要求用户说清楚、另一边静默取第一个（那会发错人）。
@@ -2055,6 +2278,9 @@ def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None,
     没有它就解析不出来。**称呼命中和库里命中是合并的**（见下），
     因为万一另一个人备注真叫「老张」，两边都得摆出来让重名保护去问，
     静默挑一个就是发错人。
+
+    `roster` 是「本轮看过的群成员」（`ToolBox._roster()`）。它只在**联系人表
+    给不出唯一答案**（0 条或多条）时才生效，理由见下面那一档的注释。
     """
     name = str(name or "").strip()
     if not name:
@@ -2085,6 +2311,17 @@ def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None,
             if not any(str(x.get("wxid")) == str(c.get("wxid")) for x in exact):
                 exact.append(c)
 
+    # 群花名册那一档：**只在联系人表给不出唯一答案时才用**（0 条 = 对不上，
+    # 多条 = 重名）。2026-10-04 真机踩到的就是这两种：
+    #   * 「老K」是群昵称，联系人表里压根没这个人（不是好友）-> 0 条；
+    #   * 「a」「Alan」「Ken」「leo」在整个账号里各有好几个同名 -> 多条。
+    # 而在**那一个群**里它们各自唯一。反过来，联系人表已经给出唯一答案时
+    # **绝不**拿花名册去覆盖它——那才是会发错人的那一头。
+    if not exact or len(exact) > 1:
+        hits = _roster_hits(roster, name, contacts)
+        if hits:
+            return hits
+
     if exact:
         return exact
 
@@ -2108,12 +2345,14 @@ def resolve_contacts(contacts, name, self_wxid="", client=None, budget=None,
     return []
 
 
-def resolve_one(contacts, name, self_wxid="", client=None, budget=None, aliases=None):
-    """把「昵称/备注/称呼/wxid」解析成唯一候选人。返回 (候选人, 错误文本)。
+def resolve_one(contacts, name, self_wxid="", client=None, budget=None,
+                aliases=None, roster=None):
+    """把「昵称/备注/称呼/wxid/群昵称」解析成唯一候选人。返回 (候选人, 错误文本)。
 
     重名时**不静默取第一个**——那会读错人、甚至发错人。
     """
-    cands = resolve_contacts(contacts, name, self_wxid, client, budget, aliases)
+    cands = resolve_contacts(contacts, name, self_wxid, client, budget, aliases,
+                             roster=roster)
     if not cands:
         return None, f"没找到「{name}」。"
     if len(cands) > 1:
@@ -2230,24 +2469,76 @@ def _rec_name(c):
     return nm or "（没备注的好友）"
 
 
-def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None, client=None):
+_CHAT_SCOPE_PREFIX = ("群:", "微信群:", "群成员:", "group:", "chatroom:")
+
+
+def _resolve_group_chat(client, what):
+    """`群:X` 里的 X（群名 / roomid）-> `(roomid, 显示名, 错误文本)`。
+
+    只认**真的群**（roomid 以 `@chatroom` 结尾）。昵称在两个群重名、或者名字
+    其实是个联系人时，**如实拒绝**，绝不猜——猜错就是往一个完全不同的群发消息。
+    查还是走 `live_history.resolve_contact`（唯一该读库的地方）。
+    """
+    what = str(what or "").strip()
+    if not what:
+        return None, None, ("「群:」后面要写群名或 roomid，例：to=\"群:同学会\"。")
+    if auto_reply.is_group(what):
+        return what, what, ""
+    try:
+        rows = live_history.resolve_contact(client, what, limit=20)
+    except Exception as e:
+        return None, None, _db_fail(f"找群「{what}」", e)
+    groups = [c for c in (rows or [])
+              if auto_reply.is_group(str(c.get("wxid") or ""))]
+    if not groups:
+        return None, None, (f"没找到叫「{what}」的**群**（群要在联系人表里有记录）。"
+                            f"看群 id 可以用 group_members 工具；"
+                            f"要发给某个人就直接点名（to=\"张三、李四\"）。")
+    exact = [c for c in groups
+             if str(c.get("name") or "") == what or str(c.get("wxid") or "") == what]
+    pick = exact or groups
+    if len(pick) > 1:
+        names = "；".join(f"{c.get('name') or c.get('wxid')}({c.get('wxid')})"
+                          for c in pick[:5])
+        return None, None, (f"「{what}」匹配到多个群，请直接给 roomid：\n{names}")
+    c = pick[0]
+    return str(c.get("wxid")), str(c.get("name") or c.get("wxid")), ""
+
+
+def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None,
+                         client=None, roster=None, notes=None):
     """解析收件人。返回 `(收件人列表, 范围, 错误文本)`。
 
     收件人元素：`{"wxid", "name", "address", "rec"}`，`rec` 是 auto_reply 名单里
     那条（没有就是 None -> 人设走全局默认、也没有称呼）。
 
-    `to` 五种写法：
+    `roster` 是「本轮看过的群成员」（`ToolBox._roster()`）：点名时群昵称在
+    **那个群**里唯一、在整个账号里常常重名，所以只把它当兜底用
+    （语义见 `resolve_contacts` 的花名册那一档）。传空 = 老行为。
+
+    `notes` 是**可选的出参 dict**：传了就往里写 `skipped`（点名里被跳过的
+    自己/控制会话）。为什么要这个：跳过的人是**用户看得见的事实**，得让
+    「待确认预览」里写一句——不然用户点名的 6 个人只收到 5 条，谁也不会知道。
+
+    `to` 六种写法：
       * 空 / 「名单」「自动回复名单」-> 自动回复名单里的人（默认，量小可控）；
       * 「分组:大学同学」（也认「组:」）或**组名本身** -> 自己建的那份分组的人；
+      * 「群:同学会」（也认「微信群:」「群成员:」）-> **那个微信群的成员**，一人一条
+        （2026-10-04 加：一次到位，不靠模型先查名单、再拼 wxid）；
       * 「标签:亲人」（也认「微信标签:」）或**标签名本身** -> 微信自带标签下的人；
       * 「所有人」「大家」「所有好友」-> 所有能发的好友（见 `_is_broadcastable`）；
       * 其余 -> 按 `、,，;；/` 拆开的**点名**。
 
+    ⚠️ **裸群名（`to="同学会"`）仍然是「发一条到群里」**（那是 `send_text` 那条路，
+    整个群都能看到），**不是**群发给每个成员。两种语义差别太大，只有显式写
+    `群:` 才按成员群发——**绝不替用户改掉他已经习惯的那个意思**。
+
     **组名优先于标签名**：分组是用户在这个助手里亲手建的，意图更明确。
 
     **默认全程离线**：只读已经加载的联系人表和配置——群发本来就慢，别再往 hook
-    上加活。**唯一例外是「标签」**：成员关系只有微信库里有（`contact_fts` 的
-    search_key 第 4 段），所以点名标签时查 **1 次**库；不点名标签一次都不查。
+    上加活。**例外只有两个**：「标签」（成员在 `contact_fts` 的 search_key 第 3 段）
+    和「群:」（成员在 `chat_room.ext_buffer`），各自查 **1~2 次**库；
+    其余写法一次库都不查。
     """
     to = str(to or "").strip()
     chats = auto_reply.chats(cfg)
@@ -2255,7 +2546,9 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None, clien
 
     def _pack(wxid, name, c=None):
         rec = chats.get(wxid)
-        addr = auto_reply.address_for(rec) if rec else ""
+        # 称呼**不要求这个人在自动回复名单里**（2026-10-04 解绑）：名单外的人
+        # 也能有称呼（群发时照样按「你平时怎么叫他」写）。走唯一的读取出口。
+        addr = auto_reply.address_of(cfg, wxid, rec)
         return {"wxid": wxid, "name": name or (rec or {}).get("name") or wxid,
                 "address": addr, "rec": rec}
 
@@ -2368,11 +2661,61 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None, clien
                                "或者只有群/公众号）。")
         return out, "all", ""
 
+    # 3.5) 某个**微信群的成员**（显式写法 `群:X`）
+    #
+    # 为什么要有这一条（2026-10-04 真机）：用户说「发给同学会群里每个人」时，
+    # 模型得先调 group_members 拿 wxid、再自己拼一个十几项的 to —— 它只要漏一步，
+    # 群昵称就会被当成联系人来解析（不是好友＝查不到、重名＝拿不准），整批如实拒绝，
+    # 白跑一趟。显式写 `群:同学会` 就一次到位：范围由群定义，不依赖模型记性。
+    #
+    # ⚠️ 只有显式前缀才按成员群发。**裸群名（to="同学会"）仍旧是「发一条到群里」**
+    # （点名的第一候选就是那个 roomid，整群可见）——两种语义差得太远，
+    # 不许替用户改掉他已经习惯的那个意思。
+    gchat = ""
+    for pre in _CHAT_SCOPE_PREFIX:
+        for p in (pre, pre[:-1] + "："):      # 全角冒号也认（手打的多半是全角）
+            if low.startswith(p):
+                gchat = to[len(p):].strip()
+                break
+        if gchat:
+            break
+    if gchat:
+        if client is None:
+            return [], "groupchat", ("这条链路读不到群成员（没连上微信），我**一个人都没发**。"
+                                     "要单独发就点名：to=\"张三、李四\"。")
+        room, gname, gerr = _resolve_group_chat(client, gchat)
+        if gerr:
+            return [], "groupchat", gerr
+        try:
+            mem = live_history.group_members(client, room)
+        except Exception as e:
+            return [], "groupchat", _db_fail(f"读「{gname}」的成员", e)
+        if not mem:
+            return [], "groupchat", (
+                f"没查到「{gname}」的成员名单（这个版本可能拿不到群成员数据），"
+                f"我**一个人都没发**。要单独发就点名：to=\"张三、李四\"。")
+        recips, skipped = [], []
+        for m in mem:
+            w = str(m.get("wxid") or "").strip()
+            if not w:
+                continue
+            if self_wxid and w == self_wxid:
+                skipped.append(str(m.get("name") or "你自己"))
+                continue
+            recips.append(_pack(w, str(m.get("name") or "")))
+        if not recips:
+            return [], "groupchat", (f"「{gname}」里除了你自己没有别人可发，"
+                                     f"我**一个人都没发**。")
+        if notes is not None:
+            notes["skipped"] = skipped
+        return recips, "groupchat", ""
+
     # 3) 点名
     names = [x.strip() for x in re.split(r"[、,，;；/]", to) if x.strip()]
-    out, missing, amb = [], [], []
+    out, missing, amb, skipped = [], [], [], []
     for nm in names:
-        cands = resolve_contacts(contacts, nm, self_wxid, None, None, aliases)
+        cands = resolve_contacts(contacts, nm, self_wxid, None, None, aliases,
+                                 roster=roster)
         if not cands:
             missing.append(nm)
             continue
@@ -2380,20 +2723,31 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None, clien
             amb.append(nm)
             continue
         wxid = str(cands[0].get("wxid"))
+        # 自己 / 文件传输助手：**不是「没找到」**，而是「这次不发给他」。
+        # 以前这两条也塞进 missing，于是「发给群里的每个人」——群里本来就有你
+        # 自己——整批被拒，回给用户的还是「没找到：小明」，而 find_contact
+        # 明明找得到（2026-10-04 真机踩到，用户据此以为「拿不到群成员的真实 id」）。
         if wxid == "filehelper" or (self_wxid and wxid == self_wxid):
-            missing.append(nm)
+            skipped.append(nm)
             continue
         if not any(r["wxid"] == wxid for r in out):
             out.append(_pack(wxid, _rec_name(cands[0])))
+    if notes is not None:
+        notes["skipped"] = list(skipped)
     if missing or amb:
         bits = []
         if missing:
             bits.append(f"没找到：{'、'.join(missing)}")
         if amb:
             bits.append(f"重名（要说全名）：{'、'.join(amb)}")
+        if skipped:
+            bits.append(f"跳过的（你自己/控制会话）：{'、'.join(skipped)}")
         return [], "named", ("点名的这些人没能全部对上，所以我**一条都没发**："
                              + "；".join(bits) + "。")
     if not out:
+        if skipped:
+            return [], "named", (f"点名的「{'、'.join(skipped)}」是**你自己**"
+                                 f"（或控制会话），没有别人可发——我**一条都没发**。")
         return [], "named", "没解析出任何收件人。"
     return out, "named", ""
 
@@ -2495,7 +2849,8 @@ def _scope_preview(recipients):
             f"回「确认」继续，回「不发」取消。")
 
 
-def prepare_broadcast(client, chat, recipients, spec, cfg, llm, interval, is_ok):
+def prepare_broadcast(client, chat, recipients, spec, cfg, llm, interval, is_ok,
+                      skip_note=""):
     """生成 + 分流。返回 `(给用户看的报告文本, 错误文本)`。
 
     `chat` 是**控制会话**（待确认项一律登记在那儿，见 bot.py：工具层的 self.chat
@@ -2542,9 +2897,20 @@ def prepare_broadcast(client, chat, recipients, spec, cfg, llm, interval, is_ok)
             note = (f"上面 {len(direct)} 个已经直接发出；下面这些等你看过再发。"
                     f"回「确认」发出，回「不发」取消。")
         preview = _broadcast_preview(queued, note)
-        set_pending(chat, "", "", preview, kind="broadcast", items=queued,
-                    label="群发内容")
+        dupe = set_pending(chat, "", "", preview, kind="broadcast", items=queued,
+                           label="群发内容", ttl=confirm_ttl_of(cfg))
         report.append(preview)
+        if dupe:
+            # 这一批已经在队列里了（同一批被又说了一遍）：**没有再登记一份**。
+            # 这段文本是 bot **原样直发**给用户的，所以必须写在这里——不能让用户
+            # 以为排了两批、各确认一次发两遍（那等于给每个人发两条）。
+            report.append(f"（⚠️ 队列里已经有一条一模一样的群发批次了（第 {dupe} 条），"
+                          f"这一批**没有再登记**——回「确认」发出的就是那一条。）")
+    if skip_note:
+        # 被跳过的（你自己 / 控制会话）**必须写进这段给用户看的文本**：
+        # 它是由 bot 原样直发的，用户是照着它确认的。静默少发一个人
+        # ＝ 用户以为发给 6 个、实际只发 5 个（和「不许静默缩小影响面」同一条规矩）。
+        report.append(skip_note)
     return "\n\n".join(report), ""
 
 
@@ -2640,6 +3006,12 @@ class ToolBox:
         self.line_chars = max(80, int(agent_cfg.get("line_chars", 400)))
         # wxid -> 显示名，群里标发言人用（构造时算一次，别每条消息重算）
         self._names = auto_reply.contact_names(self.contacts)
+        # 本轮看过的**群成员花名册**（roomid -> {"name": 群名, "members": [...]}）。
+        # 只有 `t_group_members` 真的查过之后才有，用来给「给群里的 a 发消息」
+        # 兜底（重名/不是好友那两种情况，见 resolve_contacts 的花名册那一档）。
+        # ⚠️ ToolBox 是**一轮一份**，所以花名册天然不跨轮存活：上一轮看过的群，
+        # 这一轮不会再被拿来当依据（群成员是会变的，过期名册 = 发错人）。
+        self._rosters = {}
         self.sent = []          # 本轮真正发出去的 [(name, text)]
         # 本轮真正发出去的**条数**（单独的计数器，不从 self.sent 的长度推：
         # self.sent 里一条可能代表「连发 5 次」也可能代表「一张图」，语义不齐，
@@ -2673,6 +3045,32 @@ class ToolBox:
         # 混在一起会让「搜了两次」吃掉两次查库额度，模型就查不动聊天记录了。
         # 但它仍然要有闸：搜索是同步 HTTP，占着收消息那条线程。
         self.search_calls = 0
+        # 触发这一轮的消息**是不是我自己发的**。这是 bot 主循环给的**事实**，
+        # ToolBox 自己推不出来，所以默认 None = **「不知道」**。
+        #
+        # ⚠️ 「不知道」绝不许当成 True：权限类判断（文件能力的 files.who）
+        # 靠它决定放不放行，把 None 当 True 等于静默放宽权限。
+        self.from_self = None
+        # 会话是不是群。`roomid` 的形态就是 `xxx@chatroom`，由 chat 直接推得，
+        # 不额外查库（查库要走 hook，能省一次就省一次）。
+        self.is_group = "@chatroom" in self.chat
+        # 插件工具与生命周期事件共用的只读上下文。
+        # 见 plugins.py 的契约与 docs/plugin-contract-spec.md 2.1。
+
+    def ctx(self):
+        """工具处理器 / 事件用的只读上下文（形状见 `docs/plugin-contract-spec.md` 2.1）。
+
+        **只读**：处理器不许改它去影响别的处理器或主循环 —— 要改行为就
+        `set_pending`（走确认闸）或用 `before_reply`。
+        """
+        return {
+            "chat": self.chat,
+            "self_wxid": self.self_wxid,
+            "cfg": self.cfg_provider(),
+            "from_self": self.from_self,
+            "is_group": self.is_group,
+            "user_query": self.user_query,
+        }
 
     def _image_path_ok(self, path):
         """校验发图路径。返回 (绝对路径, 错误文本)。
@@ -2787,10 +3185,22 @@ class ToolBox:
         except Exception:
             return {}
 
+    def _roster(self):
+        """本轮看过的群成员（扁平成一个列表，给解析当兜底）。没看过就是空。
+
+        它**只**来自 `t_group_members`：模型真的看过这个群，才谈得上
+        「他点的是这个群里的人」。没看过就返回空，解析退化成原来的行为。
+        """
+        out = []
+        for info in (self._rosters or {}).values():
+            out.extend(info.get("members") or [])
+        return out
+
     def _resolve(self, name):
-        """昵称/备注/称呼/微信号 -> 候选列表。实现见模块级 resolve_contacts。"""
+        """昵称/备注/称呼/微信号/群昵称 -> 候选列表。实现见模块级 resolve_contacts。"""
         return resolve_contacts(self.contacts, name, self.self_wxid,
-                                self.client, self.budget, self._aliases())
+                                self.client, self.budget, self._aliases(),
+                                roster=self._roster())
 
     def _in_whitelist(self, wxid, name):
         """判定在模块级 `_name_hits` 里（唯一一处），这里只是把构造时的名单喂进去。"""
@@ -2811,6 +3221,23 @@ class ToolBox:
             return None, (f"「{who}」匹配到多个人：{names}。"
                           f"请问用户要哪一个，拿到明确的名字后再试。")
         return cands[0], None
+
+    def _queue_send(self, to_wxid, to_name, text, **kw):
+        """登记一条待确认动作，**判重的 ttl 统一走这一个口子**。
+
+        为什么不各处直接调模块级 `set_pending`：判重只看「同一条动作还在不在」，
+        而「在不在」用的是 `agent.confirm_ttl`——bot 的确认分支和 `save_pending`
+        也用的同一个值。工具侧有 9 个登记点（文本/图片/图片群发/素材/文件/转发/
+        打电话/群发/命令），让每个点自己拼 ttl，迟早有一个漏掉，那处就静默
+        回到「同一条重复入队」或者反过来「拿过期条目吞掉用户的新请求」。
+        （用构造时的 `self.confirm_ttl`：一轮之内不会有人改它；真改了，影响也只是
+        判重窗口的大小，不会让动作丢失。）
+
+        返回值同 `set_pending`：正常入队 None，判重命中则返回那一条的菜单编号。
+        调用方把 `dupe_note(...)` 接在返回文本后面。
+        """
+        return set_pending(self.chat, to_wxid, to_name, text,
+                           ttl=self.confirm_ttl, **kw)
 
     def t_find_contact(self, args):
         cands = self._resolve(args.get("name"))
@@ -2855,12 +3282,12 @@ class ToolBox:
                 return f"已发送给 {nm}。"
             return f"已给 {nm} 连发 {n} 条「{text}」。"
 
-        # 名单外：只登记待确认，不真发
-        set_pending(self.chat, wxid, nm, text, count=count)
+        # 名单外：只登记待确认，不真发。同一条动作**不重复入队**（见 _queue_send）。
+        dupe = self._queue_send(wxid, nm, text, count=count)
         times = f"连发 {count} 次" if count > 1 else "发一条"
         return (f"「{nm}」不在自动发送名单里，消息**尚未发送**。"
                 f"请告诉用户：准备{times}给 {nm}，内容是「{text}」，"
-                f"让用户回复「确认」后再发。")
+                f"让用户回复「确认」后再发。{dupe_note(dupe)}")
 
     def t_broadcast(self, args):
         """群发：一条意图 -> 多个人，各按那个人自己的人设 + 称呼写一条。
@@ -2893,11 +3320,19 @@ class ToolBox:
         cfg = self.cfg_provider()
         # `client` 是给「标签」那一支用的：标签成员只有微信库里有。不点名标签时
         # 它一次库都不查（其余分支纯离线），所以这里带上它不会让普通群发变慢。
+        notes = {}
         recips, scope, err = broadcast_recipients(self.contacts, cfg, to,
                                                  self.self_wxid, self._aliases(),
-                                                 client=self.client)
+                                                 client=self.client,
+                                                 roster=self._roster(),
+                                                 notes=notes)
         if err:
             return err
+        skip_note = ""
+        if notes.get("skipped"):
+            skip_note = ("\n⚠️ 「" + "、".join(str(x) for x in notes["skipped"]) +
+                         "」是**你自己**（或控制会话），这次没有发；"
+                         "上面的收件人不含他。")
 
         cap = broadcast_cap(cfg)
         if len(recips) > cap:
@@ -2922,11 +3357,12 @@ class ToolBox:
         if scope == "all":
             preview = _scope_preview(recips)
             self.broadcast_preview = preview
-            set_pending(self.chat, "", "", preview, kind="broadcast_scope",
-                        items=recips, spec=spec, label="群发范围")
+            dupe = self._queue_send("", "", preview, kind="broadcast_scope",
+                                    items=recips, spec=spec, label="群发范围")
             return ("**范围还没确认**：我没有生成内容、也没有发任何消息。\n"
                     "（系统已经把「这次会发给多少人」那段**原样**发给用户了，"
-                    "你只需要一句话说明：要真的发就回「确认」。）")
+                    "你只需要一句话说明：要真的发就回「确认」。）"
+                    f"{dupe_note(dupe)}")
 
         # 名单 / 点名：人数本来有界，直接生成 + 分流。
         llm = None
@@ -2941,7 +3377,8 @@ class ToolBox:
                 return f"拿不到模型（{type(e).__name__}: {e}），**一条都没发**。"
 
         report, err = prepare_broadcast(self.client, self.chat, recips, spec, cfg,
-                                       llm, self.send_interval, self._in_whitelist)
+                                       llm, self.send_interval, self._in_whitelist,
+                                       skip_note=skip_note)
         if err:
             return err
         # 报告里有**逐条正文和人数**，同样由 bot 原文直发（不让模型转述）。
@@ -3489,8 +3926,14 @@ class ToolBox:
     def t_read_image(self, args):
         contact = str(args.get("contact") or "").strip()
         lid = str(args.get("local_id") or "").strip()
+        if not contact and not lid:
+            # 2026-10-04：用户把图**发到控制会话**时，那张图不走消息流（素材暂存收下了），
+            # 但本地有明文副本（`data/stash/`，或微信刚发出去的临时原图）。
+            # 用户紧接着问「图片里的价格怎么样」时，模型两个参数都不填就能读它。
+            return self._read_stashed_image()
         if not contact or not lid:
-            return "参数不全：需要 contact 和 local_id。"
+            return ("参数不全：要么 contact 和 local_id 都给（find_images 的结果），"
+                    "要么两个都不给（读你刚发到控制会话的那张图）。")
         cand, err = self._one(contact)
         if err:
             return err
@@ -3515,7 +3958,7 @@ class ToolBox:
 
         import image_read
         r = image_read.handoff(path, self.cfg,
-                               collect=self._image_collector(f"{nm} 的图"))
+                               collect=self._image_collector(f"{contact} 的图"))
         t = hit.get("time")
         if r["kind"] == "image":
             extra = (f"\n（原图已交给模型看；图里还认出了这些字：{r['text'][:200]}）"
@@ -3526,6 +3969,59 @@ class ToolBox:
         why = r.get("why") or "没读出内容"
         return (f"这张图（{t}）读不出内容：{why}\n"
                 f"请如实告诉用户「这张图我看不到 / 读不出」，**不要编内容**。")
+
+    def _read_stashed_image(self):
+        """读「用户刚发到控制会话的那张图」——素材暂存区里那条的本地明文。
+
+        为什么要有这条路：控制会话收到的图**不进消息流**（`bot.stash_control_media`
+        会把它收进素材暂存区并回执，然后就 `continue` 了），所以模型手里没有 local_id。
+        可那张图的**明文副本就在本地**（`data/stash/`，或微信 `temp\\RWTemp` 里
+        刚发出去的原图）——不让模型读等于白白看着它能读的东西说「看不了」。
+
+        规矩：
+          * **只认控制会话那条**（`talker` 要和当前会话对得上）——别的地方必须点名
+            contact + local_id，否则模型会读到别处的图、答非所问；
+          * 最新那条优先（暂存区末尾就是「刚收到的那条」）；
+          * 读不出来（没明文 / `image.mode=off` / OCR 失败）**一律如实说 + 给出可做法**，
+            绝不许编图里的内容。
+        """
+        try:
+            items = assets.load()
+        except Exception as e:
+            return f"读素材暂存区失败（{type(e).__name__}: {e}），这张图我看不了。"
+        pick, path = None, ""
+        for it in reversed(items or []):
+            if str((it or {}).get("talker") or "") not in ("", self.chat):
+                continue
+            p = assets.plaintext_of(it)
+            if p:
+                pick, path = it, p
+                break
+        if pick is None:
+            return ("素材暂存区里**没有可读的明文图**，所以这张图我看不了"
+                    "（微信只留加密原图，我拿不到）。\n"
+                    "请如实告诉用户：**把这张图以「文件」方式再发一次**就能读"
+                    "（长按图片 → 以文件形式发送），那样是明文原图，读得更清。"
+                    "**不要凭猜测说图里有什么。**")
+        import image_read
+        kind = str(pick.get("kind") or "图片")
+        try:
+            r = image_read.handoff(path, self.cfg,
+                                   collect=self._image_collector("刚发的那张图"))
+        except Exception as e:
+            return (f"读这张{kind}时出错（{type(e).__name__}: {e}）；"
+                    f"如实告诉用户读不出来，别编内容。")
+        if r["kind"] == "image":
+            extra = (f"\n（原图已交给模型看；图里还认出了这些字：{r['text'][:200]}）"
+                     if r.get("text") else "\n（原图已交给模型看）")
+            return f"[用户刚发到控制会话的{kind}：原图直接给模型看了]{extra}"
+        if r["kind"] == "text":
+            return (f"[用户刚发到控制会话的{kind}，识别出的文字]\n"
+                    f"{r['text'].strip()}")
+        why = r.get("why") or "没读出内容"
+        return (f"用户刚发到控制会话的那张{kind}读不出内容：{why}\n"
+                f"（没明文副本、或者图片解读模式是关的。可以如实说读不了，"
+                f"并建议他把图**以「文件」方式**再发一次。）**不要编内容。**")
 
     def _files_on_disk(self, name, since, until, label, limit):
         """跨全部会话找文件：**只翻本地文件目录**（不查库、不碰 hook）。
@@ -3796,15 +4292,35 @@ class ToolBox:
         if not mem:
             return (f"没查到「{nm}」的成员名单（这个版本可能拿不到群成员数据）。"
                     f"如实告诉用户查不到，**不要编名单**。")
+        # 查到的**真实 wxid** 要留着：后面「给群里的 a 发消息」就靠它把群昵称
+        # 解析成人（群昵称不在联系人表里、在整个账号里还常常重名）。
+        self._rosters[wxid] = {
+            "name": nm,
+            "members": [dict(m, _room=wxid, _room_name=nm) for m in mem],
+        }
         shown = mem[:limit]
         lines = []
         for m in shown:
             nick = m.get("name") or self._names.get(m["wxid"]) or m["wxid"]
-            lines.append(f"- {nick}{'（群主）' if m.get('is_owner') else ''}")
+            tags = []
+            if m.get("is_owner"):
+                tags.append("群主")
+            if self.self_wxid and m["wxid"] == self.self_wxid:
+                tags.append("我")
+            mark = f"（{'·'.join(tags)}）" if tags else ""
+            # **wxid 必须列出来**：以前这里只给群昵称，模型拿着群昵称去发送，
+            # 于是要么「查不到这个联系人」（不是好友），要么撞上一堆同名——
+            # 用户看到的就是「一条都没发」。真正能定人的那一半数据是 wxid。
+            lines.append(f"- {nick}{mark} (wxid={m['wxid']})")
         head = f"「{nm}」共 {len(mem)} 人"
         if len(mem) > len(shown):
             head += f"，下面只列前 {len(shown)} 个"
-        return head + "：\n" + "\n".join(lines)
+        return (head + "：\n" + "\n".join(lines) +
+                "\n（要单独给谁发消息，就把后面的 wxid 原样填进 send_text / "
+                "broadcast 的 to；标「我」的是你自己，不用发。"
+                "wxid 只给你自己定位用，**不要念给用户听**。"
+                "群里可能有**不是你好友**的人，他们不一定收得到私聊——"
+                "发失败就如实说，别换个 id 再试。）")
 
     def t_send_image(self, args):
         to = str(args.get("to") or "").strip()
@@ -3827,9 +4343,10 @@ class ToolBox:
             self._sent_count += 1
             self.sent.append((nm, desc))
             return f"已把 {base} 发给 {nm}。"
-        set_pending(self.chat, wxid, nm, desc, image=path)
+        dupe = self._queue_send(wxid, nm, desc, image=path)
         return (f"「{nm}」不在自动发送名单里，图片**尚未发送**。"
-                f"请告诉用户：准备把 {base} 发给 {nm}，让他回复「确认」后再发。")
+                f"请告诉用户：准备把 {base} 发给 {nm}，让他回复「确认」后再发。"
+                f"{dupe_note(dupe)}")
 
     def t_send_images(self, args):
         to = str(args.get("to") or "").strip()
@@ -3904,10 +4421,10 @@ class ToolBox:
             self.sent.append((nm, desc))
             return f"已把 {len(picked)} 张图片发给 {nm}。{trunc}"
 
-        set_pending(self.chat, wxid, nm, "", image=picked)
+        dupe = self._queue_send(wxid, nm, "", image=picked)
         return (f"「{nm}」不在自动发送名单里，**一张都还没发**。"
                 f"请告诉用户：准备把「{folder}」里的 {len(picked)} 张图发给 {nm}，"
-                f"让他回复「确认」后我再发。{trunc}")
+                f"让他回复「确认」后我再发。{trunc}{dupe_note(dupe)}")
 
     def t_semantic_search(self, args):
         """本地语义检索。**不查库**（所以不扣 `agent.max_queries`，和 web_search 同理）。
@@ -4006,9 +4523,9 @@ class ToolBox:
                 return f"发文件「{base}」失败（**这份没有发出去**）：{e}"
             return f"已经尝试把文件「{base}」发给 {nm}。"
 
-        set_pending(self.chat, wxid, nm, f"发文件：{base}", kind="file", file=path)
+        dupe = self._queue_send(wxid, nm, f"发文件：{base}", kind="file", file=path)
         return (f"还没有发。**请用户回「确认」再发**：把文件「{base}」发给 {nm}。\n"
-                f"（用户回「确认」之后我才真正去发。）")
+                f"（用户回「确认」之后我才真正去发。）{dupe_note(dupe)}")
 
     def t_call(self, args):
         """发起一通微信语音通话。**只登记待确认，绝不在这里拨出去。**
@@ -4049,10 +4566,11 @@ class ToolBox:
                     f"**请如实告诉用户没拨出去**：不要改用发消息代替，"
                     f"也不要假装打了。")
 
-        set_pending(self.chat, wxid, nm, f"打电话给 {nm}", kind="call")
+        dupe = self._queue_send(wxid, nm, f"打电话给 {nm}", kind="call")
         return (f"还没有拨。**请用户回「确认」再拨**：给 {nm} 打一通微信语音通话。\n"
                 f"（电话是不可逆动作——对方手机会响；用户回「确认」之后我才拨。"
-                f"拨出去之后我也只会说「邀请已发出」，不保证对方接到。）")
+                f"拨出去之后我也只会说「邀请已发出」，不保证对方接到。）"
+                f"{dupe_note(dupe)}")
 
     def t_forward_message(self, args):
         to = str(args.get("to") or "").strip()
@@ -4089,10 +4607,10 @@ class ToolBox:
             self._sent_count += 1
             self.sent.append((nm, desc))
             return f"已把「{snm}」里那条消息转发给 {nm}。"
-        set_pending(self.chat, wxid, nm, desc, xml=xml)
+        dupe = self._queue_send(wxid, nm, desc, xml=xml)
         return (f"「{nm}」不在自动发送名单里，转发**尚未发出**。"
                 f"请告诉用户：准备把「{snm}」里那条消息转给 {nm}，"
-                f"让他回复「确认」后再发。")
+                f"让他回复「确认」后再发。{dupe_note(dupe)}")
 
     def _sync_latest_asset(self, items):
         """把控制会话里**比暂存区更新的**那条「自己发的媒体」补存进来。
@@ -4255,12 +4773,12 @@ class ToolBox:
 
         # 名单外：登记待确认。图片按「一串路径」传，重复几次就发几次
         # （send_pending 的图片分支就是这么连发的）。
-        set_pending(self.chat, wxid, nm, what, image=[pl] * count,
-                    count=count, label=what)
+        dupe = self._queue_send(wxid, nm, what, image=[pl] * count,
+                               count=count, label=what)
         times = f"连发 {count} 次" if count > 1 else "发一次"
         return (f"「{nm}」不在自动发送名单里，{what}**尚未发送**。"
                 f"请告诉用户：准备把{what}{times}发给 {nm}，"
-                f"让他回复「确认」后再发。")
+                f"让他回复「确认」后再发。{dupe_note(dupe)}")
 
     def t_run_command(self, args):
         """登记一条「待确认执行」的本地命令。**这里一个字都不执行。**
@@ -4314,15 +4832,17 @@ class ToolBox:
 
         # text 也存命令原文：bot 复述给用户用，且保证**显示模型给的原话**，
         # 不是模型事后转述的版本（转述会把命令改掉，用户确认的就不是真跑的那条）。
-        set_pending(self.chat, "", "", text=raw, kind="shell", cmd=raw,
-                    timeout=timeout)
+        dupe = self._queue_send("", "", text=raw, kind="shell", cmd=raw,
+                                timeout=timeout)
         # 真的登记上了才置位（auto_ok 那支直接执行、不走这里，也就不置位）。
         # bot 用它核对回答里说的「已提交、等你确认」是不是真的。
+        # 判重命中也置位：队里确实压着**同一条命令**等确认，「等你确认」是真的。
         self.shell_queued = True
         return (f"命令**尚未执行**。请把下面这条命令**原文**发给用户看一眼，"
                 f"请他回复「确认」之后才会真的在他本机执行：\n"
                 f"{raw}\n"
-                f"（用户没回「确认」之前，**不许说已经跑了**，也不许编造执行结果。）")
+                f"（用户没回「确认」之前，**不许说已经跑了**，也不许编造执行结果。）"
+                f"{dupe_note(dupe)}")
 
     def t_web_search(self, args):
         """联网搜一次（走**本机**自建的 SearXNG，见 web_read.py）。
@@ -4545,7 +5065,14 @@ class ToolBox:
         raise RuntimeError(msg)
 
     def run(self, name, args):
-        fn = getattr(self, f"t_{name}", None)
+        # 派发**只走注册表这一条路**。不留「查不到就 getattr(self, f"t_{name}")」
+        # 的兜底 —— 留了就等于两套派发、第二个所有者
+        # （docs/plugin-contract-spec.md 第七节第 8 条）。
+        #
+        # 副作用：`t_call` 不再能经 run() 调到。它是**故意的孤儿**（TOOLS 里
+        # 那条已按用户 2026-10-03 的口径删掉、代码保留），模型本来就调不到它；
+        # `selftest_call.py` 直接调 `box.t_call(...)`，不受影响。
+        fn = plugins.REGISTRY.resolve(name, self)
         if fn is None:
             return f"没有名为 {name} 的工具。"
         before = self._sent_count
@@ -4573,3 +5100,20 @@ class ToolBox:
                         f"或者第一条就失败了）。请如实告诉用户没发成、原因是什么，"
                         f"**不要说自己重发过了**。")
             return f"工具 {name} 执行出错：{e}"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 内置工具注册进插件注册表（`docs/plugin-contract-spec.md` 2.2）
+#
+# **唯一真源**：`plugins.REGISTRY` 是工具声明与派发的真源；`TOOLS` 降级为
+# 「内置工具的声明输入」。`run_agent` 从注册表取清单，`ToolBox.run` 从注册表解析
+# 处理器，**不再有第二条路径**。
+#
+# 「零行为变化」的可验证定义（`selftest_plugins.py` 直接断言）：
+# 注册表里 `source="builtin"` 的工具清单，必须与 `TOOLS` **逐条相等、含顺序**。
+#
+# ⚠️ 放在文件**最底部**：注册表在导入期就建好，而 `TOOLS` 与 `ToolBox` 都在上面
+# 定义完了。挪到前面会撞「名字还没定义」。
+# ────────────────────────────────────────────────────────────────────────
+plugins.load_builtin_tools(TOOLS)
+

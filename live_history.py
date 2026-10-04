@@ -2219,8 +2219,82 @@ def _v4_active_talkers(client, since):
     return [str(_pick(r, "username", 0)) for r in rows if _pick(r, "username", 0)]
 
 
+# 一轮最多回查几个「有动静的会话」。为什么必须有闸：非文本补捞现在是「谁变了就查谁的
+# 消息表」，理论上限 = 这一轮有多少个会话在动。稳态 0 个（零查询），消息洪水时可能几十个
+# —— hook 不支持并发、CLAUDE.md 也不许我们把活压上去。超出的**记进 pending**，
+# 下一轮一定接着扫（**不靠 `since` 兜**，见函数里那段注释），所以只会晚一拍、不会丢。
+_NONTEXT_MAX_SESSIONS = 8
+# fts 已经覆盖的类型（1=文本，49=appmsg 的**低 32 位**）：这条补捞路不重复报，
+# 否则同一条消息会被答两遍。
+_TEXT_LOCAL_TYPES = (1, 49)
+# 「还没有基线」的会话（第一次跑、或 state.json 丢了）只认**这么近**的非文本：
+# 否则一上来就把每个会话最后 10 条历史里的图片/语音全当新消息回放一遍。
+_NONTEXT_BOOTSTRAP_WINDOW = 1800
+
+
+def _v4_msg_seqs(client):
+    """每个会话的 `Msg_<md5>` 表里**最大 local_id** —— 非文本补漏的新鲜度信号。
+
+    为什么必须有它（2026-10-04 真机：控制会话那条 4 秒语音**一行日志都没有**）：
+    `SessionTable.last_timestamp` **不可信**。实测 `session.db` 从 **00:16:37** 起
+    17 小时没落过盘（`session.db-wal` 的 mtime 就停在 00:16:37），而 `message_fts.db`
+    一路写到 16:56。于是候选闸 `WHERE last_timestamp >= since`（since 来自**消息**时钟）
+    **一个会话都匹配不到** ⇒ 语音/图片/表情**全丢**、连一行日志都没有。
+    现场取证（bot 停着时只读查询）：
+        since=1791104183（16:56，当时的 __time__）→ **0 行**
+        since=1791044185（00:16，会话表自己的最大值）→ 1 行
+    同一条语音在消息表里躺着：`Msg_<md5(filehelper)> local_id=848, local_type=34,
+    create_time=16:42:55`。
+
+    `sqlite_sequence` 是 SQLite 自己维护的 AUTOINCREMENT 计数器：每个 `Msg_<hash>`
+    一行、`seq` 就是该会话最新一条的 `local_id`（实测 855 = 该表最新行的 local_id，
+    含那条语音）。它随每次插入更新，**跟 session.db 落不落盘毫无关系**，
+    而且一次查询就拿到**全部**会话 —— 比「谁有动静」更准确，也更便宜。
+    """
+    def build():
+        rows = _query(client, "message_0.db",
+                      "SELECT name, seq FROM sqlite_sequence WHERE name LIKE 'Msg_%'")
+        out = {}
+        for r in rows:
+            name = str(_pick(r, "name", 0) or "")
+            if name.startswith("Msg_"):
+                out[name] = _as_int(_pick(r, "seq", 1))
+        return out
+    return _cached_filled(client, "_lh_msg_seqs", build, ttl=5)
+
+
+def _v4_talkers_by_table(client):
+    """`Msg_<md5(会话名)>` 表名 → 会话名（`local_id` 信号只给表名，得翻译回来）。
+
+    三个来源取**并集**（每个都只是一次小表查询，缓存 10 分钟）：
+      * `MessageResourceInfo` 用的 `ChatName2Id`（message_resource.db）—— 新；
+      * `SessionTable` 的 username —— 值可能很旧，但**行还在**，够用来翻译表名；
+      * fts 的 Name2Id（`_v4_fts_session_map`，已有缓存）。
+    翻译不出来的表**直接跳过**：拿不到会话名就没法把消息交给上层（talker 就是发给谁）。
+    """
+    def build():
+        names = set()
+        for db, sql, col, idx in (
+            ("session.db", "SELECT username FROM SessionTable", "username", 0),
+            ("message_resource.db", "SELECT user_name FROM ChatName2Id", "user_name", 0),
+        ):
+            try:
+                for r in _query(client, db, sql):
+                    u = str(_pick(r, col, idx) or "").strip()
+                    if u:
+                        names.add(u)
+            except Exception:
+                pass
+        try:
+            names.update(v for v in _v4_fts_session_map(client).values() if v)
+        except Exception:
+            pass
+        return {_v4_table_for(u): u for u in names}
+    return _cached_filled(client, "_lh_talkers_by_table", build, ttl=600)
+
+
 def _v4_pickup_nontext(client, cursors, already, limit=10):
-    """把 **fts 装不下的非文本（主要是图片）**从消息表里捞出来。
+    """把 **fts 装不下的非文本（图片 / 语音 / 表情 / 视频…）**从消息表里捞出来。
 
     为什么非有这一条不可（2026-10-01 实测）：
       * **fts 里根本不存在 `local_type = 3` 的行** —— 四个分片
@@ -2230,56 +2304,104 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
         而图片的 summary 是**空串** → 被 `if not content: continue` 跳过。
       两条路都瞎，用户看到的就是「我把图发过去了，它一点反应没有」。
 
-    做法：只用 SessionTable 当「有新动静」的信号（几百行的小表、一次查询），
-    条件收紧到 **最后一条不是文本**才回查那个会话的消息表。
+    ⚠️ **判据是「这个会话有新行」，不是「最后一条不是文本」**（2026-10-04 真机修）：
+    以前这里拿 `last_msg_type NOT IN (1,49)` 当闸，于是**非文本后面紧跟一句话**
+    （你发完图马上打字提问、群里有人补一句）时，`last_msg_type` 已经变成 1，
+    这个会话这一轮就不会被回查 —— 那张图**永久消失**（fts 没有它、summary 也不认它）。
+    真机现场：用户发了一张图、紧接着问「图片里的价格怎么样」，bot 完全不知道有这张图，
+    只能去别的群乱找。
 
-    ⚠️ 判据必须是 `last_msg_type`，**不能**再用「summary 为空」当「非文本」的替身：
-    图片的 summary 确实常是空串，但**语音的 summary 是时长**（实测 `1"`）、
-    表情/视频/系统消息也各有摘要 —— 拿 summary 当判据，这些类型**永远进不来**，
-    表现就是「我发了条语音，bot 完全没反应」（2026-10-03 真机踩到）。
-    文本(1) 和 appmsg(49) 由 fts 那条路覆盖，所以这里排掉这两个，其余全捞。
+    ⚠️⚠️ **新鲜度信号 = `message_0.db` 的 `sqlite_sequence`（见 `_v4_msg_seqs`），
+    不是 `SessionTable.last_timestamp`**（2026-10-04 真机：语音条**一行日志都没有**）：
+    那个值真机实测能落后 **17 小时**（`session.db-wal` 停在 00:16:37，消息表写到 16:56），
+    于是 `WHERE last_timestamp >= since`（since 来自**消息**时钟）**0 个会话匹配**
+    ⇒ 语音/图片/表情**全丢**，而且**连一行日志都没有**（不是"读不出来"，是压根没送到）。
+    现在改成：**每个会话的最大 `local_id` 比它自己的水位线大 ⇒ 回查一次消息表**，
+    再按**行**挑出新出现的非文本（文本 / appmsg 丢掉，那是 fts 那条路的活）。
+    判据是 SQLite 自己的 AUTOINCREMENT 计数器，**跟 session.db 落不落盘无关**。
 
-    稳态下这个查询返回 0 行 → **不增加任何额外查库**；真收到图/语音才多 1~2 次查询。
+    ⚠️ 这里**没有任何时间窗口**：判据是每个会话自己的 `local_id` 水位线
+    （`cursors["__nonttext_seq__"]`），所以「本批里别的会话来了条更晚的消息」
+    也推不动它 —— 旧实现拿 `__time__` 当窗口，正是这样把语音整条丢掉的。
+    只有**还没打过基线**的会话（第一次跑 / state.json 丢了 / 刚出现的会话）
+    才用 `time.time() - _NONTEXT_BOOTSTRAP_WINDOW` 兜一道：只认刚发生的，
+    绝不把几个月的历史回放一遍。
 
-    每个会话一个水位线 `cursors["__nonttext__"][talker]`，避免同一张图每轮重复报。
-    **不做「第一次见到就只记水位线不报」那种 seed**——那会让「你在某个会话里发的
-    第一张图」永远报不上来（那个会话还没进水位线，就被当成历史 seed 掉了）。
-    启动边界的历史回放由两道现成机制挡着，不需要在这里再挡一次：
-      * `last_timestamp >= since`（since 是 fts 游标 `__time__`，启动时就是最新）= 老会话根本进不来；
+    代价与两道闸：
+      * 稳态（没有新行）→ 0 个会话命中 → **一次消息表都不查**（只多一条 sqlite_sequence）；
+      * N 个会话在动 → 最多 N 次（每会话一次，不是每条消息一次）；
+      * 一轮最多扫 `_NONTEXT_MAX_SESSIONS` 个（按差得最少优先，先到先扫、防饿死），
+        超出的写进 `cursors["__nonttext_pending__"]`，下一轮**不看任何时间窗口也照样扫**。
+
+    每个会话一个水位线 `cursors["__nonttext_seq__"][talker]`（**local_id** 语义），
+    避免同一张图每轮重复报。**不做「第一次见到就只记水位线不报」那种 seed**——那会让
+    「你在某个会话里发的第一张图」永远报不上来（那个会话还没进水位线，就被当成历史 seed
+    掉了）。启动边界的历史回放由两道现成机制挡着，不需要在这里再挡一次：
+      * 还没有基线的水位线配 `_NONTEXT_BOOTSTRAP_WINDOW`（只认近半小时内的非文本）；
       * `prime()` 会把边界那批消息塞进 `seen`，第一轮再查到的会被去重掉；
       * 真有「停机期间的旧消息」漏进来，bot 主循环的 catchup 判定也只通知、不自动回复。
     """
-    since = _as_int((cursors or {}).get("__time__", 0))
-    # 判据用 last_msg_type（结构），不用 summary 是否为空（那是个不成立的替身）——
-    # 详见本函数 docstring：语音/表情/视频/系统消息的 summary 都非空。
-    sql = ("SELECT username, last_timestamp, last_msg_type FROM SessionTable "
-           f"WHERE last_timestamp >= {since} "
-           "AND (last_msg_type IS NULL OR last_msg_type NOT IN (1, 49))")
-    try:
-        rows = _query(client, "session.db", sql)
-    except Exception as e:
-        _note_poll_error("session.db", e)
-        return []
+    # 水位线（**local_id 语义**，每个会话一份）：记「这个会话我扫到第几条了」。
+    # 旧的那份是会话时钟语义（`__nonttext__`），已退役并删掉——它依赖
+    # `SessionTable.last_timestamp`，而那个值真机实测能落后 17 小时（见 _v4_msg_seqs）。
+    # 两个 owner 说两套话正是要避免的，所以不留兼容读取。
+    cursors.pop("__nonttext__", None)
+    wm = cursors.get("__nonttext_seq__")
+    if not isinstance(wm, dict):
+        wm = cursors["__nonttext_seq__"] = {}
+    pending = cursors.get("__nonttext_pending__")
+    if not isinstance(pending, dict):
+        pending = cursors["__nonttext_pending__"] = {}
 
-    wm = cursors.setdefault("__nonttext__", {})
-    if not isinstance(wm, dict):          # 旧 state.json 里形状不对就重置，别让它挡住轮询
-        wm = cursors["__nonttext__"] = {}
+    # 新鲜度信号：每个会话的**最大 local_id**（一次查询，全部会话）。比水位线大 = 有新行。
+    try:
+        seqs = _v4_msg_seqs(client)
+    except Exception as e:
+        _note_poll_error("message_0.db", e)
+        return []
+    rev = _v4_talkers_by_table(client)
+
+    # 候选 = 上一轮被闸门挡下的（独立于任何时间窗口，绝不丢）∪ 这一轮有新行的
+    todo = {}
+    for talker, seq in pending.items():
+        talker, seq = str(talker or ""), _as_int(seq)
+        if talker and seq > _as_int(wm.get(talker, 0)):
+            todo[talker] = seq
+    for tab, seq in seqs.items():
+        talker = rev.get(tab)
+        if not talker or seq <= 0:
+            continue                       # 翻译不出会话名：跳过（拿不到名字就没法交给上层）
+        if seq <= _as_int(wm.get(talker, 0)):
+            continue                       # 自上次扫过之后没有新行 → 一次消息表都不查
+        if seq > todo.get(talker, 0):
+            todo[talker] = seq
+
+    # 从少到多：洪水时差得最少（最可能已经处理过）的先扫，不会因为新会话不断插队而饿死
+    order = sorted(todo.items(), key=lambda kv: kv[1])
+    picked = order[:_NONTEXT_MAX_SESSIONS]
+    cursors["__nonttext_pending__"] = {t: seq for t, seq in order[_NONTEXT_MAX_SESSIONS:]}
 
     seen = {(m.get("talker"), m.get("content"), m.get("_ts")) for m in (already or [])}
+    # 还没打过基线的会话（第一次跑 / state.json 丢了 / 刚出现的会话）：只认**刚发生的**
+    # 非文本，否则一上来就把每个会话最后 10 条历史里的图片/语音全回放一遍。
+    # 打过基线之后按 local_id 精确判，不设时间窗 —— **一条都不会漏**。
+    floor = int(time.time()) - _NONTEXT_BOOTSTRAP_WINDOW
     out = []
-    for r in rows:
-        talker = str(_pick(r, "username", 0) or "")
-        last_ts = _as_int(_pick(r, "last_timestamp", 1))
-        if not talker or last_ts <= 0:
-            continue
+    for talker, seq in picked:
         prev = _as_int(wm.get(talker, 0))
-        if last_ts <= prev:
-            continue
-        wm[talker] = last_ts
-        # 这条会话最后一条是非文本 → 回查它的消息表，把新增的那几条渲染出来
-        for m in _v4_history_from_tables(client, talker, limit=limit):
-            if _as_int(m.get("_ts", 0)) <= prev:
+        wm[talker] = seq
+        # 差得多就多看几条：只看最后 `limit` 条会在积压时漏掉更早的非文本，
+        # 而水位线一跳过去它就永久没了。封顶 60 条，别把重活压给 hook。
+        lim = int(limit) if not prev else max(int(limit), min(60, seq - prev))
+        for m in _v4_history_from_tables(client, talker, limit=lim):
+            # 文本 / appmsg 由 fts 那条路负责：这里再报一次＝同一条消息答两遍
+            if (_as_int(m.get("local_type", 0)) & 0xFFFFFFFF) in _TEXT_LOCAL_TYPES:
                 continue
+            lid = _as_int(m.get("local_id", 0))
+            if prev and lid and lid <= prev:
+                continue                   # 已经扫过的那几条（local_id 单调，判据是精确的）
+            if not prev and floor and _as_int(m.get("_ts", 0)) < floor:
+                continue                   # 还没有基线：老历史一律不报
             key = (m.get("talker"), m.get("content"), m.get("_ts"))
             if key in seen:
                 continue
@@ -2364,8 +2486,8 @@ def _v4_new_messages(client, cursors, limit=200):
                 "local_type": lt,
             })
 
-    # 补漏：图片之类**不在 fts 里**的消息，靠 SessionTable 的信号捞回来。
-    # 详见 _v4_pickup_nontext 的 docstring（这是「对方发图、bot 没反应」的根治处）。
+    # 补漏：图片之类**不在 fts 里**的消息，靠消息表自己的 local_id 水位线捞回来。
+    # 详见 _v4_pickup_nontext 的 docstring（这是「对方发图/语音、bot 没反应」的根治处）。
     try:
         out.extend(_v4_pickup_nontext(client, cursors, out, limit=10))
     except Exception as e:
@@ -2447,19 +2569,70 @@ def _v4_new_messages_session(client, cursors, limit=200):
 
 
 def _v4_new_messages_tables(client, cursors, limit=200):
-    """没有 fts 时的退路：用 SessionTable 找活跃会话，再逐个查 Msg_ 小表。
+    """没有 fts 时的退路：找出**有新消息的会话**，再逐个查 Msg_ 小表。
+
+    ⚠️ 判据有**两个来源，取并集**（2026-10-04 晚真机：fts 与 session.db 的句柄同时
+    失效，而 `message_0.db` 好好的，bot 却完全收不到消息）：
+      * `sqlite_sequence` —— 每个 `Msg_<md5>` 表的最大 `local_id`（跟落盘无关，永远新鲜）；
+      * `SessionTable.last_timestamp` —— 老来源，session.db 能用时照旧。
+    只留老来源是本条路曾经的死法：`session.db` 一旦查不动（或像真机那样 17 小时没落盘），
+    这里的候选就是空的，于是「fts 挂了还有兜底」这句话不成立 —— 三层一起瞎。
+
+    每个会话一份 `__msg_seq__` 水位线（local_id 语义）：「我读到第几条了」。
+    稳态下只有真有新行的会话会被查（0~几个），不是每个会话每轮都查。
 
     Msg_ 分片整个拿不到、或这条路上一条都没捞到时，退到 session.db 兜底——
     那条路只要 SessionTable 一张表，比逐会话去解析 Msg_ 句柄可靠得多。
     """
     cursors = dict(cursors or {})
     since = _as_int(cursors.get("__time__", 0))
+    # 每个会话一份「我读到第几条了」（local_id 语义）。
+    # ⚠️ **第一次**（state.json 里还没有这张表）只**打基线、不回放**：否则 ~290 个会话
+    # 会在同一轮里各查一次消息表（把 hook 压死），而且会把几十分钟的积压当新消息重放。
+    # 基线打好之后按 local_id 精确判，**一条都不会漏**，也只查真有新行的会话。
+    seeded = isinstance(cursors.get("__msg_seq__"), dict)
+    seqs = cursors.get("__msg_seq__") if seeded else {}
     out = []
     if _v4_msg_dbs(client):
+        try:
+            rev = _v4_talkers_by_table(client)
+            seq_map = _v4_msg_seqs(client)
+        except Exception as e:
+            _note_poll_error("message_0.db", e)
+            rev, seq_map = {}, {}
+        if not seeded:
+            base = {rev[t]: s for t, s in seq_map.items() if rev.get(t)}
+            if base:
+                cursors["__msg_seq__"] = seqs = base
+                print(f"[live] 已为 {len(base)} 个会话建立 local_id 基线（首次运行）："
+                      f"本轮不回放历史", file=sys.stderr, flush=True)
+            seq_map = {}          # 这一轮不把「历史上就有行」的会话当新消息
+
+        # 来源一：老信号（session.db）——它活着时照旧，行为不变
+        todo = {}
         for talker in _v4_active_talkers(client, since):
-            for m in _v4_history_from_tables(client, talker, limit):
-                if m["_ts"] >= since:
-                    out.append(m)
+            todo[talker] = _as_int(seqs.get(talker, 0))
+        # 来源二：`sqlite_sequence`（跟落盘无关，永远新鲜）—— session.db 死了也有它
+        for tab, seq in seq_map.items():
+            talker = rev.get(tab)
+            if talker and seq > _as_int(seqs.get(talker, 0)):
+                todo[talker] = seq
+
+        for talker, seq in todo.items():
+            prev = _as_int(seqs.get(talker, 0))
+            if seq:
+                seqs[talker] = seq
+            # 差得多就多看几条（漏了更早的那几条，水位线一跳过去它们就永久没了）
+            lim = int(limit) if not (seq and prev) else max(int(limit),
+                                                            min(200, seq - prev))
+            for m in _v4_history_from_tables(client, talker, lim):
+                # 已经读过的（local_id 单调，判据精确）——这也是「第一次只打基线」
+                # 之后不会把基线之前那几条再报一遍的原因
+                if prev and _as_int(m.get("local_id", 0)) <= prev:
+                    continue
+                if m["_ts"] < since:
+                    continue      # 时间上再拦一道：老来源（session.db）那条没有水位线
+                out.append(m)
     if not out:
         # 三层全废（fts 分片不可用 + Msg_ 分片拿不到 + session.db 也查不动）这件事的
         # 日志由 _v4_new_messages_session 自己发——只有它手里有那个异常原文，

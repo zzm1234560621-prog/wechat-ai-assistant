@@ -785,6 +785,11 @@ def main():
     gtxt = box5.t_group_members({"contact": "12345678901@chatroom"})
     ok &= check("group_members 标出群昵称和群主", "老张（群主）" in gtxt, gtxt)
     ok &= check("group_members 报出总人数", "共 2 人" in gtxt, gtxt)
+    # 真机抓到的 ext_buffer 里每个人**本来就带 wxid**（字段 1）——它必须出现在
+    # 工具输出里：模型发私聊靠的就是这个 id，只给群昵称会「一条都没发」（2026-10-04）。
+    ok &= check("group_members 把真实 wxid 列出来",
+                "wxid=wxid_aaaaaaaaaaaaa" in gtxt and "wxid=wxid_bbbbbbbbbbbbb" in gtxt,
+                gtxt)
     ok &= check("非群会话被拒绝，不硬查",
                 "不是群" in box5.t_group_members({"contact": "wxid_friendA"}))
     before_g = _V4StaleFtsStub.dbs_called

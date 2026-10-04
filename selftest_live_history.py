@@ -14,6 +14,7 @@ import io
 import sqlite3
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer
 
 import aixed_api
@@ -646,6 +647,12 @@ def main():
     print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
     ok &= _t_nonttext_pickup()
 
+    print("\n── 非文本补漏的窗口：不许被本批更晚的消息推走（语音条就是这么丢的）──")
+    ok &= _t_poll_window_keeps_nontext()
+
+    print("\n── fts 与 session.db 同时失效：靠 sqlite_sequence 照样收得到 ──")
+    ok &= _t_fallback_survives_dead_session_db()
+
     print("\n── 微信自带的「标签」：成员藏在 contact_fts 的 search_key 第 4 段 ──")
     ok &= _t_labels()
 
@@ -655,7 +662,10 @@ def main():
     return 0 if ok else 1
 
 
-_IMG_TS = 1790000100
+# 非文本补漏的用例时间戳**必须是「刚刚」**：还没打过基线的会话要过
+# `_NONTEXT_BOOTSTRAP_WINDOW`（默认 1800 秒）那道兜底闸，用固定的远古时刻会被它挡掉。
+_IMG_TS = int(time.time()) - 100
+
 
 
 def _t_fts_history_fields():
@@ -694,21 +704,52 @@ class _PickupStub:
 
     真实故障的形状（2026-10-01 实测）：**图片不在 fts 里**（四个分片
     `local_type=3` 全是 0 条），而 SessionTable 里那个会话 `summary` 是空串。
+
+    2026-10-04 晚起，新鲜度信号换成了 `message_0.db.sqlite_sequence`
+    （每个 `Msg_<hash>` 一行的最大 `local_id`）—— 所以这个桩要同时回答它。
     """
 
-    def __init__(self, last_ts=_IMG_TS, has_image=True):
+    def __init__(self, last_ts=_IMG_TS, has_image=True, last_type=3, rows=None):
         self.last_ts = last_ts
         self.has_image = has_image
+        self.last_type = last_type
+        # rows = 显式给这个会话的消息表内容（用来演「图后面跟了一句话」）
+        self.rows = rows
         self.sql_log = []
+
+    @property
+    def seq(self):
+        """这个会话的**最大 local_id** —— 新的那条新鲜度信号。"""
+        if self.rows is None:
+            return 7 if self.has_image else 0
+        best = 0
+        for r in self.rows:
+            try:
+                best = max(best, int(r.get("local_id") or 0))
+            except (TypeError, ValueError):
+                pass
+        return best
 
     def query_sql(self, db, sql):
         self.sql_log.append((db, sql))
         if db == "session.db":
-            return [{"username": "filehelper", "last_timestamp": str(self.last_ts)}]
+            # 反查表名 → 会话名（`SELECT username FROM SessionTable`）也走这里
+            return [{"username": "filehelper", "last_timestamp": str(self.last_ts),
+                     "last_msg_type": self.last_type}]
         if db.startswith("message_"):
+            # 真机上该会话的表**只在一个分片里**（其余分片探测就该失败）——
+            # 不过这一条，`_v4_msg_dbs` 会返回 8 个库、同一批行被复制 8 份，
+            # 最后 `rows[-limit:]` 只留下时间最新的那几条（自测会假绿/假红）。
+            if db != "message_0.db":
+                return []
+            if "sqlite_sequence" in sql:
+                return ([{"name": live_history._v4_table_for("filehelper"),
+                          "seq": str(self.seq)}] if self.seq else [])
             if "sqlite_master" in sql:
                 return [{"x": 1}]
             if "FROM Msg_" in sql:
+                if self.rows is not None:
+                    return self.rows
                 if self.has_image:
                     return [{"local_id": "7", "local_type": "3",
                              "create_time": str(self.last_ts),
@@ -724,8 +765,70 @@ class _PickupStub:
         return [s for db, s in self.sql_log if "FROM Msg_" in s]
 
 
+class _PickupMultiStub:
+    """多会话版：每个会话各有自己的 last_timestamp / last_msg_type / 消息行。
+
+    按 `Msg_<md5(会话)>` 表名定位到会话（`_v4_table_for` 就是那条映射），
+    所以「哪个会话被查了」是**真的**由 SQL 决定的，不是靠调用顺序猜的。
+    """
+
+    def __init__(self, sessions):
+        # sessions = {talker: {"last_ts": int, "last_type": int, "rows": [...]}}
+        self.sessions = sessions
+        self._by_table = {live_history._v4_table_for(t): s
+                          for t, s in sessions.items()}
+        self.sql_log = []
+
+    def query_sql(self, db, sql):
+        self.sql_log.append((db, sql))
+        if db == "session.db":
+            since = 0
+            if "last_timestamp >= " in sql:
+                try:
+                    since = int(sql.split("last_timestamp >= ")[1].split()[0])
+                except (IndexError, ValueError):
+                    since = 0
+            return [{"username": t, "last_timestamp": str(s["last_ts"]),
+                     "last_msg_type": s.get("last_type", 1)}
+                    for t, s in self.sessions.items() if s["last_ts"] >= since]
+        if db.startswith("message_"):
+            if db != "message_0.db":
+                return []                # 同上：一个会话的表只在一个分片里
+            if "sqlite_sequence" in sql:
+                out = []
+                for s in self.sessions.values():
+                    best = max([int(r.get("local_id") or 0)
+                                for r in (s.get("rows") or [])] or [0])
+                    if best:
+                        tbl = live_history._v4_table_for(
+                            [t for t, x in self.sessions.items() if x is s][0])
+                        out.append({"name": tbl, "seq": str(best)})
+                return out
+            if "sqlite_master" in sql:
+                return [{"x": 1}]
+            if "FROM Msg_" in sql:
+                for tbl, s in self._by_table.items():
+                    if tbl in sql:
+                        return list(s.get("rows") or [])
+                return []
+            return []
+        raise aixed_api.AixedError(db)
+
+    def get_dbs(self):
+        return []
+
+    def msg_queries(self):
+        return [s for db, s in self.sql_log if "FROM Msg_" in s]
+
+
 def _t_nonttext_pickup():
-    """非文本补漏的三条硬要求：不报历史、不重复报、稳态零开销。"""
+    """非文本补漏的硬要求：不报历史、不重复报、稳态零开销、**图后面跟一句话也要报**。
+
+    2026-10-04 晚换判据：新鲜度信号从 `SessionTable.last_timestamp` 换成
+    `message_0.db.sqlite_sequence`（每会话最大 `local_id`）。真机实测 `session.db`
+    能 17 小时不落盘，那个信号会让**一个会话都匹配不到**（语音全丢、无日志）。
+    所以水位线也换成 local_id 语义：`cursors["__nonttext_seq__"]`。
+    """
     ok = True
     _clear_poll_errors()
     c = _PickupStub()
@@ -736,19 +839,24 @@ def _t_nonttext_pickup():
                 len(out1) == 1 and out1[0].get("local_type") == 3
                 and "[图片]" in str(out1[0].get("content")),
                 out1)
-    ok &= check("报到之后水位线记下这个会话",
-                (cursors.get("__nonttext__") or {}).get("filehelper") == _IMG_TS,
-                cursors.get("__nonttext__"))
+    ok &= check("报到之后水位线 = 这个会话的**最大 local_id**",
+                (cursors.get("__nonttext_seq__") or {}).get("filehelper") == 7,
+                cursors.get("__nonttext_seq__"))
+    ok &= check("旧的水位线（会话时钟语义）退役并删掉，不留两个 owner",
+                "__nonttext__" not in cursors, list(cursors))
 
-    c.last_ts = _IMG_TS + 5
-    out2 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
-    ok &= check("水位线前进之后，把新的那张图片消息报上来",
+    # 会话里又来了新的（local_id 比水位线大）→ 必须报
+    c2 = _PickupStub(rows=[{"local_id": "8", "local_type": "3",
+                            "create_time": str(_IMG_TS),
+                            "real_sender_id": "0", "message_content": ""}])
+    out2 = live_history._v4_pickup_nontext(c2, cursors, [], limit=5)
+    ok &= check("local_id 前进之后，把新的那张图片消息报上来",
                 len(out2) == 1 and out2[0].get("local_type") == 3
                 and "[图片]" in str(out2[0].get("content")),
                 out2)
 
-    out3 = live_history._v4_pickup_nontext(c, cursors, [], limit=5)
-    ok &= check("同一张图不会每轮重复报（水位线生效）", out3 == [], out3)
+    out3 = live_history._v4_pickup_nontext(c2, cursors, [], limit=5)
+    ok &= check("同一张图不会每轮重复报（local_id 水位线生效）", out3 == [], out3)
 
     # 图片消息要自己说清「能不能看」+ 带上 local_id（模型据此直接调 read_image）
     body = str(out1[0].get("content") or "")
@@ -758,31 +866,284 @@ def _t_nonttext_pickup():
                 "看不了内容" in body, body)
 
     # 已经在 fts 结果里的那条不许重复报（去重）
-    c.last_ts = _IMG_TS + 9
-    dup = [{"talker": "filehelper", "content": out2[0]["content"], "_ts": _IMG_TS + 9}]
-    out4 = live_history._v4_pickup_nontext(c, cursors, dup, limit=5)
-    ok &= check("已经在 fts 结果里的那条不重复报", out4 == [], out4)
+    img8 = {"local_id": "8", "local_type": "3", "create_time": str(_IMG_TS),
+            "real_sender_id": "0", "message_content": ""}
+    cur_d = {"__time__": _IMG_TS - 100, "__nonttext_seq__": {"filehelper": 7}}
+    got = live_history._v4_pickup_nontext(_PickupStub(rows=[img8]), cur_d, [], limit=5)
+    cur_d2 = {"__time__": _IMG_TS - 100, "__nonttext_seq__": {"filehelper": 7}}
+    out4 = live_history._v4_pickup_nontext(_PickupStub(rows=[img8]), cur_d2, got, limit=5)
+    ok &= check("已经在 fts 结果里的那条不重复报",
+                len(got) == 1 and out4 == [], (got, out4))
 
-    # 稳态：summary 非空（最后一条是文本）→ 假 client 返回空 → 一次消息表都不查
-    class _NoNontext(_PickupStub):
+    # ⚠️ 2026-10-04 真机：**图后面紧跟一句话**（用户发完图马上打字提问）。
+    # 那时的 `last_msg_type` 已经是 1（文本），旧实现按它当闸 → 这张图永久消失。
+    # 现在判据是「这个会话有动静」，图必须照报，而那句话（文本）不许重复报。
+    img = {"local_id": "8", "local_type": "3", "create_time": str(_IMG_TS + 20),
+           "real_sender_id": "0", "message_content": ""}
+    txt = {"local_id": "9", "local_type": "1", "create_time": str(_IMG_TS + 21),
+           "real_sender_id": "0", "message_content": "图片里的价格怎么样"}
+    c_img_then_text = _PickupStub(last_ts=_IMG_TS + 21, last_type=1,
+                                  rows=[img, txt])
+    cur_it = {"__time__": _IMG_TS + 15}
+    out6 = live_history._v4_pickup_nontext(c_img_then_text, cur_it, [], limit=5)
+    ok &= check("图后面跟了一句话：那张图**照样报上来**（旧实现会永久丢掉）",
+                len(out6) == 1 and out6[0].get("local_type") == 3
+                and "[图片]" in str(out6[0].get("content")), out6)
+    ok &= check("同一批里的**文本不许重复报**（那条是 fts 的活）",
+                all(live_history._as_int(x.get("local_type")) != 1 for x in out6), out6)
+
+    # 稳态：会话没有新动静 → 一次消息表都不查
+    class _NoChange(_PickupStub):
         def query_sql(self, db, sql):
             self.sql_log.append((db, sql))
             if db == "session.db":
-                return []            # 真实 SQL 已经用 summary='' 过滤掉了
+                return []            # 没有会话 `last_timestamp >= since`
             return []
 
-    c2 = _NoNontext()
+    c2 = _NoChange()
     cur2 = {"__time__": _IMG_TS}
     out5 = live_history._v4_pickup_nontext(c2, cur2, [], limit=5)
-    ok &= check("最后一条是文本时：零额外查询、零输出（稳态不加负担）",
+    ok &= check("没有会话有动静时：零额外查询、零输出（稳态不加负担）",
                 out5 == [] and c2.msg_queries() == [], (out5, c2.msg_queries()))
 
+    # 闸门：一轮最多扫 8 个会话，超出的进 pending，**下一轮不看 since 也照样扫**
+    many = {}
+    for i in range(11):
+        many["room%d@chatroom" % i] = {
+            "last_ts": _IMG_TS + i, "last_type": 1,
+            "rows": [{"local_id": str(100 + i), "local_type": "3",
+                      "create_time": str(_IMG_TS + i),
+                      "real_sender_id": "0", "message_content": ""}],
+        }
+    cur_m = {"__time__": _IMG_TS - 100}
+    out_m = live_history._v4_pickup_nontext(_PickupMultiStub(many), cur_m, [],
+                                           limit=5)
+    ok &= check("洪水时一轮只扫 8 个会话（不一次压几十条查询给 hook）",
+                len(out_m) == 8, len(out_m))
+    ok &= check("超出的 3 个记进 pending",
+                len(cur_m.get("__nonttext_pending__") or {}) == 3,
+                cur_m.get("__nonttext_pending__"))
+    # 第二轮：since 已经被推到很后面（模拟 __time__ 被后续消息推走），
+    # 但 pending 里的会话**照样要扫**——这正是「只靠 since 会丢消息」那个坑。
+    cur_m["__time__"] = _IMG_TS + 10_000
+    out_m2 = live_history._v4_pickup_nontext(_PickupMultiStub(many), cur_m, [],
+                                             limit=5)
+    ok &= check("pending 里的会话下一轮照样扫（不被 since 挡掉）",
+                len(out_m2) == 3, len(out_m2))
+    ok &= check("pending 清空", (cur_m.get("__nonttext_pending__") or {}) == {},
+                cur_m.get("__nonttext_pending__"))
+
     # 坏掉的游标形状不许把轮询挡住
-    cur3 = {"__time__": _IMG_TS, "__nonttext__": "垃圾"}
+    cur3 = {"__time__": _IMG_TS, "__nonttext_seq__": "垃圾"}
     c3 = _PickupStub(last_ts=_IMG_TS + 1)
     live_history._v4_pickup_nontext(c3, cur3, [], limit=5)
-    ok &= check("__nonttext__ 形状不对时自动重置，不抛异常",
-                isinstance(cur3.get("__nonttext__"), dict), cur3.get("__nonttext__"))
+    ok &= check("__nonttext_seq__ 形状不对时自动重置，不抛异常",
+                isinstance(cur3.get("__nonttext_seq__"), dict), cur3.get("__nonttext_seq__"))
+    return ok
+
+
+class _DeadSessionStub:
+    """`session.db` 与 `message_fts.db` 句柄**同时失效**，只有 message_0.db 能用。
+
+    2026-10-04 晚真机就是这形状：这两个库的查询一直报
+    `get database handle which named … failed`，而 `message_0.db` / `message_resource.db`
+    好好的 —— 旧实现只拿 SessionTable 当「谁有新消息」的信号，于是候选为空，
+    bot **完全收不到消息**（连文本都收不到）。
+    """
+
+    def __init__(self, rows, seq):
+        self.rows = rows
+        self.seq = seq
+        self._ft = live_history._v4_table_for("filehelper")
+
+    def query_sql(self, db, sql):
+        if db in ("session.db", "message_fts.db"):
+            raise aixed_api.AixedError(
+                f"查库 {db} 失败：get database handle which named {db} failed")
+        if db == "message_resource.db":
+            if "ChatName2Id" in sql:
+                return [{"rowid": "6", "user_name": "filehelper"}]
+            return []
+        if db == "message_0.db":
+            if "sqlite_sequence" in sql:
+                return [{"name": self._ft, "seq": str(self.seq)}]
+            if "sqlite_master" in sql:
+                return [{"x": 1}]
+            if ("FROM " + self._ft) in sql:
+                return self.rows
+            return []
+        return []
+
+    def get_dbs(self):
+        return []
+
+
+def _t_fallback_survives_dead_session_db():
+    """fts 与 session.db 都失效时，靠 `sqlite_sequence` 照样收到消息（含语音条）。
+
+    这是 2026-10-04 晚真机的形状：那两个库的句柄一直取不到，语音/文本**全收不到**。
+    只要 `message_0.db` 还在，就有救 —— 而它是新判据唯一依赖的库。
+    """
+    ok = True
+    _clear_poll_errors()
+    now = int(time.time())
+    old = [
+        {"local_id": "4", "local_type": "1", "create_time": str(now - 600),
+         "real_sender_id": "0", "message_content": "更早的一句话"},
+        {"local_id": "5", "local_type": "34", "create_time": str(now - 599),
+         "real_sender_id": "0", "message_content": ""},
+    ]
+    # 第一次：只打基线，不回放历史
+    out0, cur = live_history._v4_new_messages(_DeadSessionStub(old, seq=5), {})
+    ok &= check("第一次只打 local_id 基线、不回放历史（否则约 290 个会话同轮各查一次）",
+                out0 == [] and (cur.get("__msg_seq__") or {}).get("filehelper") == 5,
+                (out0, cur.get("__msg_seq__")))
+
+    # 之后来了新的：一句文本 + 一条语音条
+    rows = old + [
+        {"local_id": "6", "local_type": "1", "create_time": str(now - 60),
+         "real_sender_id": "0", "message_content": "搜索"},
+        {"local_id": "7", "local_type": "34", "create_time": str(now - 59),
+         "real_sender_id": "0", "message_content": ""},
+    ]
+    out, cur2 = live_history._v4_new_messages(_DeadSessionStub(rows, seq=7), cur)
+    ok &= check("session.db / message_fts.db 全失效时**照样收到消息**",
+                len(out) == 2, out)
+    ok &= check("语音条（local_type=34）也在里面，并且渲染成可读的一行",
+                any(live_history._as_int(m.get("local_type")) == 34
+                    and "语音条" in str(m.get("content")) for m in out), out)
+    ok &= check("文本也在里面（这条路上 fts 已经不干活了）",
+                any(str(m.get("content")) == "搜索" for m in out), out)
+    ok &= check("水位线按 local_id 记下来",
+                (cur2.get("__msg_seq__") or {}).get("filehelper") == 7,
+                cur2.get("__msg_seq__"))
+    out2, _ = live_history._v4_new_messages(_DeadSessionStub(rows, seq=7), cur2)
+    ok &= check("同一批不会每轮重复报", out2 == [], out2)
+    return ok
+
+
+class _PollOneRoundStub:
+    """**一整轮轮询**的假库（考 `_v4_new_messages`，不是单个函数）。
+
+    复刻真机 2026-10-04 16:42 那一轮（用户发的 4 秒语音**一行日志都没有**）：
+      * 语音条在 filehelper 里（`local_type=34`），**不进 fts**（结构性事实）；
+      * 同一批里**另一个会话来了一条更晚的文本**（`other_ts`）——它会把 fts 游标
+        `__time__` 推过那条语音；
+      * filehelper 自己最后一条是紧跟语音后面的那句文本（`last_msg_type=1`）。
+
+    真机的数据形状就是这样：`_v4_pickup_nontext` 拿的是「会话有动静」这个信号，
+    而**这个会话的 last_timestamp 是那句文本**，不是语音。
+    """
+
+    def __init__(self, voice_ts, text_ts, other_ts, voice_type=34):
+        self.voice_ts = voice_ts
+        self.text_ts = text_ts
+        self.other_ts = other_ts
+        self.voice_type = voice_type
+        self.sql_log = []
+        self._ft = live_history._v4_table_for("filehelper")
+        # 会话表查询里那个 `since`（能不能捞到 filehelper 全看它）
+        self.session_since = []
+
+    def query_sql(self, db, sql):
+        self.sql_log.append((db, sql))
+        if db == "message_fts.db":
+            if "sqlite_master" in sql:
+                return [{"name": "message_fts_v4_0"}]
+            if "FROM Name2Id" in sql:
+                if "username =" in sql:            # 自己那个 id：拿不到就算了
+                    return []
+                return [{"rowid": "5", "username": "other_friend"},
+                        {"rowid": "7", "username": "filehelper"}]
+            if "message_fts_v4_" in sql:
+                # 本批唯一进 fts 的一条：**别的会话**、比语音更晚
+                return [{"rowid": "11", "acontent": "别的会话的一句话",
+                         "session_id": "5", "sender_id": "2",
+                         "create_time": str(self.other_ts),
+                         "local_type": "1", "message_local_id": "1"}]
+            return []
+        if db == "session.db":
+            if "FROM SessionTable" in sql:
+                since = 0
+                if "last_timestamp >= " in sql:
+                    try:
+                        since = int(sql.split("last_timestamp >= ")[1].split()[0])
+                    except (IndexError, ValueError):
+                        since = 0
+                self.session_since.append(since)
+                rows = [{"username": "filehelper",
+                         "last_timestamp": str(self.text_ts), "last_msg_type": 1},
+                        {"username": "other_friend",
+                         "last_timestamp": str(self.other_ts), "last_msg_type": 1}]
+                return [r for r in rows
+                        if int(r["last_timestamp"]) >= since]
+            return []
+        if db.startswith("message_"):
+            if db != "message_0.db":
+                return []                          # 同上：一个会话的表只在一个分片里
+            if "sqlite_sequence" in sql:
+                return [{"name": self._ft, "seq": "43"}]
+            if "sqlite_master" in sql:
+                return [{"x": 1}]
+            if "FROM Name2Id" in sql:
+                return []
+            if ("FROM " + self._ft) in sql:
+                return [
+                    {"local_id": "42", "local_type": str(self.voice_type),
+                     "create_time": str(self.voice_ts), "real_sender_id": "0",
+                     "message_content": "", "packed_info_data": ""},
+                    {"local_id": "43", "local_type": "1",
+                     "create_time": str(self.text_ts), "real_sender_id": "0",
+                     "message_content": "1", "packed_info_data": ""},
+                ]
+            return []
+        return []
+
+    def get_dbs(self):
+        return []
+
+
+def _t_poll_window_keeps_nontext():
+    """轮询窗口**不许被本批更晚的消息推走**——「语音条一行日志都没有」的真正成因。
+
+    真机现场（2026-10-04 16:42，控制会话）：用户发了一条 4 秒语音，紧接着一句「1」，
+    同一批里别的会话也在动。`bot.log` 里**没有任何一行**跟这条语音有关
+    —— 不是「读不出来」，是**根本没送到语音分支**，bot 只回了一句无关的话。
+
+    成因：`_v4_new_messages` 先把 `cursors["__time__"]` 推到**本批最新**
+    （`other_ts`，来自别的会话），再拿这个已经被推走的值当非文本补捞的窗口。
+    而 filehelper 的 `last_timestamp` 是那句文本（`text_ts < other_ts`）
+    —— 于是 `WHERE last_timestamp >= since` 直接把这个会话排除掉，
+    **整条会话连候选都不是**，里面的语音永久消失（水位线也没记，下一轮 since 更晚）。
+
+    契约：补捞窗口必须是**轮询前**的水位（「上一轮看到的时刻」），
+    因为真正防重复的是每个会话自己的 `__nonttext__` 水位线。
+    """
+    ok = True
+    _clear_poll_errors()
+    voice_ts, text_ts = _IMG_TS + 10, _IMG_TS + 11
+    # 本批里**别的会话**那条比语音晚 1 小时：它会把 fts 游标 `__time__` 推得老远。
+    # 拿推走之后的值当窗口，这条语音就够不着了（真机就是这么丢的）。
+    other_ts = voice_ts + 3600
+    c = _PollOneRoundStub(voice_ts, text_ts, other_ts)
+    cursors = {"__time__": _IMG_TS}
+
+    out, cur2 = live_history._v4_new_messages(c, cursors)
+
+    ok &= check("前提：本批最新那条比语音晚很多（足够把窗口推出去）",
+                other_ts - voice_ts > live_history._NONTEXT_BOOTSTRAP_WINDOW,
+                (voice_ts, other_ts))
+    ok &= check("语音条**送到上层**了（有内容、带 local_type=34）",
+                any(live_history._as_int(m.get("local_type")) == 34 for m in out),
+                out)
+    ok &= check("语音渲染成可读的一行（不是空串走 `if not query: continue` 静默丢掉）",
+                any("语音条" in str(m.get("content")) for m in out)
+                and all(str(m.get("content")).strip() for m in out), out)
+    ok &= check("同一批里别的会话那条文本照常上报（补捞不许顶掉 fts 的活）",
+                any(str(m.get("talker")) == "other_friend" for m in out), out)
+    ok &= check("语音报过之后记下这个会话的水位线（下一轮不会重复报）",
+                (cur2.get("__nonttext_seq__") or {}).get("filehelper") == 43,
+                cur2.get("__nonttext_seq__"))
     return ok
 
 

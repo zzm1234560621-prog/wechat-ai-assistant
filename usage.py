@@ -57,8 +57,9 @@ USAGE_PATH = os.path.join(PROJECT_DIR, "data", "usage.jsonl")
 #   deepseek-reasoner  输入 4 元/百万，输出 16 元/百万  ← 别的 key 上可能还能用，留档
 #
 # 明确**没有**收录的（不是忘了，是查不到可信公开价 / 会随版本变）：
-#   Claude 各档、通义千问、Kimi、智谱 GLM、OpenAI —— 这些走 unpriced 分支，
+#   Claude 各档、通义千问、Kimi、OpenAI、以及智谱的**付费档** —— 这些走 unpriced 分支，
 #   只报 token。用户要算钱，请自己按服务商价目表加进下面这张表。
+#   智谱这边**只收了官方明确标注"免费"的那一个**（glm-4.7-flash，单价 0）。
 #
 # 两处**会让估算偏高**的地方（诚实写在这儿，别当成 bug）：
 #   ① 按高峰价填，空闲时段（含周末/节假日）实际只要一半；
@@ -69,6 +70,17 @@ PRICE_TABLE = {
     "deepseek-v4-pro": (9.0, 27.0),
     "deepseek-chat": (2.0, 8.0),
     "deepseek-reasoner": (4.0, 16.0),
+    # 智谱**免费**的两款（官方定价页「免费 / 免费」，2026-10-04 核
+    # https://docs.bigmodel.cn/cn/guide/start/pricing.md）。填 0 是**事实**、不是估的：
+    # `/用量` 会报「估算 ¥0」，而不是含糊的「没有价目表」。
+    #   glm-4-flash-250414 —— 本项目**现役**。实测连打 6 次全成功、0.2~0.5s、
+    #                          工具调用正常、不带思考（reasoning_tokens=0）
+    #   glm-4.7-flash      —— 更聪明，但**限流严重**（实测 6 次里 4 次 429/1305），
+    #                          且**默认开思考**：max_tokens=64 时 64 个 token 全花在
+    #                          思考上、正文返回空。留着备查，不建议当现役。
+    # 哪天智谱开始收费，改这两行或删掉它们。
+    "glm-4-flash-250414": (0.0, 0.0),
+    "glm-4.7-flash": (0.0, 0.0),
 }
 
 # 归一化时剥掉的 provider 前缀（只剥**已知**前缀，见 _norm_model）。

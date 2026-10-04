@@ -341,3 +341,145 @@ plain_tail = bytes(b ^ 0x6C for b in blob[15 + aesz:])
 
 
 含义：**「发给自己就能读聊天图」不成立**（最近发的基本都没有明文缩略图），要读图就走 `file_read` 那条「当文件发原图」。
+
+
+## 非文本补捞的判据演进（2026-10-04，从 CLAUDE.md 搬来）
+
+图片/语音/表情**不在 fts 里**（四个分片 `local_type=3` 全是 0），`_v4_new_messages_session`
+又按 `summary` 过滤（图片是空串）——两条路都瞎。所以 `live_history._v4_pickup_nontext`
+是唯一入口，它的判据改过两次，**别改回去**：
+
+| 版本 | 判据 | 后果 |
+|---|---|---|
+| 最初 | `SessionTable.summary = ''` | 语音/表情/视频的 summary 非空 → 永远进不来（2026-10-03 真机：「我发了条语音，bot 完全没反应」） |
+| 2026-10-03 | `last_msg_type NOT IN (1,49)` | **图后面紧跟一句话就被吞**：`last_msg_type` 已是 1，该会话当轮不回查 → 那张图**永久消失**（2026-10-04 真机：用户发图 + 紧接着问「图片里的价格怎么样」，bot 去别的群乱找） |
+| **现在** | **会话只要有动静就回查它的消息表，再按行挑非文本** | 图不会再丢；文本/appmsg 由 fts 负责，这条路**按行丢掉**它们，所以同一条消息不会被答两遍 |
+
+配套的两道闸：
+
+- **稳态零开销**：`last_timestamp` 和每会话水位线 `cursors["__nonttext__"][talker]`
+  相同 → 一个会话都不命中 → 一次消息表都不查。
+- **一轮最多扫 `_NONTEXT_MAX_SESSIONS`(8) 个会话**（按时间从早到晚，防饿死），
+  超出的写进 `cursors["__nonttext_pending__"]`，**下一轮不看 `since` 也照样扫**。
+  为什么 pending 必须独立于 `since`：`__time__` 会被后续消息推着往前，一旦被闸门挡下的
+  会话落到窗口之外，那张图就真丢了。
+
+回归：`selftest_live_history._t_nonttext_pickup`（15 条，含「图后面跟一句话照样报」、
+「同一批的文本不许重复报」、「洪水只扫 8 个 + pending 下一轮照样扫」）。
+
+
+## 控制会话发来的图：`read_image` 不填参数就能读（2026-10-04）
+
+用户在控制会话（文件传输助手）发一张图、紧接着问「图片里的价格怎么样」时，
+那张图**不进消息流**：`bot.stash_control_media` 把它收进素材暂存区就 `continue` 了
+（这是「发一次，之后说发给谁」那个设计）。所以模型手里**没有 local_id**，
+但那张图的**明文副本就在本地**（`data/stash/`，来自微信刚发出去的临时原图）。
+
+于是 `t_read_image` 加了一条：**两个参数都不填** → `_read_stashed_image()`
+读暂存区里**最新那条、且 `talker` 和当前会话对得上**的图。三条规矩：
+
+1. **只认控制会话那条**——别处的图必须点名 `contact` + `local_id`，
+   否则模型会读到别处的图、答非所问；
+2. 读不出来（没明文副本 / `image.mode=off` / OCR 失败）**如实说 + 建议用户
+   把图「以文件方式」再发一次**，**绝不编图里的内容**；
+3. 顺带修掉一个真 bug：老代码 `_image_collector(f"{nm} 的图")` 里的 `nm`
+   **根本没定义**，于是「有缓存、能读」那条路一读就 `NameError`
+   （没有测试覆盖，一直没被发现）。
+
+回归：`selftest_policy.test_read_image`（6 条：缓存图能读 + 不崩、
+不填参数读暂存区、别处的图不读、没明文时如实说、参数只给一半要拒绝）。
+
+
+## ⚠️ 补漏的「新鲜度信号」以前是坏的：`session.db` **17 小时没落盘**（2026-10-04 晚）
+
+**真机现场**：用户 16:42 在控制会话发了一条 **4 秒语音**，`bot.log` 里**没有任何一行**
+跟它有关 —— 不是「读不出来」，是**根本没送到**（连 `[bot] 自聊模式，处理自己的消息: …`
+都没打），bot 只回了后面那句文本「1」。语音本身好好的躺在消息表里：
+
+```
+Msg_9e20f478899dc29eb19741386f9343c8（= md5("filehelper")）
+  local_id=848  local_type=34(语音)  create_time=16:42:55
+  local_id=849  local_type=1 (文本)  create_time=16:47:55   ← 那句「1」
+  local_id=850  local_type=1         create_time=16:48:04   ← bot 的回复
+```
+
+**根因：候选闸用的时钟是坏的。** `_v4_pickup_nontext` 当时是
+`SELECT … FROM SessionTable WHERE last_timestamp >= since`，而 `since` 来自**消息**时钟
+（`__time__`，16:56）。可是真机上：
+
+| 库 | 最后落盘 | 里面最新的时间 |
+|---|---|---|
+| `session.db` / `-wal` | **2026-10-04 00:16:37** | `MAX(last_timestamp)=00:16:25` |
+| `message_fts.db` | 16:56:13 | 消息到 16:56:23 |
+| `message_0.db` | 17:12:54 | 消息到 16:57:28 |
+
+于是停掉 bot、只读查询复现得很干脆：
+
+```
+SELECT username, last_timestamp, last_msg_type FROM SessionTable
+  WHERE last_timestamp >= 1791104183   →  0 行      ← 当时真实的 since（16:56）
+  WHERE last_timestamp >= 1791044185   →  1 行      ← 会话表自己的最大值（00:16）
+```
+
+**0 个候选会话 ⇒ 语音/图片/表情/视频全丢**，而且**连一行日志都没有**。
+`data/state.json` 里 `__nonttext__` 那 74 条水位线**全是 10-03 及以前的**
+（10-04 一条都没有）—— 这条补捞路从 00:16 起就死了。这就是早就记过的「吞图」。
+（顺带一提：`session.db` 不落盘会让**所有**依赖它的路一起瞎，包括
+`_v4_new_messages_session` 与 `_v4_new_messages_tables` 那两条兜底路。）
+
+**修法：换成一个跟 session.db 无关、且天生新鲜的新鲜度信号 ——
+`message_0.db` 的 `sqlite_sequence`。** 它是 SQLite 自己维护的 AUTOINCREMENT 计数器：
+每个 `Msg_<md5(会话)>` 一行、`seq` 就是该会话**最新一条的 `local_id`**
+（实测 855 = 该表最新行的 local_id，含那条语音）。一次查询拿到**全部**会话，且随每次插入更新。
+
+| | 旧（坏） | 新 |
+|---|---|---|
+| 新鲜度信号 | `SessionTable.last_timestamp`（依赖落盘） | `sqlite_sequence.seq`（= 最大 `local_id`） |
+| 水位线 | `cursors["__nonttext__"]`（会话时钟秒） | `cursors["__nonttext_seq__"]`（**local_id**） |
+| 判据 | `last_timestamp >= since`（**全局时间窗**） | `seq > 水位线`（**每会话精确**） |
+| 时间窗 | 必须靠它挑候选 | **彻底不要**（见下） |
+
+**「本批里别的会话来了条更晚的消息」再也推不动它**（旧实现拿 `__time__` 当窗口，
+正是这样把整条会话排除掉的）：判据只有每会话自己的 `local_id`。只有**还没打过基线**的
+会话（第一次跑 / `state.json` 丢了 / 刚出现的会话）才用
+`time.time() - _NONTEXT_BOOTSTRAP_WINDOW`（默认 1800 秒）兜一道 —— 只认刚发生的，
+绝不把历史回放一遍。`__nonttext__` 那份旧水位线**已退役并直接删掉**（两个 owner
+说两套话正是要避免的）。
+
+⚠️ **别改回去什么**：
+
+1. **不许**把候选判据换回 `SessionTable.last_timestamp`（或任何依赖 session.db 落盘的列）
+   —— 那正是这个 bug（1 行日志都没有的那种）。
+2. `_NONTEXT_BOOTSTRAP_WINDOW` 那道兜底闸**不许删**：删了会在「第一次跑 / state 丢了」时
+   把每个会话最后 10 条历史里的图片语音全当新消息回放。
+3. 水位线必须是 **local_id 语义**（`__nonttext_seq__`）：换成时间戳就又回到「精确不了」。
+4. 一轮 8 个会话 + `__nonttext_pending__` 两道闸**不许删**（hook 不支持并发）。
+5. 这一条修的是**送达**，不是**转写**：送达之后能不能读出字，仍然由 `voice_mem`
+   （内存里找 SILK + 长度指纹 + `voice.scan_seconds`）说话，读不出来照样如实说
+   （见 `voice-reliability-2026-10-03.md`）。**音频已经不在内存的旧语音谁也救不回来** ——
+   上面那条 16:42 的语音，没读出来就是因为这个，不是因为送达。
+
+回归：`selftest_live_history._t_nonttext_pickup`（16 条，水位线 = 最大 local_id /
+旧水位线退役 / 图后面跟一句话照样报 / 洪水只扫 8 个 + pending 照样扫）、
+`_t_poll_window_keeps_nontext`（本批那条晚 1 小时的消息**推不动**语音）。
+真机只读侦察脚本：`_audit/probe_voice_drop.py`。
+
+### 同一条信号也用在了**兜底收消息路**上（2026-10-04 晚，同一场事故）
+
+真机同时暴露了第二件事：`session.db` 与 `message_fts.db` 的**句柄一起失效**
+（`get database handle which named … failed`，`force_rescan` 无效）时，
+`_v4_new_messages_tables`（没有 fts 时的退路）拿 `_v4_active_talkers`（= session.db）
+当「谁有新消息」的信号 —— 于是候选为空，**bot 完全收不到消息，连文本都收不到**，
+而 `message_0.db` 明明好好的。
+
+改法：那条路的候选改成**两个来源取并集** —— 老来源（`SessionTable.last_timestamp`，
+session.db 活着时行为一字不变）∪ `sqlite_sequence`（跟落盘无关、永远新鲜），
+每个会话一份 `__msg_seq__` 水位线（local_id 语义）。
+⚠️ **第一次只打基线、不回放历史**（`[live] 已为 N 个会话建立 local_id 基线`）：
+不然 ~290 个会话会在同一轮里各查一次消息表（把 hook 压死），还会把几十分钟的积压重放。
+代价说清楚：基线之前那批（停机/瞎掉期间的消息）**不会被这条路补报** ——
+它们本来也只该「只通知、不自动回复」。
+
+回归：`selftest_live_history._t_fallback_survives_dead_session_db`
+（第一次只打基线 / 之后 text + 语音条都收得到 / 不重复报）。
+

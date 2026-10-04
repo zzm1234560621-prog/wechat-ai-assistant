@@ -78,5 +78,36 @@
   - ⚠️ **`bot.restore_pending` 必须恢复 `label` / `items` / `spec`**：只恢复那 8 个
     基础字段的话，重启后群发批次会变成「没有 items」，然后按文本分支把**给人看的
     预览**往一个**空 wxid** 发出去（真机上最难查的那种错）。已加回归用例。
-  - 回归用例：`selftest_policy.test_broadcast`（38 条）、`selftest_bot_loop`
-    的落盘恢复与 `with_broadcast_preview`。
+  - **点名「某个群里的成员」先看花名册**（2026-10-04，真机「一条都没发」那一课）：
+    群昵称不在联系人表里（「老K」这种根本不是好友 → 查不到），而且在**整个账号**里
+    常常重名（「a」「Ken」「Alan」「leo」各匹配到好几个）→ 群发整批被拒。
+    可群里每个人的 **wxid** 一直就在 `chat_room.ext_buffer` 里（`group_members` 现在
+    会把它列出来）：模型要**先调 `group_members`**、把 wxid 填进 `to`。
+    花名册（`ToolBox._roster()`，**一轮一份**、不跨轮）另外给 `resolve_contacts`
+    当兜底——**只在联系人表给不出唯一答案时才生效**，已有唯一答案时绝不覆盖
+    （覆盖才是会发错人的那一头）。它来自同轮那次 `group_members`，所以
+    **仍然一次库都不查**。
+  - **自己 / `filehelper` 是「跳过」，不是「没找到」**：群里本来就有你自己，
+    把它报成没找到会让「发给群里的每个人」当场整批被拒（真机上用户看到的是
+    「找不到小明」，而 `find_contact` 明明找得到——他据此以为助手「拿不到群成员的
+    真实 id」）。只有整批点名**全是自己**才如实拒绝。被跳过的名字还要写进
+    **待确认预览**（`prepare_broadcast(skip_note=...)`——那段是 bot 原样直发的、
+    用户照着确认的）：少发一个人却不写，就是静默缩小影响面。
+  - **按群发（`to="群:同学会"`，2026-10-04 加）**：= **那个微信群的成员**，一人一条。
+    为什么要有：用户说「单独发给同学会群里每个人」时，模型得先 `group_members` 拿 wxid、
+    再自己拼十几项 `to`——漏一步群昵称就被当联系人来解析（不是好友＝查不到、重名＝
+    拿不准），整批如实拒绝、白跑一趟。显式 `群:X` 把范围直接定义成「那个群」，
+    **一次到位，不靠模型记性**。
+    - 认 `群:` / `微信群:` / `群成员:` / `group:` / `chatroom:`（半角全角冒号都认），
+      `X` 可以是群名（走 `live_history.resolve_contact` 查一次库）或 roomid（零查询）。
+    - 成员来自 `live_history.group_members`（`chat_room.ext_buffer`，**1 次库**）——
+      和「标签」一样，它是**仅有的两条会查库的群发路径**，其余写法一次都不查。
+    - **自己会被跳过**并写进预览（群里本来就有你）；成员名单拿不到就**如实拒绝**，
+      绝不瞎发。人数照样受 `agent.broadcast_max` 约束。
+    - ⚠️ **裸群名（`to="同学会"`）仍旧是「发一条到群里」**（点名那一路把它解析成
+      roomid，整群可见）——**绝不许**把用户已经习惯的那个意思偷偷改成群发成员。
+      只有显式 `群:` 才按成员发。回归：`selftest_policy.test_group_chat_scope`
+      （专门有一条断言钉住裸群名的老语义）。
+  - 回归用例：`selftest_policy.test_broadcast`（38 条）、`selftest_policy.test_group_roster`、
+    `selftest_policy.test_group_chat_scope`、
+    `selftest_bot_loop` 的落盘恢复与 `with_broadcast_preview`。

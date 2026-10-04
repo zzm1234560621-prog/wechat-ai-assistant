@@ -18,6 +18,7 @@
 
 用法：python selftest_policy.py
 """
+import binascii
 import os
 import re
 import read_worker
@@ -29,6 +30,7 @@ import time
 
 import agent_tools
 import aixed_api
+import assets
 import file_read
 import groups
 import image_cache
@@ -975,6 +977,390 @@ def test_broadcast():
     return ok
 
 
+# ------------------------------- 群成员：真实 wxid / 群昵称定人 / 「自己」
+
+def _pb_varint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def _pb_bytes(field, data):
+    return _pb_varint(field << 3 | 2) + _pb_varint(len(data)) + data
+
+
+def _pb_int(field, n):
+    return _pb_varint(field << 3) + _pb_varint(n)
+
+
+def _room_ext_buffer(members):
+    """按 `live_history.decode_room_members` 认的结构拼 `chat_room.ext_buffer`。
+
+    用**编码器**现场拼，而不是贴一段抄来的 hex：贴的那段里错一个字节，用例就会
+    在一个早就变了的假设上变绿（而 selftest_aixed 里那份**真机抓到的 hex** 继续
+    负责证明解码器认的是真实数据）。
+    结构：外层 repeated 子消息，内部 1=wxid、2=群昵称、3=角色（群主=9）。
+    """
+    out = b""
+    for wxid, nick, role in members:
+        sub = (_pb_bytes(1, str(wxid).encode("utf-8"))
+               + _pb_bytes(2, str(nick or "").encode("utf-8"))
+               + _pb_int(3, int(role)))
+        out += _pb_bytes(1, sub)
+    return binascii.hexlify(out).decode("ascii")
+
+
+_ROOM_ID = "12345678901@chatroom"          # 真机上「同学会」的 roomid（截图/日志里那个）
+_ROOM_MEMBERS = [
+    ("wxid_grp_a", "a", 1),
+    ("wxid_grp_alan", "Alan", 1),
+    ("wxid_grp_zhufu", "老K", 1),        # 群昵称，联系人表里**没有**这个人
+    ("ALIAS0313", "小北", 1),                 # 不是 wxid_ 形状的别名 id（真机文档里提过）
+    (SELF_WXID, "小明", 9),               # 用户自己（群主）
+]
+
+# 联系人表：故意让「a」重名（和真机一模一样）、Alan 只有一个同名但**不是群里那位**、
+# 老K根本不是好友；自己那条叫「小明」。
+_ROOM_CONTACTS = [
+    {"wxid": "wxid_grp_a", "name": "群里的a", "remark": "群里的a"},
+    {"wxid": "wxid_other_a1", "name": "a", "remark": "a"},
+    {"wxid": "wxid_other_a2", "name": "a", "remark": "a 另一个"},
+    {"wxid": "wxid_other_alan", "name": "Alan", "remark": "Alan"},
+    {"wxid": "wxid_litongxue", "name": "李同学", "remark": "李同学"},
+    {"wxid": SELF_WXID, "name": "小明", "remark": ""},
+    # 群本身也在联系人表里（真机就是这样：username 形如 xxx@chatroom、群名在 nick_name）。
+    # 有它才能验「裸群名 = 发一条到群里」那条老语义没被改掉。
+    {"wxid": _ROOM_ID, "name": "同学会", "remark": ""},
+]
+
+
+class _RoomClient:
+    """假 hook：应答群花名册那一条查询，也能记账发消息。"""
+
+    def __init__(self):
+        self.calls = []
+        self.buf = _room_ext_buffer(_ROOM_MEMBERS)
+
+    def send_text(self, msg, wxid):
+        self.calls.append(("text", wxid, msg))
+
+    def query_sql(self, db, sql):
+        if db == "contact.db":
+            if "FROM chat_room" in sql:
+                return [{"ext_buffer": self.buf, "owner": SELF_WXID}]
+            if "SELECT 1 FROM contact" in sql:
+                return [{"x": 1}]             # v4 探针要通
+            return []                         # 这个假库里没有别的联系人
+        return []
+
+
+class _ChatGroupClient:
+    """假 hook：既能答**联系人模糊查**（`群:同学会` 要先把群名解析成 roomid），
+    也能答**群成员**（`chat_room.ext_buffer`）。两条都只走 live_history。"""
+
+    def __init__(self, rows, buf):
+        self.rows = rows              # [(username, nick_name, remark, alias)]
+        self.buf = buf
+
+    def query_sql(self, db, sql):
+        low = sql.lower()
+        if db != "contact.db":
+            return []
+        if low.strip().startswith("select 1 "):
+            return [{"x": 1}]                     # v4 探针要通
+        if "from chat_room" in low:
+            return [{"ext_buffer": self.buf, "owner": SELF_WXID}]
+        if "from contact" in low:
+            m = re.search(r"like '%(.*?)%'", low)
+            key = (m.group(1) if m else "").lower()
+            if not key:
+                return []
+            out = []
+            for u, n, r, a in self.rows:
+                if any(key in str(v or "").lower() for v in (u, n, r, a)):
+                    out.append({"username": u, "nick_name": n, "remark": r,
+                                "alias": a})
+            return out
+        return []
+
+
+def test_read_image():
+    """`read_image` 两条路：聊天里有缓存的图；**用户刚发到控制会话的那张图**。
+
+    为什么要专门钉：真机现场（2026-10-04）用户把一张报价截图发到控制会话、紧接着问
+    「图片里的价格怎么样」，bot 既不知道有这张图（漏捞，见 selftest_live_history），
+    也读不到它的内容。第一条已经修在 `_v4_pickup_nontext`；第二条在这里：
+    控制会话收到的图会进**素材暂存区**（里面有本地明文副本），所以模型不填任何参数
+    就能读它——而**别的地方的图必须点名 contact + local_id**，不许乱读。
+
+    顺带钉住一个真 bug：老代码里 `collect=self._image_collector(f"{nm} 的图")` 里的
+    `nm` **根本没定义**，于是「有缓存、能读」的那条路一读就 NameError（测试没覆盖到，
+    所以一直没被发现）。
+    """
+    print("\n── read_image：缓存的图 / 刚发到控制会话的图 ──")
+    ok = True
+    import image_read
+    real_handoff = image_read.handoff
+    real_assets_path = assets.PATH
+    tmp = tempfile.mkdtemp(prefix="read_image_selftest_")
+    seen = []
+
+    def fake_handoff(path, cfg, max_bytes=None, collect=None):
+        seen.append(path)
+        return {"kind": "text", "text": "  价格 3,229.96  ", "why": ""}
+
+    png = _write(os.path.join(tmp, "shot.png"))
+    stash_path = os.path.join(tmp, "assets.json")
+    try:
+        image_read.handoff = fake_handoff
+        assets.PATH = stash_path
+
+        # ① 聊天里有缓存的图（老代码这条路 NameError）
+        box = _box(contacts=[{"wxid": "wxid_z", "name": "张三", "remark": "张三"}])
+        box._images = lambda wxid: [{"local_id": "7", "time": "10-04 12:00",
+                                     "image": png}]
+        out = box.t_read_image({"contact": "张三", "local_id": "7"})
+        ok &= check("有缓存的图能读出来，而且不崩（老代码在这里 NameError）",
+                    "3,229.96" in out and seen and seen[-1] == png, out)
+
+        # ② 用户刚发到控制会话的图：不填参数就能读（暂存区里那条明文）
+        assets.save([{"kind": "图片", "talker": CHAT, "local_id": "42",
+                      "path": png, "at": time.time()}], path=stash_path)
+        out2 = box.t_read_image({})
+        ok &= check("不填参数 -> 读的是刚发到控制会话那张（暂存区的明文）",
+                    "3,229.96" in out2 and seen[-1] == png, out2)
+        ok &= check("回执里说清这是「刚发到控制会话的图」",
+                    "控制会话" in out2, out2)
+
+        # ③ 只认控制会话那条：别处的图不许被顺手读出来
+        assets.save([{"kind": "图片", "talker": "room_x@chatroom", "local_id": "9",
+                      "path": png, "at": time.time()}], path=stash_path)
+        n_before = len(seen)
+        out3 = box.t_read_image({})
+        ok &= check("别处的图不会被顺手读（只认控制会话）",
+                    len(seen) == n_before and "文件" in out3, out3)
+
+        # ④ 暂存区里没有明文副本 -> 如实说 + 给出可做法（以文件方式再发一次）
+        assets.save([], path=stash_path)
+        out4 = box.t_read_image({})
+        ok &= check("没有明文副本时如实说，并告诉他「以文件方式再发一次」",
+                    "明文" in out4 and "文件" in out4 and "不要" in out4, out4)
+
+        # ⑤ 参数只给一半 -> 明确拒绝（不猜）
+        out5 = box.t_read_image({"contact": "张三"})
+        ok &= check("只给 contact 不给 local_id -> 明确说清两种用法",
+                    "参数不全" in out5, out5)
+    finally:
+        image_read.handoff = real_handoff
+        assets.PATH = real_assets_path
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
+def test_group_chat_scope():
+    """`to="群:X"`：一次把消息群发给**某个微信群的成员**。
+
+    2026-10-04：用户说「单独发给同学会群里每个人」时，模型得先 group_members、再自己拼
+    十几项 wxid；漏一步就整批如实拒绝（白跑一趟）。这一条把范围直接定义成「那个群」。
+    要钉的四件事：
+      ① 群名 / roomid 两种写法都认，成员一人一条；
+      ② **自己**被跳过（群里本来就有你），不是「没找到」，也不整批拒绝；
+      ③ **裸群名仍然是「发一条到群里」**——绝不把用户习惯的意思偷偷改掉；
+      ④ 认不出 / 不是群 / 拿不到成员名单时**如实拒绝**，一个人都不发。
+    """
+    print("\n── 群成员范围：to=\"群:X\"（一次到位，不等模型拼名单）──")
+    ok = True
+    _reset_pending()
+    cfg = _bc_cfg()
+    buf = _room_ext_buffer(_ROOM_MEMBERS)
+    # 群名 -> roomid 靠这一行（和真机一样：群在 contact 表里，nick_name 是群名）
+    rows = [(_ROOM_ID, "同学会", "", ""),
+            ("wxid_other_alan", "Alan", "Alan", "")]
+    client = _ChatGroupClient(rows, buf)
+
+    recips, scope, err = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "群:同学会", SELF_WXID, client=client)
+    got = [r["wxid"] for r in recips]
+    ok &= check("「群:同学会」解析成群成员（自己不在里面）",
+                err == "" and got == ["wxid_grp_a", "wxid_grp_alan",
+                                      "wxid_grp_zhufu", "ALIAS0313"], (got, err))
+    ok &= check("范围标成 groupchat（有界，不走「所有人」那道范围确认）",
+                scope == "groupchat", scope)
+    ok &= check("群昵称直接当显示名（用户认得的就是它）",
+                [r["name"] for r in recips][:2] == ["a", "Alan"],
+                [r["name"] for r in recips])
+
+    notes = {}
+    _r, _s, _e = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "群:" + _ROOM_ID, SELF_WXID, client=client,
+        notes=notes)
+    ok &= check("直接给 roomid 也认", _e == "" and len(_r) == 4, (_r, _e))
+    ok &= check("自己记进 notes「跳过」，预览里才说得清",
+                notes.get("skipped") == ["小明"], notes)
+
+    # ③ 裸群名 = 发一条到群里（**不是**群发成员）
+    bare, bscope, berr = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "同学会", SELF_WXID, client=client)
+    ok &= check("裸群名仍然是「发一条到群里」（收件人就是那个 roomid）",
+                berr == "" and [r["wxid"] for r in bare] == [_ROOM_ID]
+                and bscope == "named", (bare, bscope, berr))
+
+    # ④ 如实拒绝的三种情况
+    _r2, _s2, e1 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "群:没这个群", SELF_WXID, client=client)
+    ok &= check("群名对不上 → 说清是「没找到群」、一个人都不发",
+                "没找到" in e1 and "群" in e1 and _r2 == [], e1)
+    _r3, _s3, e2 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "群:x", SELF_WXID, client=None)
+    ok &= check("链路读不到群成员时如实说（不是「没有这个人」）",
+                "读不到" in e2 and _r3 == [], e2)
+    empty = _ChatGroupClient(rows, "")
+    _r4, _s4, e3 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "群:同学会", SELF_WXID, client=empty)
+    ok &= check("拿不到成员名单 → 如实说、不瞎发",
+                "没查到" in e3 and _r4 == [], e3)
+
+    # ⑤ 整条路（工具层）：群发一批，内容按各人自己的称呼写
+    _reset_pending()
+    cli = _Rec()
+    box = agent_tools.ToolBox(cli, cfg, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                              cfg_provider=lambda: cfg)
+    box.client = client
+    out = box.run("broadcast", {"to": "群:同学会", "text": "节日快乐"})
+    pend = agent_tools.list_pending(CHAT)
+    ok &= check("整条路走通：一条待确认批次、4 个收件人、内容是原话",
+                len(pend) == 1 and pend[0]["kind"] == "broadcast"
+                and len(pend[0]["items"]) == 4
+                and {i["text"] for i in pend[0]["items"]} == {"节日快乐"},
+                (pend, out))
+    ok &= check("预览由 bot 原样直发（含「你自己没发」那句）",
+                "给 4 个人群发" in box.broadcast_preview
+                and "你自己" in box.broadcast_preview, box.broadcast_preview)
+    _reset_pending()
+    return ok
+
+
+def test_group_roster():
+    """群成员：真实 wxid 要给到模型；群昵称要在**那个群**里定人；自己不算「没找到」。
+
+    2026-10-04 真机现场（bot.log）：`group_members` 只报群昵称，模型拿着
+    「a、李同学、Alan、Ken、leo、老K」去群发，于是
+      「a / Alan / Ken / leo」= 在**整个账号**里重名、「老K」= 根本不是好友
+    ——整批被拒，「一条都没发」；用户还看到「没找到：小明」，那其实是**用户自己**
+    （`config.yaml` 的 self_wxid），而 `find_contact` 明明找得到它。
+    这一组钉三件事：
+      ① 花名册里**带 wxid**（能定人的那一半数据，以前被丢掉了）；
+      ② 群昵称能在花名册里定人——**但只在联系人表给不出唯一答案时**；
+      ③ 自己 / 文件传输助手是「跳过」，不是「没找到」，也**不整批拒绝**。
+    """
+    print("\n── 群成员：真实 wxid + 群昵称定人（花名册只兜底）+ 自己不算没找到 ──")
+    ok = True
+    _reset_pending()
+    cfg = _bc_cfg()
+
+    cli = _RoomClient()
+    box = agent_tools.ToolBox(cli, cfg, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                              cfg_provider=lambda: cfg)
+
+    # ① 名单里必须有 wxid —— 这是用户说的「拿不到群聊里人的真实 id」的正解
+    out = box.t_group_members({"contact": _ROOM_ID})
+    ok &= check("group_members 报出每个人的 wxid（模型能直接拿去发送）",
+                "wxid=wxid_grp_a" in out and "wxid=ALIAS0313" in out, out)
+    ok &= check("group_members 标出群主和「我」", "（群主·我）" in out, out)
+    ok &= check("group_members 告诉模型怎么用 wxid、别念给用户",
+                "原样填进" in out and "不要念给用户听" in out, out)
+    ok &= check("group_members 仍报总人数", "共 5 人" in out, out)
+
+    # ② 花名册定人：重名收敛、不是好友也能定、别名 id 也能透传
+    cand, err = box._one("a")
+    ok &= check("重名的群昵称 -> 收敛到**这个群里**那一个",
+                err is None and cand["wxid"] == "wxid_grp_a", (cand, err))
+    cand2, err2 = box._one("老K")
+    ok &= check("不是好友的群友也能定人（联系人表里没有他）",
+                err2 is None and cand2["wxid"] == "wxid_grp_zhufu", (cand2, err2))
+    cand3, err3 = box._one("ALIAS0313")
+    ok &= check("非 wxid_ 形状的别名 id 也能透传（从花名册认出来）",
+                err3 is None and cand3["wxid"] == "ALIAS0313", (cand3, err3))
+    cand4, err4 = box._one("Alan")
+    ok &= check("联系人表已有**唯一**答案时不拿花名册覆盖（那才是发错人）",
+                err4 is None and cand4["wxid"] == "wxid_other_alan", (cand4, err4))
+
+    # ③ 自己：跳过而不是「没找到」，也不许因此整批拒绝
+    recips, _s, err5 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "a、小明", SELF_WXID, roster=box._roster())
+    ok &= check("名单里带上你自己时**不整批拒绝**（发给别人）",
+                err5 == "" and [r["wxid"] for r in recips] == ["wxid_grp_a"],
+                (recips, err5))
+    _r, _s2, err6 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "小明", SELF_WXID, roster=box._roster())
+    ok &= check("点名的全是自己 -> 明说「你自己」，不是「没找到」",
+                "你自己" in err6 and "没找到" not in err6, err6)
+    _r, _s3, err7 = agent_tools.broadcast_recipients(
+        _ROOM_CONTACTS, cfg, "filehelper", SELF_WXID)
+    ok &= check("点名文件传输助手 -> 也明说「控制会话」而不是「没找到」",
+                "控制会话" in err7 and "没找到" not in err7, err7)
+
+    # ④ 花名册**不跨轮**：没看过名单时，重名照旧重名、查不到照旧查不到
+    fresh = agent_tools.ToolBox(_RoomClient(), cfg, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                                cfg_provider=lambda: cfg)
+    _c, e_fresh = fresh._one("老K")
+    ok &= check("花名册不跨轮：没在这个群看过名单时，「老K」照样查不到",
+                _c is None and "没找到" in e_fresh, e_fresh)
+    _c2, e2_fresh = fresh._one("a")
+    ok &= check("花名册不跨轮：没看过名单时「a」仍是重名（绝不静默挑一个）",
+                _c2 is None and "多个人" in e2_fresh, e2_fresh)
+
+    # ⑤ 整条路：先看名单 -> 再按群昵称群发 -> 待确认批次里是真实 wxid
+    _reset_pending()
+    cli2 = _RoomClient()
+    cfg2 = _bc_cfg()
+    box2 = agent_tools.ToolBox(cli2, cfg2, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                               cfg_provider=lambda: cfg2)
+    box2.t_group_members({"contact": _ROOM_ID})
+    out2 = box2.run("broadcast", {"to": "a、老K", "intent": "祝节日快乐"})
+    ok &= check("没有模型时如实拒绝：不发、也不登记半截内容",
+                "没配 API Key" in out2 and agent_tools.list_pending(CHAT) == [],
+                (out2, agent_tools.list_pending(CHAT)))
+
+    llm = _BCLLM('{"1": "节日快乐", "2": "节日快乐"}')
+    box3 = agent_tools.ToolBox(_RoomClient(), cfg2, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                               cfg_provider=lambda: cfg2,
+                               llm_factory=lambda: llm)
+    box3.t_group_members({"contact": _ROOM_ID})
+    out3 = box3.run("broadcast", {"to": "a、老K", "intent": "祝节日快乐"})
+    pend = agent_tools.list_pending(CHAT)
+    ok &= check("整条路走通：两个群昵称 -> 待确认批次里是那两个**真实 wxid**",
+                len(pend) == 1
+                and [i["wxid"] for i in pend[0]["items"]]
+                == ["wxid_grp_a", "wxid_grp_zhufu"], (pend, out3))
+    ok &= check("给模型的回执里没有 wxid 泄漏", "wxid_" not in out3, out3)
+    ok &= check("发出去的内容条数对得上（没有凭空多一个自己）",
+                len(pend[0]["items"]) == 2, pend[0]["items"])
+
+    # ⑥ 点名里带自己：剩下的人照发，而且**预览里必须写明自己没发**
+    #    （预览是 bot 原样直发的、用户照着它确认；少发一个人却不写＝静默缩小影响面）
+    _reset_pending()
+    box4 = agent_tools.ToolBox(_RoomClient(), cfg2, _ROOM_CONTACTS, SELF_WXID, CHAT,
+                               cfg_provider=lambda: cfg2)
+    box4.t_group_members({"contact": _ROOM_ID})
+    out4 = box4.run("broadcast", {"to": "a、小明", "text": "节日快乐"})
+    ok &= check("点到自己时别人照发，预览里写明「小明是你自己、这次没发」",
+                "你自己" in box4.broadcast_preview
+                and "小明" in box4.broadcast_preview
+                and "节日快乐" in box4.broadcast_preview,
+                box4.broadcast_preview)
+    ok &= check("这段给用户看的文本里不出现 wxid", "wxid_" not in box4.broadcast_preview,
+                box4.broadcast_preview)
+    ok &= check("预览的收件人只有一个（自己没混进去）",
+                "给 1 个人群发" in box4.broadcast_preview, box4.broadcast_preview)
+    _reset_pending()
+    return ok
+
+
 class _LabelClient:
     """假 hook：既能应答「标签」那两条查询，也能**记账发消息**。
 
@@ -1695,10 +2081,179 @@ def test_own_file_echo():
     return ok
 
 
+def test_pending_dedupe():
+    """**同一条动作只登记一次**——重复入队会让用户确认两次、对方收到两份。
+
+    2026-10-04 真机现场（bot.log）：用户连着三遍说「发给我」（「最新的发给我吧」
+    →「吧文件发给我」→「发给我吧」），模型每一遍都照做、各登记一次，队列里于是
+    压着**两条逐字相同**的发文件（第 2、3 条都是同一份课表发给文件传输助手）。
+    菜单里两条长得一模一样，用户确认第 2 条发一份、再确认第 3 条**又发一份**——
+    他当场问「这个确认2和确认3有什么区别啊」。
+
+    这里守七条：
+      ① 同一条动作登记两遍 → 队列里只有一条，第二次返回**那一条的编号**；
+      ② 正文 / 收件人 / kind / count / 图片列表 只要有一处不同 → **各自入队**
+         （合并就等于静默少发、发错人、发错内容，比重复更严重）；
+         **例外**：自动回复草稿（kind="auto"）**完全不判重**——它是「响应某一条消息
+         生成的回复」，两条一样的草稿对应两条不同的消息，合并＝第二条没人回；
+      ③ 过期的那条**不能吞掉**新请求（判重窗口 = 配置里的 confirm_ttl）；
+      ④ 判重命中会**刷新时效**：用户刚又说了一遍，确认窗口按最后一次起算；
+      ⑤ `dupe_note` 只在判重命中时说话，且绝不出现 wxid；
+      ⑥ `confirm_ttl_of` 是「确认有效期」的唯一解析（判重/确认/落盘三处共用）；
+      ⑦ 工具级：同一份文件同一人发两遍（真机那个形状）只登记一条。
+    """
+    print("\n── 待确认队列：同一条动作只登记一次（否则确认两次=发两份）──")
+    ok = True
+    _reset_pending()
+    try:
+        # ① 真机现场的形状：同一份文件、同一个收件人，登记两遍
+        kw = dict(kind="file", file=r"D:\wx\xwechat_files\msg\file\2026-10\课表.xlsx")
+        f1 = agent_tools.set_pending(CHAT, "filehelper", "文件传输助手",
+                                    "发文件：课表.xlsx", **kw)
+        f2 = agent_tools.set_pending(CHAT, "filehelper", "文件传输助手",
+                                    "发文件：课表.xlsx", **kw)
+        ok &= check("第一次登记：正常入队（返回 None）", f1 is None, f1)
+        ok &= check("同一条动作再登记：**不重复入队**，返回那一条的编号 1", f2 == 1, f2)
+        ok &= check("队列里只有 1 条（确认一次 = 只发一份）",
+                    len(agent_tools.list_pending(CHAT)) == 1,
+                    len(agent_tools.list_pending(CHAT)))
+        ok &= check("路径写法不同但指向同一个文件 → 也算同一条（realpath 比对）",
+                    agent_tools.set_pending(
+                        CHAT, "filehelper", "文件传输助手", "发文件：课表.xlsx",
+                        kind="file",
+                        file=r"D:\wx\xwechat_files\msg\file\2026-10\.\课表.xlsx") == 1
+                    and len(agent_tools.list_pending(CHAT)) == 1,
+                    len(agent_tools.list_pending(CHAT)))
+
+        # ② 只要有一处不同就**不许合并**
+        _reset_pending()
+        agent_tools.set_pending(CHAT, "wxid_a", "张三", "晚上一起吃饭")
+        ok &= check("正文不同 → 各自入队",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "晚上一起看电影")
+                    is None and len(agent_tools.list_pending(CHAT)) == 2)
+        ok &= check("收件人不同 → 各自入队",
+                    agent_tools.set_pending(CHAT, "wxid_b", "李四", "晚上一起吃饭")
+                    is None and len(agent_tools.list_pending(CHAT)) == 3)
+        ok &= check("kind 不同 → 各自入队（同一句话的「本机命令」和「发出去」不是一回事）",
+                    agent_tools.set_pending(CHAT, "", "", text="晚上一起吃饭",
+                                            kind="shell",
+                                            cmd="晚上一起吃饭") is None
+                    and len(agent_tools.list_pending(CHAT)) == 4)
+        ok &= check("count 不同 → 各自入队（发 2 次不是发 1 次，合并就是静默少发）",
+                    agent_tools.set_pending(CHAT, "wxid_c", "王五", "hi", count=1)
+                    is None
+                    and agent_tools.set_pending(CHAT, "wxid_c", "王五", "hi",
+                                                count=2) is None
+                    and len([i for i in agent_tools.list_pending(CHAT)
+                             if i.get("to_wxid") == "wxid_c"]) == 2)
+
+        # **唯一的例外：自动回复草稿（kind="auto"）不判重。** 那些待确认项不是
+        # 「用户要求的一个动作」，而是「响应某一条消息生成的一份回复」——两条一样的
+        # 草稿对应**两条不同的消息**，合并掉等于第二条消息没人回（静默少发，比重复坏）。
+        _reset_pending()
+        agent_tools.set_pending(CHAT, "wxid_a", "张三", "我回头确认下", kind="auto")
+        ok &= check("自动回复草稿：两条一模一样的也各自入队（两条消息要两条回复）",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "我回头确认下",
+                                            kind="auto") is None
+                    and len(agent_tools.list_pending(CHAT)) == 2,
+                    agent_tools.list_pending(CHAT))
+
+        _reset_pending()
+        img_a, img_b = r"D:\pics\a.jpg", r"D:\pics\b.jpg"
+        agent_tools.set_pending(CHAT, "wxid_a", "张三", "", image=[img_a, img_b])
+        ok &= check("图片顺序不同 → 各自入队（顺序就是发送顺序）",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "",
+                                            image=[img_b, img_a]) is None
+                    and len(agent_tools.list_pending(CHAT)) == 2)
+        ok &= check("同一串图片（顺序也一样）→ 合并成一条",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "",
+                                            image=[img_a, img_b]) == 1
+                    and len(agent_tools.list_pending(CHAT)) == 2)
+
+        # ③ 过期条目**不能吞掉**新请求：ttl 小、旧条目拨老
+        _reset_pending()
+        agent_tools.set_pending(CHAT, "wxid_a", "张三", "hello", ttl=1)
+        agent_tools._PENDING[CHAT][0]["ts"] = time.time() - 10
+        ok &= check("旧条目已过期 → 新登记照常入队（不许拿过期条目吞掉用户的新请求）",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "hello",
+                                            ttl=1) is None)
+        ok &= check("过期项只跳过、不删（删队列项是读侧的事，入队这边不动它）",
+                    len(agent_tools._PENDING[CHAT]) == 2,
+                    agent_tools._PENDING[CHAT])
+        ok &= check("读侧照旧把它过滤掉：用户只看得到 1 条",
+                    len(agent_tools.list_pending(CHAT, ttl=1)) == 1)
+
+        # ④ 判重命中 → 刷新时效（用户刚又说了一遍，窗口按最后一次起算）
+        _reset_pending()
+        agent_tools.set_pending(CHAT, "wxid_a", "张三", "hello", ttl=300)
+        first_ts = agent_tools._PENDING[CHAT][0]["ts"]
+        time.sleep(0.05)
+        ok &= check("判重命中 → 返回编号、不新增条目",
+                    agent_tools.set_pending(CHAT, "wxid_a", "张三", "hello",
+                                            ttl=300) == 1
+                    and len(agent_tools._PENDING[CHAT]) == 1)
+        ok &= check("命中时刷新 ts（不然一条还剩 3 秒过期的旧条目会把这次请求吃掉）",
+                    agent_tools._PENDING[CHAT][0]["ts"] > first_ts,
+                    (first_ts, agent_tools._PENDING[CHAT][0]["ts"]))
+
+        # ⑤ dupe_note：只说该说的话，且不泄 id
+        ok &= check("dupe_note(None) 是空串（正常入队一个字都不加）",
+                    agent_tools.dupe_note(None) == "")
+        note = agent_tools.dupe_note(2)
+        ok &= check("dupe_note(2)：说清「没有再登记一份」并带上编号",
+                    "第 2 条" in note and "没有再登记" in note, note)
+        ok &= check("dupe_note 里不出现 wxid / roomid",
+                    "wxid" not in note and "@chatroom" not in note, note)
+
+        # ⑥ confirm_ttl_of：判重窗口和 bot 的确认分支、save/restore 用**同一个解析**
+        ok &= check("confirm_ttl_of：配置里写多少就是多少",
+                    agent_tools.confirm_ttl_of({"agent": {"confirm_ttl": 60}}) == 60.0)
+        ok &= check("confirm_ttl_of：没配 / 写歪 / 传 None → 退回默认（不抛、不放行）",
+                    agent_tools.confirm_ttl_of({}) == agent_tools._DEFAULT_CONFIRM_TTL
+                    and agent_tools.confirm_ttl_of(
+                        {"agent": {"confirm_ttl": "写歪了"}})
+                    == agent_tools._DEFAULT_CONFIRM_TTL
+                    and agent_tools.confirm_ttl_of(None)
+                    == agent_tools._DEFAULT_CONFIRM_TTL)
+    finally:
+        _reset_pending()
+
+    # ⑦ 工具级：真机那个形状（同一份文件、同一个收件人，用户说了两遍）
+    tmp = tempfile.mkdtemp(prefix="selftest_policy_dedupe_")
+    old_roots = file_read.files_roots
+    file_read.files_roots = lambda: [tmp]
+    _reset_pending()
+    try:
+        d = os.path.join(tmp, "2026-10")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "课表.xlsx"), "wb") as f:
+            f.write(b"PK\x03\x04 x")
+        contacts = [{"wxid": "filehelper", "name": "文件传输助手",
+                     "remark": "文件传输助手"}]
+        box = _box(contacts=contacts)
+        out1 = box.t_send_file({"to": "文件传输助手", "name": "课表.xlsx"})
+        out2 = box.t_send_file({"to": "文件传输助手", "name": "课表.xlsx"})
+        ok &= check("工具级：同一份文件同一人发两遍 → 队列里只有 1 条",
+                    len(agent_tools.list_pending(CHAT)) == 1,
+                    agent_tools.list_pending(CHAT))
+        ok &= check("第二次的工具返回里写明「已经有一条一模一样」",
+                    "已经有一条一模一样" in out2, out2)
+        ok &= check("第一次返回里**不**出现这句话（正常入队不吓唬模型）",
+                    "已经有一条一模一样" not in out1, out1)
+        ok &= check("两次都仍然是「还没有发」（自始至终一个字都没发出去）",
+                    "还没有发" in out1 and "还没有发" in out2, (out1, out2))
+    finally:
+        file_read.files_roots = old_roots
+        _reset_pending()
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
 def main():
     ok = True
     print("\n待确认队列 / 发图白名单 / 查询预算 —— 回归自测（不联网、不碰 30001）")
     ok &= test_queue()
+    ok &= test_pending_dedupe()
     ok &= test_describe()
     ok &= test_whitelist()
     ok &= test_image_cache_root()
@@ -1706,6 +2261,9 @@ def main():
     ok &= test_partial_send_report()
     ok &= test_budget_clamp()
     ok &= test_broadcast()
+    ok &= test_group_roster()
+    ok &= test_group_chat_scope()
+    ok &= test_read_image()
     ok &= test_history_window()
     ok &= test_when_day()
     ok &= test_day_history()

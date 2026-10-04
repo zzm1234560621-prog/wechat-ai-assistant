@@ -105,7 +105,9 @@ class FakeClient:
             m = _re.search(r"nick_name like '%(.*?)%'", low)
             if m:
                 key = m.group(1)
-                rows = [r for r in rows if key in str(r[1] or "")]
+                # SQLite 的 LIKE 对 ASCII 是**大小写不敏感**的，假客户端也要一致，
+                # 否则「Johny 黄 儿子」这种带大写字母的名字在自测里永远查不到。
+                rows = [r for r in rows if key in str(r[1] or "").lower()]
             return rows
         raise AssertionError(f"自测不该查这个库：{db} / {sql}")
 
@@ -951,12 +953,27 @@ def t13_address_from_history():
             def rec_z():
                 return auto_reply.chats(settings.effective({}))["wxid_z"]
 
+            def cfg_now():
+                return settings.effective({})
+
+            def addr_of(w="wxid_z"):
+                """称呼的**唯一读取出口**（2026-10-04 起不再从聊天记录里读）。"""
+                return auto_reply.address_of(cfg_now(), w,
+                                             auto_reply.chats(cfg_now()).get(w))
+
+            def addr_src(w="wxid_z"):
+                return (auto_reply.address_record(cfg_now(), w) or {}).get("source")
+
             # 1) 模型按 JSON 给两样 → 称呼和人设**一起**学到
             llm = _LearnLLM('{"address": "老张", "persona": '
                             '"你正在代替我本人回复。第一人称、简短、别暴露你是 AI。"}')
             out, changed = run("persona 张三 学习", llm_factory=lambda: llm)
-            chk(changed and rec_z()["address"] == "老张", "学到了称呼")
-            chk(rec_z()["address_source"] == "learned", "称呼来源记成 learned")
+            chk(changed and addr_of() == "老张", "学到了称呼")
+            chk(addr_src() == "learned", "称呼来源记成 learned")
+            chk(rec_z().get("address") is None,
+                "称呼**不再写回聊天记录**（单一真源：settings.json 的 addresses 段）")
+            chk((settings.load().get("addresses") or {}).get("wxid_z", {}).get("address")
+                == "老张", "称呼落在 settings.json 的 addresses 里")
             chk(rec_z()["persona"].startswith("你正在代替我本人回复"), "人设也学到了")
             chk("老张" in out, "回执里说出了称呼（模型能如实复述）")
 
@@ -978,7 +995,7 @@ def t13_address_from_history():
             before_n = rec_z()["persona_n"]
             llm.raw = ('{"address": "张哥", "persona": "这段人设一个字都不该被写进去"}')
             out, changed = run("address 张三 学习", llm_factory=lambda: llm)
-            chk(changed and rec_z()["address"] == "张哥", "只学称呼时称呼确实更新了")
+            chk(changed and addr_of() == "张哥", "只学称呼时称呼确实更新了")
             chk(rec_z()["persona"] == before_persona, "人设正文一个字没动")
             chk(rec_z()["persona_source"] == before_src and rec_z()["persona_n"] == before_n,
                 "人设的**来源**也没被改成 learned（否则用户分不清哪段是自己写的）")
@@ -987,12 +1004,12 @@ def t13_address_from_history():
             llm.raw = "你正在代替我本人回复。第一人称、口语简短、别暴露你是 AI。"
             out, _ch = run("persona 张三 重新学习", llm_factory=lambda: llm)
             chk(rec_z()["persona"].startswith("你正在代替我本人回复"), "散文格式照样学人设")
-            chk(rec_z()["address"] == "张哥", "没按 JSON 走时**不猜称呼**，原来那个保持不动")
+            chk(addr_of() == "张哥", "没按 JSON 走时**不猜称呼**，原来那个保持不动")
 
             # 5) 模型说「没有固定称呼」= 有效的学习结果（空串，不是 None）
             llm.raw = '{"address": "", "persona": "你正在代替我本人回复。第一人称、简短。"}'
             run("persona 张三 重新学习", llm_factory=lambda: llm)
-            chk(rec_z()["address"] == "", "空串 = 模型明确说没固定称呼，照实存下来")
+            chk(addr_of() == "", "空串 = 模型明确说没固定称呼，照实存下来")
             cap3 = _CaptureLLM()
             auto_reply.make_reply(cap3, rec_z(), msgs, {}, settings.effective({}))
             chk("怎么称呼对方" not in (cap3.system or ""), "没称呼时提示词里不提称呼")
@@ -1001,22 +1018,22 @@ def t13_address_from_history():
             llm.raw = ('{"address": "' + "老" * 30 + '", '
                        '"persona": "你正在代替我本人回复。第一人称、简短。"}')
             out, _ch = run("persona 张三 重新学习", llm_factory=lambda: llm)
-            chk(rec_z()["address"] == "", "超长称呼按「没有称呼」处理，没存半截")
+            chk(addr_of() == "", "超长称呼按「没有称呼」处理，没存半截")
             chk("太长" in out, "并且明确告诉了用户")
 
             # 7) 手写称呼 + 清空
             out, changed = run("address 张三 老张")
-            chk(changed and rec_z()["address"] == "老张", "手写称呼落盘")
-            chk(rec_z()["address_source"] == "manual", "手写来源记成 manual")
+            chk(changed and addr_of() == "老张", "手写称呼落盘")
+            chk(addr_src() == "manual", "手写来源记成 manual")
             bad, _ch = run("address 张三 " + "老" * 30)
             chk("太长" in bad, "手写超长称呼如实拒绝")
-            chk(rec_z()["address"] == "老张", "拒绝时没写进去")
+            chk(addr_of() == "老张", "拒绝时没写进去")
 
             st = auto_reply.status_text(settings.effective({}))
             chk("称呼=你设的:老张" in st, f"状态里能看到称呼（实际 {st.splitlines()[-1]!r}）")
 
             run("address 张三 清空")
-            chk(rec_z()["address"] == "", "清空后不再套称呼")
+            chk(addr_of() == "", "清空后不再套称呼")
 
             # 8) 用**称呼**当名字操作（用户心里他就叫老张）
             run("address 张三 老张")
@@ -1051,7 +1068,7 @@ def t13_address_from_history():
             out = tb.t_auto_reply({"action": "address", "who": "全局", "address": "老张"})
             chk("按人" in out, f"address 不接受「全局」（实际 {out[:40]!r}）")
             out = tb.t_auto_reply({"action": "address", "who": "张三", "address": "张哥"})
-            chk(tb.cfg_changed and rec_z()["address"] == "张哥",
+            chk(tb.cfg_changed and addr_of() == "张哥",
                 "工具层成功设了称呼（走的是 handle_command 同一条实现）")
             _ = tmp
     finally:
@@ -1391,6 +1408,99 @@ def t17_remind_me():
         chk(arg == "addremind 10分钟之后 喝水", f"拼出来的子命令对（实际 {arg!r}）")
 
 
+def t18_address_without_membership():
+    """称呼和自动回复**解绑**（2026-10-04 用户拍的：「学称呼和自动回复要是单独的啊」）。
+
+    真机现场：用户想给 4 位群友「学称呼」，工具挨个回「他们**不在自动回复名单里**，
+    而称呼是每人一份、只对名单里的人生效」——名单外的人连设/学/清都做不了，
+    而顺手把人加进名单又等于替用户决定「要不要让 AI 代他回话」（CLAUDE.md 禁止）。
+
+    这一组钉死六件事：
+      ① 名单外的人能**设**称呼，且**绝不顺手把人加进名单**；
+      ② 能**看**；
+      ③ 能**学**（只学称呼、不动人设、不加人）；
+      ④ 能**清**（清的是称呼，不是把人人道移除）；
+      ⑤ 称呼照样当**联系人别名**（「给四哥发消息」认得出）；
+      ⑥ 群发时名单外的人也**带上自己的称呼**，没设的人仍是空（不许编）。
+    顺带钉住：名字带空格（「Johny 黄 儿子 阿黄」）也切得出人和称呼。
+    """
+    print("T18. 称呼与自动回复解绑：名单外的人也能设/看/学/清")
+    real_qch = auto_reply.live_history.query_contact_history
+    try:
+        auto_reply.live_history.query_contact_history = _HistoryStub(_hist())
+        init = {"auto_reply": {"enabled": True, "chats": [
+            {"wxid": "wxid_z", "name": "张三", "mode": "self", "review": None,
+             "persona": ""}]}}
+        contacts = list(_CONTACTS) + [
+            {"wxid": "wxid_j", "name": "Johny 黄 儿子", "remark": "Johny 黄 儿子"},
+        ]
+        with TempSettings(init) as tmp:
+            client = FakeClient(contacts)
+
+            def run(arg, llm_factory=None):
+                return auto_reply.handle_command(arg, settings.effective({}), client,
+                                                 llm_factory=llm_factory)
+
+            def cfg():
+                return settings.effective({})
+
+            def listed():
+                return {str(r.get("wxid")) for r in auto_reply.chat_list(cfg())}
+
+            # ① 设：名单外的人（李四只在联系人表里）
+            out, changed = run("address 李四 阿四")
+            chk(changed and auto_reply.address_of(cfg(), "wxid_l") == "阿四",
+                f"名单外的人也能设称呼（实际 {out[:50]!r}）")
+            chk("wxid_l" not in listed(), "**没有**顺手把他加进自动回复名单")
+            chk((settings.load().get("addresses") or {}).get("wxid_l", {}).get("name")
+                == "李四", "称呼表里记了显示名（别名和状态显示要用）")
+
+            # ② 看
+            out, changed = run("address 李四")
+            chk((not changed) and "阿四" in out,
+                f"能查看名单外那个人的称呼（实际 {out[:50]!r}）")
+
+            # ③ 学：只学称呼、不动人设、不加人
+            llm = _LearnLLM('{"address": "四哥", "persona": "这段人设一个字都不该被写进去"}')
+            out, changed = run("address 李四 学习", llm_factory=lambda: llm)
+            chk(changed and auto_reply.address_of(cfg(), "wxid_l") == "四哥",
+                f"名单外的人也能从历史学称呼（实际 {out[:60]!r}）")
+            chk("wxid_l" not in listed(), "学完也没有把他加进名单")
+
+            # ④ 清
+            run("address 李四 清空")
+            chk(auto_reply.address_of(cfg(), "wxid_l") == "", "名单外的人也能清称呼")
+            chk("wxid_l" not in listed(), "清称呼**不会**动人名单")
+
+            # ⑤ 称呼当别名
+            run("address 李四 四哥")
+            aliases = auto_reply.address_aliases(settings.effective({}))
+            cands = agent_tools.resolve_contacts(_CONTACTS, "四哥", aliases=aliases)
+            chk(len(cands) == 1 and cands[0]["wxid"] == "wxid_l",
+                f"「四哥」解析到李四（实际 {cands}）")
+
+            # ⑥ 群发：名单外的人用自己的称呼；没设的人仍是空
+            recips, _scope, err = agent_tools.broadcast_recipients(
+                _CONTACTS, settings.effective({}), "李四、张三", "", aliases=aliases)
+            by = {r["wxid"]: r for r in recips}
+            chk(err == "" and by["wxid_l"]["address"] == "四哥",
+                f"群发时名单外的人带上自己的称呼（实际 {recips}）")
+            chk(by["wxid_z"]["address"] == "", "没设称呼的人仍是空（不许拿名字顶替）")
+
+            # ⑦ 名字带空格：最长前缀切人
+            out, changed = run("address Johny 黄 儿子 阿黄")
+            chk(changed and auto_reply.address_of(cfg(), "wxid_j") == "阿黄",
+                f"名字带空格也切得出人和称呼（实际 {out[:60]!r}）")
+
+            # ⑧ 状态里要能看到「不在名单里、但有称呼」的人
+            st = auto_reply.status_text(settings.effective({}))
+            chk("不在名单里" in st and "四哥" in st,
+                f"状态单独列出名单外的称呼（实际 {st.splitlines()[-1]!r}）")
+            _ = tmp
+    finally:
+        auto_reply.live_history.query_contact_history = real_qch
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -1406,7 +1516,7 @@ def main():
                t11_per_person_persona, t12_learn_persona_from_history,
                t13_address_from_history, t14_groups,
                t15_watch_keywords, t16_no_commitment_on_my_behalf,
-               t17_remind_me):
+               t17_remind_me, t18_address_without_membership):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"

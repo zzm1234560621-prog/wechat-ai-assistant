@@ -390,8 +390,12 @@ chk(usage.price_of("DeepSeek-Flash") == (2.0, 8.0), "flash 也大小写不敏感
 chk(usage.price_of("DeepSeek-Chat") == (2.0, 8.0), "大小写不敏感")
 chk(usage.price_of("  deepseek-chat  ") == (2.0, 8.0), "前后空白不影响")
 chk(usage.price_of("openai/deepseek-chat") == (2.0, 8.0), "已知 provider 前缀会被剥掉")
+# 2026-10-04 换成的现役模型：智谱 glm-4-flash-250414（官方定价页标「免费」→ 单价 0）
+chk(usage.price_of("glm-4-flash-250414") == (0.0, 0.0), "glm-4-flash-250414 有价目表（免费 = 0）")
+chk(usage.price_of("glm-4.7-flash") == (0.0, 0.0), "glm-4.7-flash 有价目表（免费 = 0）")
+chk(usage.price_of("zhipu/glm-4-flash-250414") == (0.0, 0.0), "zhipu/ 前缀会被剥掉")
 for _unknown in ["gpt-4o", "claude-sonnet-5", "qwen-plus", "moonshot-v1-8k",
-                 "glm-4-flash", "no-such-model-xyz", "", None, 123]:
+                 "glm-4-flash", "glm-4-plus", "no-such-model-xyz", "", None, 123]:
     chk(usage.price_of(_unknown) is None,
         f"没有价目表就返回 None，不猜价：{_unknown!r}")
 chk(usage.price_of("deepseek-chat-v3") is None,
@@ -421,6 +425,15 @@ try:
     chk("只含上表里能算钱的模型" in _txt2, "明说金额只覆盖能算的那部分")
     # 微信消息体量：别把 /用量 的回执搞成巨长的东西
     chk(len(_txt2) < 1500, f"文案体量可控（{len(_txt2)} 字）")
+
+    # 免费模型（glm-4-flash-250414，单价 0）：**必须算得出 0 元**。
+    # 否则会掉进 budget_status 的 `spent is None` 那条路，把「免费」说成「算不出花费」。
+    usage.record("openai", "glm-4-flash-250414", 1000000, 500000)
+    _free = usage.summary(7)
+    chk(_free["by_model"]["glm-4-flash-250414"]["est_cost"] == 0.0,
+        "免费模型的 est_cost 是 0.0，不是 None")
+    chk("glm-4-flash-250414" in _free["priced"], "免费模型进 priced")
+    chk("glm-4-flash-250414" not in _free["unpriced"], "免费模型不该被当成「没价目表」")
 finally:
     usage.USAGE_PATH = _repo_path
     shutil.rmtree(_tmpdir, ignore_errors=True)

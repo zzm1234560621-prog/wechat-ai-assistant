@@ -433,7 +433,8 @@ def first_run():
 
     print()
     print("    接下来配「用哪个模型 + API Key」——**全程在这里，不用去微信里打字**。")
-    print("    没有 key 就去 https://platform.deepseek.com 领一个（有免费额度）。")
+    print("    没有 key 就去对应平台领一个：DeepSeek https://platform.deepseek.com，")
+    print("    智谱 GLM https://open.bigmodel.cn（其中 glm-4.7-flash 官方免费）。")
     if _confirm("    现在配？(Y/n) ", default_no=False):
         run("setup_llm.py")
         print("    → 配完直接去微信「文件传输助手」发一句话就能用了。")
