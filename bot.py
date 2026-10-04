@@ -2672,6 +2672,17 @@ def main():
     print(f"[bot] {scheduler.summary_line(cfg)}  |  {watch.summary_line(cfg)}"
           f"  |  {recall.summary_line(cfg)}")
 
+    # 插件（`docs/plugin-contract-spec.md`）：扫 `plugins/` 目录。
+    # **必须在进轮询循环之前** —— 插件可能在 `setup` 里注册工具/事件，
+    # 循环一开就晚了。而且**加载失败绝不拦住启动**：一个写坏的插件不该让整台
+    # 助手起不来（同 `health` / `status_page` / 坏掉的 `state.json` 那条规矩）。
+    # `load_dir` 自己逐条 catch + 整份回滚；这里的 try 是**第三条保险**：
+    # 万一加载器本身有 bug，也绝不能把助手拦在启动阶段。
+    try:
+        plugins.load_dir(cfg=cfg, log=print)
+    except Exception:
+        traceback.print_exc()
+
     # 只读状态页（默认关闭，见 config.yaml 的 status 段）。
     # **只渲染内存快照、绝不查库**，所以它不违反「hook 不支持并发」那条铁律。
     # 只允许绑回环地址；status_page 自己会拒绝其它地址。

@@ -28,9 +28,12 @@
 本模块**谁也不 import**（纯注册表）。`agent_tools` / `files` **import 它**，
 并在各自模块底部自注册。注册表去 import 工具层/文件层会**立刻**变成循环依赖。
 """
+import os
+
 __all__ = [
-    "PluginError", "Registry", "REGISTRY",
+    "PluginError", "Registry", "REGISTRY", "ScopedRegistrar",
     "CONFIRM_MODES", "EXEC_MODES",
+    "plugins_dir", "load_dir", "enabled", "disabled_names",
 ]
 
 
@@ -178,6 +181,23 @@ class Registry:
         """内置工具的名字（按注册顺序）。给自测做「零行为变化」比对用。"""
         return [n for n in self._order if self._tools[n]["source"] == "builtin"]
 
+    def rollback_source(self, source):
+        """把某个 `source` 注册的东西全部撤掉，返回撤掉的工具名。
+
+        **给加载器做「半加载」回滚用**：插件在 `setup` 里注册了工具 A、
+        再在 B 上抛错，如果留着 A，那这个插件就是**半加载**状态 ——
+        它的工具模型看得到，但它的其它东西（事件、待确认 kind）没生效。
+        这种状态最难查（「怎么有个工具，但又不好使」），所以宁可不加载。
+
+        工具注册表是**唯一真源**，回滚也只能回滚自己注册的那一份 ——
+        绝不能顺手把别人的也清掉，所以按 `source` 精确匹配。
+        """
+        gone = [n for n in self._order if self._tools[n]["source"] == source]
+        for n in gone:
+            self._order.remove(n)
+            self._tools.pop(n, None)
+        return gone
+
     # ------------------------------------------------------------ 派发
 
     def resolve(self, name, box):
@@ -221,3 +241,165 @@ def load_builtin_tools(tools, register_source="builtin"):
             "method": "t_" + name if name else "",
         }, source=register_source))
     return out
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 插件加载（规格 2.3）
+# ────────────────────────────────────────────────────────────────────────
+
+PLUGIN_ENTRY = "setup"
+PLUGINS_DIRNAME = "plugins"
+
+
+class ScopedRegistrar:
+    """交给插件用的注册视图：**把 source 钉成插件名**。
+
+    为什么不让插件自己填：插件名是**加载器**从文件名知道的，让插件自己写就会写错
+    或撞名；而 `source` 是「回滚半加载插件」的唯一依据（见 `rollback_source`）。
+    插件拿到的这个对象只有注册方法，没有任何回滚/查询能力。
+    """
+
+    def __init__(self, registry, source):
+        self._reg = registry
+        self.source = source
+
+    def register_tool(self, spec, **kw):
+        kw.pop("source", None)          # 插件说了不算：source 由加载器定
+        return self._reg.register_tool(spec, source=self.source)
+
+
+def plugins_dir(base=None):
+    """插件目录：`<repo>/plugins`。"""
+    base = base or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, PLUGINS_DIRNAME)
+
+
+def _switch_on(cfg, log):
+    """`plugins.enabled` 是不是开着。
+
+    判据：**只有显式的 `false` 才算关**；缺省 = 开；其它值（`"false"` 字符串、
+    `0`、整个段写成标量）告警并**当开**。
+
+    为什么和 `redact` 那条（严格 `is True`，写 `"true"` 一律当关）**反着来**：
+    那边判错的安全方向是「关」；这边一旦判错成「关」，用户放进 `plugins/` 的插件会
+    **静默不加载** —— 那正是本项目最忌讳的失效。宁可多加载，也要让它**说出来**。
+    """
+    p = (cfg or {}).get("plugins")
+    if p is None:
+        return True
+    if not isinstance(p, dict):
+        log(f"[plugins] ⚠️ config 的 plugins 段不是表（是 {type(p).__name__}），"
+            f"已按默认值当**开**处理。")
+        return True
+    v = p.get("enabled", True)
+    if v is False:
+        return False
+    if v is not True:
+        log(f"[plugins] ⚠️ plugins.enabled={v!r} 不是布尔值，已当**开**处理"
+            f"（写成字符串 \"false\" 关不掉插件）。要关就写 enabled: false")
+    return True
+
+
+def disabled_names(cfg):
+    """`plugins.disabled: [名字]` —— 单个关掉。
+
+    非字符串项直接跳过（YAML 写歪了只能变成「没关掉」，不能变成「关了什么」）。
+    """
+    p = (cfg or {}).get("plugins")
+    if not isinstance(p, dict):
+        return []
+    raw = p.get("disabled") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x).strip() for x in raw if isinstance(x, str) and x.strip()]
+
+
+def _import_file(path, mod_name):
+    """按文件路径把插件导入成模块。
+
+    模块名带 `_wechat_plugin_` 前缀，避免和真实模块撞名。
+
+    **不把插件目录加进 `sys.path`**：那会让插件里的文件名有机会遮蔽标准库
+    ——一个叫 `json.py` 的插件能悄悄换掉全进程的 json。插件是**单文件**；
+    要复用代码就用 `_` 前缀的辅助文件并自己 importlib 加载。
+    """
+    import importlib.util
+    key = f"_wechat_plugin_{mod_name}"
+    spec = importlib.util.spec_from_file_location(key, path)
+    if spec is None or spec.loader is None:
+        raise PluginError(f"这个文件没法当模块加载：{path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_dir(directory=None, cfg=None, log=print, registry=None):
+    """扫插件目录并加载。**永不抛异常**，永远返回一份报告 dict。
+
+    报告形状：`{"dir", "loaded": [名], "skipped": [(名, 原因)], "failed": [(名, 原因)]}`
+
+    规矩（规格 2.3，每条都有原因）：
+
+    * 只认 `*.py`，**跳过 `_` 开头**（`_example.py` 是模板，不加载）；
+    * **不用 `entry_points`**：这个包是 zip + `.bat` 发的，没有 `pip install`
+      这一步，entry_points 永远不会被触发（写了等于静默失效）；
+    * **加载失败只告警并跳过，绝不拦住 bot 启动** —— 同 `health` / `status_page` /
+      坏掉的 `state.json` 那条规矩：一个写坏的插件不该让整台助手起不来；
+    * 失败的插件**整份回滚**（见 `Registry.rollback_source`），不留半加载状态；
+    * **逐条打印**加载结果 —— 往目录里丢个文件就能让代码跑起来，这件事不能是暗的。
+    """
+    reg = registry if registry is not None else REGISTRY
+    rep = {"dir": "", "loaded": [], "skipped": [], "failed": []}
+
+    if not _switch_on(cfg, log):
+        rep["skipped"].append(("(全部)", "plugins.enabled 是显式的 false"))
+        log("[plugins] 插件已按配置关闭（plugins.enabled: false）。")
+        return rep
+
+    d = directory or plugins_dir()
+    rep["dir"] = d
+    if not os.path.isdir(d):
+        return rep                 # 目录不存在 = 一份插件都没有，这是正常状态
+
+    off = set(disabled_names(cfg))
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError as e:
+        log(f"[plugins] ⚠️ 插件目录读不出来（{e}），跳过。")
+        rep["failed"].append(("(目录)", f"{type(e).__name__}: {e}"))
+        return rep
+
+    for fn in entries:
+        if not fn.endswith(".py") or fn.startswith("_"):
+            continue
+        name = fn[:-3]
+        if name in off:
+            rep["skipped"].append((name, "在 plugins.disabled 名单里"))
+            continue
+        try:
+            mod = _import_file(os.path.join(d, fn), name)
+            entry = getattr(mod, PLUGIN_ENTRY, None)
+            if not callable(entry):
+                raise PluginError(
+                    f"插件必须定义 {PLUGIN_ENTRY}(reg) 作为入口（这个文件里没有）")
+            entry(ScopedRegistrar(reg, name))
+        except Exception as e:
+            gone = reg.rollback_source(name)      # 半加载最难查，整份撤掉
+            why = f"{type(e).__name__}: {e}"
+            if gone:
+                why += f"（已回滚它注册的 {len(gone)} 个工具：{'、'.join(gone)}）"
+            rep["failed"].append((name, why))
+            log(f"[plugins] ❌ 插件「{name}」加载失败，已跳过并回滚：{why}")
+        else:
+            rep["loaded"].append(name)
+
+    for name, why in rep["skipped"]:
+        log(f"[plugins] ⏭  跳过「{name}」：{why}")
+    if rep["loaded"]:
+        log(f"[plugins] 已加载 {len(rep['loaded'])} 个插件：" + "、".join(rep["loaded"]))
+    elif not rep["failed"] and not rep["skipped"]:
+        log(f"[plugins] 插件目录是空的（{d}），没有插件。")
+    return rep
+

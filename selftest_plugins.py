@@ -288,6 +288,119 @@ def test_dependency_direction():
     return True
 
 
+def _mkplug(td, name, body):
+    with open(os.path.join(td, name + ".py"), "w", encoding="utf-8") as f:
+        f.write(body)
+
+
+_GOOD_SPEC = ('{"name": "%s", "description": "d", "parameters": {"type": "object"},'
+              ' "handler": lambda a, c: "from-plugin", "guidance": "g"}')
+
+
+def test_load_dir():
+    print("\n── 6 · 插件目录加载：失败隔离 / 半加载回滚 / 开关 ──")
+    ok = True
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        _mkplug(td, "_example", "def setup(reg):\n    raise RuntimeError('模板不该被加载')\n")
+        _mkplug(td, "good", "def setup(reg):\n    reg.register_tool(%s)\n"
+                            % (_GOOD_SPEC % "good_tool"))
+        _mkplug(td, "broken", "def setup(reg)\n    pass\n")          # 语法错
+        _mkplug(td, "nosetup", "X = 1\n")                            # 没有 setup
+        _mkplug(td, "half", "def setup(reg):\n"
+                            "    reg.register_tool(%s)\n"
+                            "    raise RuntimeError('注册到一半炸了')\n"
+                            % (_GOOD_SPEC % "half_tool"))
+        # 插件叫 json.py：**不许**遮蔽标准库（我们不加 sys.path）
+        _mkplug(td, "json", "def setup(reg):\n    pass\n")
+
+        before_json = sys.modules.get("json")
+        reg = plugins.Registry()
+        logs = []
+        rep = plugins.load_dir(directory=td, cfg={}, log=logs.append, registry=reg)
+
+        ok &= check("`_` 开头的文件不加载",
+                    "_example" not in rep["loaded"]
+                    and not any(n == "_example" for n, _ in rep["failed"]),
+                    rep)
+        ok &= check("好插件加载成功", rep["loaded"] == ["good", "json"], rep["loaded"])
+        ok &= check("语法错的插件进 failed、**其余照常**、加载器不抛异常",
+                    any(n == "broken" for n, _ in rep["failed"])
+                    and "good" in rep["loaded"], rep)
+        ok &= check("缺 setup 的插件进 failed 且说清要 setup",
+                    any(n == "nosetup" and "setup" in w for n, w in rep["failed"]), rep)
+        ok &= check("插件工具进了注册表，source 是插件名",
+                    reg.has("good_tool") and reg.get("good_tool")["source"] == "good",
+                    reg.get("good_tool"))
+
+        # ⚠️ 半加载回滚：注册了一个工具再抛错 → 那个工具**不许**留在表里。
+        # 留着就是「模型看得到工具、但插件的其它东西没生效」这种最难查的状态。
+        ok &= check("半加载的插件：它注册的工具被整份回滚掉",
+                    not reg.has("half_tool") and "half" in [n for n, _ in rep["failed"]],
+                    reg.names())
+        ok &= check("回滚只清自己的（好插件的工具还在）", reg.has("good_tool"))
+
+        ok &= check("标准库没被插件顶掉（没把插件目录加进 sys.path）",
+                    sys.modules.get("json") is before_json, sys.modules.get("json"))
+
+        ok &= check("逐个打印了加载结果（往目录丢文件就能跑，这事不能是暗的）",
+                    any("已加载" in s for s in logs)
+                    and any("加载失败" in s for s in logs), logs)
+
+        # 开关
+        rep_off = plugins.load_dir(directory=td, cfg={"plugins": {"enabled": False}},
+                                   log=logs.append, registry=plugins.Registry())
+        ok &= check("plugins.enabled=false → 一个都不加载",
+                    rep_off["loaded"] == [] and rep_off["failed"] == [], rep_off)
+
+        rep_dis = plugins.load_dir(directory=td, cfg={"plugins": {"disabled": ["good"]}},
+                                   log=logs.append, registry=plugins.Registry())
+        ok &= check("plugins.disabled=[good] → 只跳过它、其余照常",
+                    "good" not in rep_dis["loaded"] and "json" in rep_dis["loaded"],
+                    rep_dis)
+
+        # 判错方向：只有显式 false 才算关。
+        # 写成字符串 "false" 如果被判成「关」，用户的插件会**静默不加载**
+        # —— 那正是本项目最忌讳的失效，所以宁可当开并**告警**。
+        logs2 = []
+        rep_str = plugins.load_dir(directory=td, cfg={"plugins": {"enabled": "false"}},
+                                   log=logs2.append, registry=plugins.Registry())
+        ok &= check("enabled 写成字符串 \"false\" → 不当成关（避免静默不加载）",
+                    "json" in rep_str["loaded"], rep_str["loaded"])
+        ok &= check("…但必须**告警**说清怎么写才关",
+                    any("enabled" in s for s in logs2), logs2)
+
+    # 目录不存在 = 正常（一份插件都没有），不是错误
+    with tempfile.TemporaryDirectory() as td:
+        rep_none = plugins.load_dir(directory=os.path.join(td, "not-there"),
+                                    cfg={}, log=lambda s: None,
+                                    registry=plugins.Registry())
+        ok &= check("插件目录不存在 → 空报告、不报错",
+                    rep_none["loaded"] == [] and rep_none["failed"] == [], rep_none)
+    return ok
+
+
+def test_scoped_source():
+    print("\n── 7 · 插件的 source 由加载器钉死（回滚要靠它）──")
+    ok = True
+    reg = plugins.Registry()
+    scoped = plugins.ScopedRegistrar(reg, "myplug")
+    spec = _good_plugin_spec("scoped_tool")
+    spec["source"] = "我想自己填"
+    scoped.register_tool(spec, source="也不想让你填")
+
+    got = reg.get("scoped_tool")
+    ok &= check("插件填的 source 被忽略，一律用插件名",
+                got is not None and got["source"] == "myplug", got and got["source"])
+    ok &= check("rollback_source 能精确清掉这个插件的东西",
+                reg.rollback_source("myplug") == ["scoped_tool"]
+                and not reg.has("scoped_tool"), reg.names())
+    ok &= check("回滚别的 source 不会误伤",
+                reg.rollback_source("没这个插件") == [])
+    return ok
+
+
 def main():
     print("插件契约回归（`plugins.py`）")
     print("=" * 66)
@@ -296,6 +409,8 @@ def main():
     test_dispatch()
     test_real_toolbox()
     test_dependency_direction()
+    test_load_dir()
+    test_scoped_source()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")
