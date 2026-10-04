@@ -3062,15 +3062,14 @@ class ToolBox:
 
         **只读**：处理器不许改它去影响别的处理器或主循环 —— 要改行为就
         `set_pending`（走确认闸）或用 `before_reply`。
+
+        形状**只有 `plugins.make_ctx` 一处定义**（这里只是把实例字段喂进去）：
+        两边各写一份的话，加一个字段就会漏一边，而漏的那边表现为「插件拿不到
+        那个事实」—— 不报错、就是没有，正是本项目最怕的静默失效。
         """
-        return {
-            "chat": self.chat,
-            "self_wxid": self.self_wxid,
-            "cfg": self.cfg_provider(),
-            "from_self": self.from_self,
-            "is_group": self.is_group,
-            "user_query": self.user_query,
-        }
+        return plugins.make_ctx(chat=self.chat, self_wxid=self.self_wxid,
+                                cfg=self.cfg_provider(), from_self=self.from_self,
+                                is_group=self.is_group, user_query=self.user_query)
 
     def _image_path_ok(self, path):
         """校验发图路径。返回 (绝对路径, 错误文本)。

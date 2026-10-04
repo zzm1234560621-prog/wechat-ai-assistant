@@ -29,10 +29,11 @@
 并在各自模块底部自注册。注册表去 import 工具层/文件层会**立刻**变成循环依赖。
 """
 import os
+import time
 
 __all__ = [
     "PluginError", "Registry", "REGISTRY", "ScopedRegistrar",
-    "CONFIRM_MODES", "EXEC_MODES",
+    "CONFIRM_MODES", "EXEC_MODES", "EVENTS", "make_ctx",
     "plugins_dir", "load_dir", "enabled", "disabled_names",
 ]
 
@@ -58,13 +59,75 @@ CONFIRM_MODES = ("auto", "always")
 # 而不是被静默当成 `inline` 跑（那等于一边阻塞微信一边声称自己没阻塞）。
 EXEC_MODES = ("inline", "worker")
 
+# 生命周期事件的白名单（规格第三节）。
+#
+# **在这里集中声明**：拼错事件名必须当场失败。静默注册一个**永远不会被触发**的
+# 回调，是查起来最费劲的一种失效 —— 插件作者以为挂上了，实际什么都没发生。
+#
+# 全部在**收消息那条线程**上同步调用。只有 `before_reply` 能改行为（且只改文本）：
+# 路由（这条消息回不回、回给谁、算不算命令）只能有一个所有者。
+EVENTS = ("on_start", "on_message", "before_reply", "after_reply", "on_tool", "on_tick")
+
+
+def make_ctx(chat="", self_wxid="", cfg=None, from_self=None, is_group=None,
+             user_query="", **extra):
+    """构造工具处理器与生命周期事件共用的**只读**上下文（规格 2.1）。
+
+    **ctx 的形状只有这一处定义** —— `ToolBox.ctx()` 也走它，免得两边各写一份、
+    慢慢长歪（这个项目为「两处各写一份」已经付过好几次代价）。
+
+    `from_self` 默认 `None` = **「不知道」**，绝不许当成 True：
+    权限类判断（文件能力的 `files.who`）靠它决定放不放行，
+    把未知当成 True 等于**静默放宽权限**。
+    """
+    if is_group is None:
+        is_group = "@chatroom" in str(chat or "")
+    ctx = {
+        "chat": str(chat or ""),
+        "self_wxid": str(self_wxid or ""),
+        "cfg": cfg if cfg is not None else {},
+        "from_self": from_self,
+        "is_group": bool(is_group),
+        "user_query": str(user_query or ""),
+    }
+    ctx.update(extra)
+    return ctx
+
+
+def event_limits(cfg):
+    """事件的时间预算，返回 `(slow_ms, disable_after)`。
+
+    `disable_after = 0` = **不自动停用**（只告警）。
+    """
+    p = (cfg or {}).get("plugins")
+    if not isinstance(p, dict):
+        p = {}
+
+    def _int(key, dflt, lo):
+        try:
+            v = int(p.get(key, dflt))
+        except (TypeError, ValueError):
+            return dflt
+        return max(lo, v)
+
+    return _int("slow_ms", 500, 1), _int("disable_after", 5, 0)
+
+
 
 class Registry:
     """工具注册表。一个进程一个实例（模块级的 `REGISTRY`）。"""
 
-    def __init__(self):
+    def __init__(self, log=None):
         self._tools = {}        # name -> 规范化后的 spec
         self._order = []        # 注册顺序（**必须保住**：模型看到的清单顺序要稳定）
+        # 生命周期事件：{事件名: [(source, fn), ...]}，按注册顺序调用。
+        self._events = {e: [] for e in EVENTS}
+        # 事件耗时记账：source -> **连续**超时次数（中间有一次快就清零）。
+        self._slow = {}
+        # 被自动停用的插件。**不落盘**：只在本次运行生效，改好代码重启即恢复。
+        self._disabled = set()
+        # 日志出口。加载器会把它换成 bot 的 print。
+        self.log = log or print
 
     # ------------------------------------------------------------ 注册
 
@@ -198,6 +261,108 @@ class Registry:
             self._tools.pop(n, None)
         return gone
 
+    # ------------------------------------------------------------ 事件
+    #
+    # 五条硬规矩（规格 3.1），每条都有原因：
+    #   1. 事件抛异常**绝不打断消息循环** —— 插件炸了不能把收微信带下去；
+    #   2. 插件跑在轮询线程上，它自己的线程**绝不许碰 hook**（契约层面约束，
+    #      代码拦不住，所以写在文档和注释里，并由「慢就停用」兜一句）；
+    #   3. `before_reply` 的返回值仍要过 `bot.send` 的既有校验；返回 `None` 或
+    #      非字符串 = **不改**（fail-safe）；
+    #   4. 单事件必须快。**Python 中断不了同步调用**，所以「超时杀掉」做不到，
+    #      不许假装做得到 —— 实际做法是测耗时、超阈值告警、连续超 N 次**自动停用**；
+    #   5. 插件是配置项，必须能一键关（`plugins.enabled` / `plugins.disabled`）。
+
+    def register_event(self, name, fn, source="plugin"):
+        """挂一个生命周期事件。事件名不认识就**当场失败**（见 `EVENTS` 的注释）。"""
+        ev = str(name or "").strip()
+        if ev not in EVENTS:
+            raise PluginError(
+                f"[{source}] 不认识的事件「{name}」——只认 {list(EVENTS)}。"
+                f"拼错事件名必须当场失败：静默注册一个**永远不会被触发**的回调，"
+                f"是最难查的一种失效（作者以为挂上了，其实什么都没发生）")
+        if not callable(fn):
+            raise PluginError(f"[{source}] 事件 {ev} 的回调不是可调用的")
+        self._events[ev].append((source, fn))
+        return fn
+
+    def emit(self, event, *args, cfg=None):
+        """触发一个**观察类**事件，返回 `[(source, 结果), ...]`。
+
+        异常与耗时都在 `_call` 里兜住。调用方**不看返回值也能用**；
+        唯一的例外是 `before_reply`，它有专用入口（要串联、要 fail-safe）。
+        """
+        return [(src, self._call(src, event, fn, *args, cfg=cfg))
+                for src, fn in list(self._events.get(event, ()))]
+
+    def before_reply(self, text, ctx=None, cfg=None):
+        """跑 `before_reply` 链，返回最终文本。
+
+        fail-safe：回调返回 `None` 或**非字符串**一律当「不改」——
+        写坏了只等于不生效，**绝不等于把回复吞掉**。
+        多个插件按注册顺序**串联**（后一个看到前一个的结果）。
+
+        ⚠️ 调用点只许是**模型答复**那一处。确认菜单 / 群发预览是
+        `bot` **原样直发**的（用户照着它回「确认」），插件改写它等于把确认闸做废。
+        """
+        out = text
+        for src, fn in list(self._events.get("before_reply", ())):
+            r = self._call(src, "before_reply", fn, out, ctx, cfg=cfg)
+            if isinstance(r, str):
+                out = r
+        return out
+
+    def _call(self, source, event, fn, *args, cfg=None):
+        if source in self._disabled:
+            return None
+        t0 = time.monotonic()
+        try:
+            return fn(*args)
+        except Exception as e:
+            self.log(f"[plugins] ⚠️ 插件「{source}」的 {event} 抛异常，已忽略并继续"
+                     f"（插件炸了绝不能把消息循环带下去）：{type(e).__name__}: {e}")
+            return None
+        finally:
+            self._note_ms(source, event, (time.monotonic() - t0) * 1000.0, cfg)
+
+    def _note_ms(self, source, event, ms, cfg):
+        slow_ms, limit = event_limits(cfg)
+        if ms <= slow_ms:
+            self._slow[source] = 0          # 「连续」：中间有一次快就重新计
+            return
+        n = self._slow.get(source, 0) + 1
+        self._slow[source] = n
+        self.log(f"[plugins] ⚠️ 插件「{source}」的 {event} 花了 {ms:.0f}ms"
+                 f"（阈值 {slow_ms}ms，连续第 {n} 次）—— 事件跑在**收消息那条线程**上，"
+                 f"它慢就是在卡收微信。")
+        if limit and n >= limit:
+            self.auto_disable(source)
+
+    def auto_disable(self, source, why="连续超时"):
+        """自动停用某个插件：撤掉它的工具与事件，并**明说是谁、为什么**。
+
+        **不假装能超时中断**（Python 中断不了同步调用）。停用是唯一能真正
+        止血的动作，代价是这个插件的功能没了 —— 所以必须说清楚，
+        而且只在本次运行生效（改好重启即恢复）。
+        """
+        if source in self._disabled:
+            return []
+        self._disabled.add(source)
+        gone = self.rollback_source(source)
+        dropped = 0
+        for ev, lst in self._events.items():
+            keep = [x for x in lst if x[0] != source]
+            dropped += len(lst) - len(keep)
+            self._events[ev] = keep
+        self.log(f"[plugins] ❌ 插件「{source}」{why}，**已自动停用**："
+                 f"撤掉 {len(gone)} 个工具、{dropped} 个事件。"
+                 f"停用只在本次运行生效 —— 改好代码重启就恢复。")
+        return gone
+
+    def disabled_plugins(self):
+        """被自动停用的插件名（给自测与状态页用）。"""
+        return sorted(self._disabled)
+
     # ------------------------------------------------------------ 派发
 
     def resolve(self, name, box):
@@ -266,6 +431,10 @@ class ScopedRegistrar:
     def register_tool(self, spec, **kw):
         kw.pop("source", None)          # 插件说了不算：source 由加载器定
         return self._reg.register_tool(spec, source=self.source)
+
+    def register_event(self, name, fn):
+        """挂生命周期事件（`EVENTS` 白名单）。"""
+        return self._reg.register_event(name, fn, source=self.source)
 
 
 def plugins_dir(base=None):
@@ -351,6 +520,7 @@ def load_dir(directory=None, cfg=None, log=print, registry=None):
     * **逐条打印**加载结果 —— 往目录里丢个文件就能让代码跑起来，这件事不能是暗的。
     """
     reg = registry if registry is not None else REGISTRY
+    reg.log = log
     rep = {"dir": "", "loaded": [], "skipped": [], "failed": []}
 
     if not _switch_on(cfg, log):

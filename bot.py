@@ -1253,6 +1253,11 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
         for c in result.tool_calls:
             out = box.run(c.name, c.arguments)
             print(f"[bot] 工具 {c.name} {json.dumps(c.arguments, ensure_ascii=False)[:70]} -> {out[:70]}")
+            # `on_tool`：**每次工具调用之后**（只观察，审计/日志用）。
+            # 放在这里而不是 ToolBox 里，是因为 ToolBox 不知道「这一轮是哪个插件的
+            # 调用」之外的东西，而事件总线要的东西它都有。
+            plugins.REGISTRY.emit("on_tool", c.name, c.arguments, out,
+                                  box.ctx(), cfg=cfg)
             messages.append({"role": "tool", "tool_call_id": c.id,
                              "name": c.name, "content": out})
 
@@ -2618,6 +2623,17 @@ def main():
               f"自动回复对它不生效，请二选一。")
         auto_recs.pop(chat, None)
 
+    def plug_ctx(chat, from_self=None, query=""):
+        """插件用的只读上下文（形状的唯一所有者是 `plugins.make_ctx`）。
+
+        ⚠️ **事实由有事实的那一层传进来**：`from_self` 是「这条消息是不是我自己
+        发的」，只有主循环手里有。**绝不在这里猜** —— 「不知道」（`None`）和
+        「是我自己发的」（`True`）是两回事，权限类判断（文件能力的 `files.who`）
+        靠它放行，把未知当 True 就是静默放宽权限。
+        """
+        return plugins.make_ctx(chat=chat, self_wxid=self_wxid, cfg=cfg,
+                                from_self=from_self, user_query=query)
+
     def send(text, to):
         """发消息。**绝不抛异常**，返回是否真的发出去了。
 
@@ -2660,6 +2676,13 @@ def main():
                 h.note_sent()
             except Exception:
                 pass
+        # `after_reply`：**一条消息真的发出去之后**才触发（只观察，不能改内容）。
+        #
+        # 为什么它比 `before_reply` 覆盖得宽（凡出站都算，包括确认菜单和群发预览）：
+        # 观察类事件没有「改坏原样直发」的风险，而且一个记录出站消息的插件
+        # 本来就该看到全部。`before_reply` 能改文本，所以只许挂在**模型答复**那两处
+        # —— 菜单/预览是用户用来回「确认」的依据，改写它等于把确认闸做废。
+        plugins.REGISTRY.emit("after_reply", text, plug_ctx(to), cfg=cfg)
         return True
 
     print(f"[bot] 后端：{backend}  |  监听中，控制会话：{targets}  |  只回目标：{reply_only}")
@@ -2682,6 +2705,9 @@ def main():
         plugins.load_dir(cfg=cfg, log=print)
     except Exception:
         traceback.print_exc()
+    # `on_start`：加载完就通知（插件可能在 setup 里注册了工具/事件，这里告诉它
+    # 「环境就绪了」，比如去连 MCP server 拉 tools/list）。异常由 emit 兜住。
+    plugins.REGISTRY.emit("on_start", cfg, cfg=cfg)
 
     # 只读状态页（默认关闭，见 config.yaml 的 status 段）。
     # **只渲染内存快照、绝不查库**，所以它不违反「hook 不支持并发」那条铁律。
@@ -2728,6 +2754,8 @@ def main():
         recall_ring.configure(recall.buffer_seconds(cfg), recall.buffer_max(cfg))
         control_chat = (list(cfg.get("target_chats") or []) or ["filehelper"])[0]
 
+    _tick_no = [0]
+
     def run_scheduled():
         """跑一遍到点的定时任务。
 
@@ -2737,6 +2765,10 @@ def main():
         next_ts，这样同一个任务不会在下一 tick 又触发一遍。命令改过配置后
         主循环会 reload_cfg()，新任务自然生效。
         """
+        # `on_tick`：轮询空档（定时任务本来就在这个空档里跑，节流 ≥1 秒）。
+        # **必须在同一线程**（规格第三节），所以挂在这里而不是另起定时器。
+        _tick_no[0] += 1
+        plugins.REGISTRY.emit("on_tick", _tick_no[0], cfg=cfg)
 
         def ask_task(question):
             """定时的「提问」：把这句话当普通提问跑一遍，走的和主循环完全同一条路。
@@ -2768,6 +2800,11 @@ def main():
                 answer = llm.chat(system_now(),
                                   history + [{"role": "user", "content": prompt}])
                 changed = False
+            # `before_reply`：定时的「提问」也是一次**模型答复**，同样要过一遍。
+            # 挂在「模型答复」这一层而不是挂在 send()，理由见主循环那处
+            # —— 确认菜单和群发预览必须原样直发。
+            answer = plugins.REGISTRY.before_reply(
+                answer, plug_ctx(control_chat, query=question), cfg=cfg)
             dialog_append(control_chat, "user", question, cfg)
             dialog_append(control_chat, "assistant", answer, cfg)
             if changed:
@@ -2908,6 +2945,14 @@ def main():
                     continue
 
                 sender = msg.roomid or msg.sender
+                # `on_message`：**尚未路由**时触发（只观察）。
+                # 放在这里而不是路由之后，是为了让插件看到「这条消息到了」，
+                # 而不是「这条消息被采纳了」—— 采纳与否是**路由**的判断，
+                # 插件不许插手（规格第三节：路由只能有一个所有者）。
+                plugins.REGISTRY.emit(
+                    "on_message",
+                    plug_ctx(sender, from_self=msg.from_self(),
+                             query=(msg.content or "")), cfg=cfg)
                 in_targets = sender in targets
                 rec = auto_recs.get(sender) if auto_on else None
                 watched = watch_recs.get(sender) if watch_on else None
@@ -3392,6 +3437,12 @@ def main():
                         answer = llm.chat(system_now(),
                                           history + [{"role": "user", "content": prompt}])
                         cfg_changed = False
+                    # `before_reply`：**只对模型答复**能改文本。
+                    # 挂在 send() 里会连确认菜单、群发预览一起改 —— 而那是用户
+                    # 用来回「确认」的依据（bot 原样直发），改写它等于把确认闸做废。
+                    answer = plugins.REGISTRY.before_reply(
+                        answer, plug_ctx(sender, from_self=msg.from_self(),
+                                         query=query), cfg=cfg)
                     send(answer, sender)
                     # 工具可能刚登记了待确认动作（发消息/发图/跑命令）→ 立刻落盘
                     save_pending(pending_chats, cfg)

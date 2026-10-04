@@ -401,6 +401,103 @@ def test_scoped_source():
     return ok
 
 
+def test_events():
+    print("\n── 8 · 生命周期事件：异常隔离 / 串联 / 慢就停用 ──")
+    ok = True
+    import time as _t
+
+    logs = []
+    reg = plugins.Registry(log=logs.append)
+    seen = []
+
+    hit, msg = _raises(lambda: reg.register_event("on_mesage", lambda c: None, source="p1"))
+    ok &= check("事件名拼错 → 加载期失败（静默注册一个永不触发的回调最难查）",
+                hit and "on_mesage" in msg, msg)
+    hit, msg = _raises(lambda: reg.register_event("on_start", "不是函数", source="p1"))
+    ok &= check("回调不可调用 → 失败", hit, msg)
+
+    reg.register_event("on_message", lambda c: seen.append("first"), source="p1")
+    reg.register_event("on_message", lambda c: 1 / 0, source="p2")
+    reg.register_event("on_message", lambda c: seen.append("third"), source="p3")
+    reg.emit("on_message", plugins.make_ctx(chat="c"), cfg={})
+    ok &= check("一个插件抛异常，其余照常被调用（绝不许把消息循环带下去）",
+                seen == ["first", "third"], seen)
+    ok &= check("异常被记进日志", any("抛异常" in s for s in logs), logs)
+
+    reg2 = plugins.Registry(log=lambda s: None)
+    reg2.register_event("before_reply", lambda t, c: t + "A", source="a")
+    reg2.register_event("before_reply", lambda t, c: t + "B", source="b")
+    ok &= check("before_reply 按注册顺序**串联**（后一个看到前一个的结果）",
+                reg2.before_reply("x", cfg={}) == "xAB", reg2.before_reply("x", cfg={}))
+    reg2.register_event("before_reply", lambda t, c: None, source="c")
+    reg2.register_event("before_reply", lambda t, c: 42, source="d")
+    ok &= check("返回 None / 非字符串 = **不改**（写坏了只等于不生效，绝不吞回复）",
+                reg2.before_reply("x", cfg={}) == "xAB", reg2.before_reply("x", cfg={}))
+    reg2.register_event("before_reply", lambda t, c: 1 / 0, source="e")
+    ok &= check("before_reply 里抛异常 → 文本不变（绝不许变成空串）",
+                reg2.before_reply("x", cfg={}) == "xAB", reg2.before_reply("x", cfg={}))
+
+    logs3 = []
+    reg3 = plugins.Registry(log=logs3.append)
+    calls = []
+    reg3.register_tool({"name": "slow_tool", "description": "d",
+                        "parameters": {"type": "object"},
+                        "handler": lambda a, c: "h", "guidance": "g"}, source="slow")
+
+    def _slow(ctx):
+        calls.append(1)
+        _t.sleep(0.02)
+
+    reg3.register_event("on_message", _slow, source="slow")
+    cfg = {"plugins": {"slow_ms": 1, "disable_after": 3}}
+    reg3.emit("on_message", None, cfg=cfg)
+    reg3.emit("on_message", None, cfg=cfg)
+    ok &= check("慢事件先只告警，还没停用",
+                len(calls) == 2 and "slow" not in reg3.disabled_plugins(), calls)
+    ok &= check("告警里说清它跑在**收消息那条线程**上（用户要知道代价）",
+                any("线程" in s for s in logs3), logs3)
+    reg3.emit("on_message", None, cfg=cfg)
+    ok &= check("连续超阈值 → 自动停用并**明说是谁**",
+                "slow" in reg3.disabled_plugins()
+                and any("已自动停用" in s and "slow" in s for s in logs3), logs3)
+    ok &= check("停用同时撤掉它的工具", not reg3.has("slow_tool"), reg3.names())
+    n_before = len(calls)
+    reg3.emit("on_message", None, cfg=cfg)
+    ok &= check("停用后它的回调**不再被调用**", len(calls) == n_before, calls)
+
+    reg4 = plugins.Registry(log=lambda s: None)
+    hits = []
+
+    def _flaky(ctx):
+        hits.append(1)
+        if len(hits) % 2 == 1:
+            _t.sleep(0.02)
+
+    reg4.register_event("on_message", _flaky, source="flaky")
+    for _ in range(6):
+        reg4.emit("on_message", None, cfg={"plugins": {"slow_ms": 1, "disable_after": 2}})
+    ok &= check("「连续」= 中间一次快就重新计（慢/快交替不会被误停用）",
+                "flaky" not in reg4.disabled_plugins(), reg4.disabled_plugins())
+
+    reg5 = plugins.Registry(log=lambda s: None)
+    reg5.register_event("on_message", lambda c: _t.sleep(0.02), source="never")
+    for _ in range(10):
+        reg5.emit("on_message", None, cfg={"plugins": {"slow_ms": 1, "disable_after": 0}})
+    ok &= check("disable_after: 0 → 只告警、永不自动停用",
+                "never" not in reg5.disabled_plugins(), reg5.disabled_plugins())
+
+    c = plugins.make_ctx(chat="123@chatroom", cfg={"a": 1})
+    ok &= check("make_ctx：from_self 默认 None（「不知道」绝不许当成 True）",
+                c["from_self"] is None, c)
+    ok &= check("make_ctx：is_group 从 chat 直接推得", c["is_group"] is True, c)
+    ok &= check("make_ctx：形状就是契约那六个键（唯一所有者）",
+                set(c) == {"chat", "self_wxid", "cfg", "from_self", "is_group",
+                           "user_query"}, set(c))
+    ok &= check("ToolBox.ctx() 走的就是 make_ctx（不是第二份形状）",
+                set(agent_tools.ToolBox(None, {}, [], chat="c").ctx()) == set(c))
+    return ok
+
+
 def main():
     print("插件契约回归（`plugins.py`）")
     print("=" * 66)
@@ -411,6 +508,7 @@ def main():
     test_dependency_direction()
     test_load_dir()
     test_scoped_source()
+    test_events()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")
