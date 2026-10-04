@@ -483,6 +483,83 @@ def test_startup_notes():
     return ok
 
 
+def test_send_file_from_disk():
+    print("\n── 9 · 扩 send_file：盘上路径一律进确认，**绝不走白名单直发** ──")
+    ok = True
+    chat = "selftest_files_send"
+    agent_tools._PENDING.pop(chat, None)
+
+    class _Cli:
+        def __init__(self):
+            self.sent = []
+
+        def send_file(self, path, wxid, cfg=None):
+            self.sent.append((path, wxid))
+
+    contacts = [{"wxid": "wxid_friendA", "name": "张三", "remark": "老张"}]
+
+    def _box(cfg, cli, chat_id, from_self=True):
+        b = agent_tools.ToolBox(cli, cfg, contacts, self_wxid="wxid_me",
+                                chat=chat_id, cfg_provider=lambda: cfg)
+        b.from_self = from_self
+        return b
+
+    with tempfile.TemporaryDirectory() as td:
+        f = _mk(os.path.join(td, "报告.pdf"), "pdf")
+        # ⚠️ 收件人**就在免确认名单里** —— 这正是要证的那一条
+        cfg = {"agent": {"max_queries": 3, "confirm_ttl": 300,
+                         "auto_send_whitelist": ["老张", "wxid_friendA"]},
+               "files": {"roots": []}}
+        cli = _Cli()
+        box = _box(cfg, cli, chat)
+        out = box.run("send_file", {"to": "老张", "name": f})
+        pend = agent_tools.list_pending(chat, 300)
+        ok &= check("盘上路径：**收件人在免确认名单里也进确认队列**、没有直发",
+                    not cli.sent and len(pend) == 1 and "还没有发" in out,
+                    (cli.sent, len(pend), out[:120]))
+        desc = agent_tools.describe_pending(pend[0])
+        ok &= check("…菜单显示**原样路径**（同一个 basename 能出现在很多目录里）",
+                    td in desc and "报告.pdf" in desc, desc)
+        ok &= check("…并说清「硬盘上取的、一律要确认」",
+                    "硬盘" in out, out)
+        n, err = agent_tools.send_pending(cli, pend[0], 0.0, cfg=cfg)
+        ok &= check("用户确认后**真的发了**", bool(cli.sent) and n == 1 and err is None,
+                    (cli.sent, n, err))
+
+        # 路径准入对发文件同样生效
+        agent_tools._PENDING.pop(chat, None)
+        cfg2 = {"agent": {"max_queries": 3}, "files": {"roots": [os.path.join(td, "other")]}}
+        os.makedirs(os.path.join(td, "other"), exist_ok=True)
+        cli2 = _Cli()
+        out = _box(cfg2, cli2, chat).run("send_file", {"to": "老张", "name": f})
+        ok &= check("roots 不含那个目录 → **当场拒绝、不进队列**（不让用户白确认一次）",
+                    "不在允许的目录里" in out and not agent_tools.list_pending(chat, 300),
+                    out[:140])
+
+        out = _box(cfg, cli, chat).run(
+            "send_file", {"to": "老张", "name": r"C:\Windows\System32\drivers\etc\hosts"})
+        ok &= check("系统目录里的文件 → 拒绝", "系统目录" in out, out)
+
+        out = _box(cfg, cli, chat).run(
+            "send_file", {"to": "老张", "name": os.path.join(td, "nope.pdf")})
+        ok &= check("绝对路径但文件不存在 → 如实说", "没有这个文件" in out, out)
+
+        # 触发者闸门对发文件也生效（新开的能力不能跟着老路径一起没闸）
+        cli3 = _Cli()
+        out = _box(cfg, cli3, "wxid_stranger", from_self=False).run(
+            "send_file", {"to": "老张", "name": f})
+        ok &= check("不是我发的、又不在名单里 → 拒绝，且**一个字节都没发**",
+                    "不能用" in out and not cli3.sent, out[:140])
+
+    # 菜单分级：`msg/file` 来源**一个字不改**
+    d = agent_tools.describe_pending({"kind": "file", "to_name": "张三",
+                                      "file": r"C:\wechat\msg\file\2026-10\报告.pdf",
+                                      "text": "", "ts": 0})
+    ok &= check("msg/file 来源的菜单**仍是只显示文件名**（既有行为不许改）",
+                d == "把文件「报告.pdf」发给 张三", d)
+    return ok
+
+
 def main():
     print("电脑文件能力回归（`files.py`）")
     print("=" * 66)
@@ -494,6 +571,7 @@ def main():
     test_delete_recycle()
     test_who_gate()
     test_startup_notes()
+    test_send_file_from_disk()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

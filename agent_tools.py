@@ -1950,9 +1950,23 @@ def describe_pending(item):
         cmd, note = _clip(str(raw or ""), 200)
         return f"本机命令「{cmd}」{(' ' + note) if note else ''}"
 
-    # 1.2) 发普通文件：只显示**文件名**（全文路径里有本机目录，用户认的是文件名）
+    # 1.2) 发普通文件。**按来源分级显示**：
+    #
+    #   * 微信 `msg/file/` 来的 → 只显示**文件名**（**既有行为，一个字不改**：
+    #     用户认的是文件名，全文路径里有本机目录）；
+    #   * **盘上来的**（`extra.src == "disk"`）→ 显示**原样路径**。
+    #
+    # 为什么必须分级：盘上的同一个 basename 可以同时出现在十来个目录里，
+    # 只显示文件名的话，用户就是在**确认一个自己分辨不出的东西**
+    # （＝「重名不许静默取第一个」那条铁律在确认菜单上被违反）。而且那条路径是
+    # **用户自己给的**，不是从缓存里翻出来的隐私，摆出来正合适。
     if kind == "file" or item.get("file"):
-        base = os.path.basename(str(item.get("file") or ""))
+        raw = str(item.get("file") or "")
+        if str((item.get("extra") or {}).get("src") or "") == "disk":
+            p, note = _clip(raw, 300)
+            tail = f" {note}" if note else ""
+            return (f"把**硬盘上**的文件「{p}」发给 {to_name or '对方'}{tail}")
+        base = os.path.basename(raw)
         return f"把文件「{base}」发给 {to_name or '对方'}"
 
     # 1.5) 群发（两道确认）。**绝不用 wxid**，也不列全文——全文由 bot 单独原文直发，
@@ -2260,20 +2274,29 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None, cfg=None):
         # 都把 hook 的原始结果原样带回来**，绝不因为「以为它会成」就说已发出。
         path = str(item["file"])
         # 发送前**再复核一次**路径归属（和图片同一个理由：登记到用户确认之间隔着时间，
-        # 文件可能被换掉、或被换成指向别处的链接）。判据是「按文件名能重新定位到同一个
-        # 文件」——那条路只认微信 `msg/file/` 下的东西。
+        # 文件可能被换掉、或被换成指向别处的链接）。
         try:
             real = os.path.realpath(path)
         except OSError as e:
             return 0, f"文件路径解析失败：{e}"
-        try:
-            again = file_read.locate(os.path.basename(real))
-        except Exception as e:
-            return 0, f"发送前复核文件失败：{e}"
-        if not again or os.path.realpath(again) != real:
-            return 0, (f"发送前复核不通过：{path} 现在定位不到了（只允许微信 "
-                       f"`msg/file/` 下、按文件名能重新找到的文件）。"
-                       f"**这份没有发出去**。")
+        if str((item.get("extra") or {}).get("src") or "") == "disk":
+            # **盘上来的**：按**当前**配置再判一次准入（不是登记时那份快照 ——
+            # 用户可能刚把那个目录从 files.roots 里拿掉）。
+            import files as _files
+            _again, ferr = _files.path_ok(real, cfg)
+            if ferr:
+                return 0, f"发送前复核不通过：{ferr}**这份没有发出去**。"
+        else:
+            # 微信里来的：判据是「按文件名能重新定位到同一个文件」——
+            # 那条路只认 `msg/file/` 下的东西。**原样不动。**
+            try:
+                again = file_read.locate(os.path.basename(real))
+            except Exception as e:
+                return 0, f"发送前复核文件失败：{e}"
+            if not again or os.path.realpath(again) != real:
+                return 0, (f"发送前复核不通过：{path} 现在定位不到了（只允许微信 "
+                           f"`msg/file/` 下、按文件名能重新找到的文件）。"
+                           f"**这份没有发出去**。")
         try:
             client.send_file(real, wxid, cfg)
         except Exception as e:
@@ -4535,9 +4558,13 @@ class ToolBox:
     def t_send_file(self, args):
         """给某人发一个普通文件。
 
-        流程：**定位（纯磁盘、只认微信 `msg/file/`）→ 解析收件人 → 能力闸 →
-        名单内直发 / 名单外进待确认**。文件这一路**永远要用户回「确认」**才发
-        （发文件不可逆）。
+        流程：**定位 → 解析收件人 → 能力闸 → 名单内直发 / 进待确认**。
+
+        **定位有两条来源**（2026-10-04 扩，用户拍板「把发送也打通」）：
+
+        * 微信 `msg/file/`（`file_read.pick` 按文件名找）—— **原样不动**；
+        * **绝对路径**，必须过 `files.path_ok`（`files.roots` / `files.deny`）
+          并过触发者闸门。这一条来源还有一条额外的硬规矩，见下面 ③ 的注释。
 
         ⚠️ 端点是谁很重要、也很反直觉：真机实测 4.1.10.27 上发普通文件走的是
         **`/SendImgMsg`**（见 `aixed_api.send_file_via`），而叫 `/SendFileMsg` 的
@@ -4549,9 +4576,24 @@ class ToolBox:
         if not to or not name:
             return "参数不全：需要 to（发给谁）和 name（文件名）。"
 
-        # ① 先把文件**真的定位到**（纯磁盘、不查库；边界只认微信 msg/file/ 下的文件）。
-        #    这一步是真实工作：不存在 / 多份命中都要如实说，而不是先让用户确认。
-        path, perr, cands = file_read.pick(name)
+        # ① 定位。**先看是不是绝对路径** —— 是就改走文件能力那条准入
+        #    （`files.roots` / `files.deny`），并**同时过触发者闸门**：
+        #    「把盘上的文件发出去」是本轮新开的能力，不能因为老那条发送路没闸
+        #    就跟着没闸。
+        import files as _files
+        from_disk = bool(os.path.isabs(name) or (len(name) > 2 and name[1] == ":"))
+        if from_disk:
+            allowed, why = _files.who_allows(self.ctx(), self.cfg_provider())
+            if not allowed:
+                return why
+            path, ferr = _files.path_ok(name, self.cfg_provider())
+            if ferr:
+                return ferr
+            if not os.path.isfile(path):
+                return f"没有这个文件：{path}"
+            perr, cands = "", []
+        else:
+            path, perr, cands = file_read.pick(name)
         if path is None:
             if cands:
                 names = "、".join(str(c.get("name") or c.get("path"))
@@ -4578,6 +4620,22 @@ class ToolBox:
         base = os.path.basename(path)
         wxid = str(cand.get("wxid"))
         nm = cand.get("remark") or cand.get("name") or to
+
+        # ③ **绝对路径来源绝不许走「名单内直发」**（docs/computer-files-spec.md 2.1）。
+        #
+        # 那条直发今天之所以可以接受，是因为可达文件集被钉死在 `msg/file/`
+        # —— 也就是**你自己在微信里收发过的东西**。一旦放开成任意磁盘路径而同时
+        # 保留直发，就等于：**模型能把盘上任意文件发给白名单里的人，一次确认都不要。**
+        # 诱因不必是恶意 —— 它刚读完的那份文件、群里某人提到的一个文件名，都够。
+        # 所以磁盘来源**一律进确认队列**，和 `delete` 永远强制确认同源。
+        if from_disk:
+            dupe = self._queue_send(wxid, nm, f"发文件：{base}", kind="file",
+                                    file=path, extra={"src": "disk"})
+            return (f"还没有发。**这份是从硬盘上取的，一律要用户回「确认」**"
+                    f"（不走免确认名单那条直发路）。\n"
+                    f"请用户回「确认」再发：把文件「{base}」发给 {nm}。\n"
+                    f"（用户回「确认」之后我才真正去发。）{dupe_note(dupe)}")
+
         if self._in_whitelist(wxid, nm) or self._in_whitelist(wxid, to):
             try:
                 self.client.send_file(path, wxid, self.cfg_provider())
