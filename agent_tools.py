@@ -3042,7 +3042,7 @@ class ToolBox:
     """一次对话里执行工具调用的上下文。"""
 
     def __init__(self, client, cfg, contacts, self_wxid="", chat="", cfg_provider=None,
-                 llm_factory=None, user_query=""):
+                 llm_factory=None, user_query="", from_self=None):
         self.client = client
         self.cfg = cfg or {}
         self.contacts = contacts or []
@@ -3137,7 +3137,13 @@ class ToolBox:
         #
         # ⚠️ 「不知道」绝不许当成 True：权限类判断（文件能力的 files.who）
         # 靠它决定放不放行，把 None 当 True 等于静默放宽权限。
-        self.from_self = None
+        #
+        # ⚠️ **2026-10-04 真机撞出来的坑**：这个参数一开始**忘了从 `run_agent` 透传**，
+        # 于是它在生产里**永远是 None** —— `computer_files` 一律拒绝
+        # （「文件操作被配置限制」），而离线自测全绿：自测是**自己塞** True 的，
+        # 生产代码从没提供过。这就是「测试是绿的、生产是漏的」。
+        # 回归改在 `selftest_bot_loop.py`，走的是**真的 `run_agent`**。
+        self.from_self = from_self
         # 会话是不是群。`roomid` 的形态就是 `xxx@chatroom`，由 chat 直接推得，
         # 不额外查库（查库要走 hook，能省一次就省一次）。
         self.is_group = "@chatroom" in self.chat

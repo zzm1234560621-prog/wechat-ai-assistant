@@ -1210,7 +1210,8 @@ def restore_pending(chats, cfg):
 
 
 def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
-              cfg_provider=None, history=None, state=None, user_query=""):
+              cfg_provider=None, history=None, state=None, user_query="",
+              from_self=None):
     """带工具的问答循环。返回 (最终要回复的文本, 工具是否改动了配置)。
 
     hook 不能并发查询，所以工具是**串行**执行的；查询次数由
@@ -1231,7 +1232,14 @@ def run_agent(llm, system, prompt, wcf, contacts, cfg, chat, self_wxid="",
     # 「hook 不能并发、已被并发查询搞崩 6 次」。光靠注释劝人「别放开」不算闸门。
     max_rounds = max(1, min(10, int(agent_cfg.get("max_rounds", 3))))
     box = agent_tools.ToolBox(wcf, cfg, contacts, self_wxid, chat, cfg_provider,
-                              llm_factory=lambda: llm, user_query=user_query or prompt)
+                              llm_factory=lambda: llm, user_query=user_query or prompt,
+                              # ⚠️ **必须透传**：`ToolBox.ctx()['from_self']` 是
+                              # 「这条消息是不是我自己发的」这个**事实**，工具层
+                              # （`files.who_allows`）靠它决定放不放行。
+                              # 2026-10-04 真机撞过一次：忘了透传 → 生产里永远是
+                              # None → `computer_files` 一律拒绝，而离线自测全绿
+                              # （自测自己塞了 True）。回归：`selftest_bot_loop`。
+                              from_self=from_self)
 
     messages = list(history or []) + [{"role": "user", "content": prompt}]
     last_text = ""
@@ -2808,7 +2816,12 @@ def main():
                 answer, changed = run_agent(
                     llm, system_now(), prompt, wcf, contacts, cfg, control_chat, self_wxid,
                     cfg_provider=lambda: settings.effective(base_cfg),
-                    history=history, state=run_state, user_query=query)
+                    history=history, state=run_state, user_query=query,
+                    # 定时任务是**用户自己**在控制会话里建的（`/定时`），那句话是
+                    # 用户的指令、不是别人发来的消息 → 算「我自己发的」。
+                    # 不给这个事实的话，控制类能力（文件）会把定时任务判成
+                    # 「不是我的消息」而一律拒绝。
+                    from_self=True)
                 # 定时的「提问」走的也是这条路：模型说「已提交命令等你确认」而
                 # 本轮其实没登记时，同样要追一句真话（否则用户回「确认」白等）。
                 answer = with_shell_truth_note(answer, run_state.get("shell_queued", False))
@@ -3467,7 +3480,10 @@ def main():
                         answer, cfg_changed = run_agent(
                             llm, system_now(), prompt, wcf, contacts, cfg, sender, self_wxid,
                             cfg_provider=lambda: settings.effective(base_cfg),
-                            history=history, state=run_state)
+                            history=history, state=run_state,
+                            # **事实在这儿**：这条消息是不是我自己发的，只有主循环
+                            # 手里有。工具层的权限判断（`files.who_allows`）靠它。
+                            from_self=msg.from_self())
                         # 确定性兜底：模型没调 run_command 却自己说「已提交/等你确认」时，
                         # 固定追一句真话。**别删**——真机上就是这么骗到用户的。
                         answer = with_shell_truth_note(

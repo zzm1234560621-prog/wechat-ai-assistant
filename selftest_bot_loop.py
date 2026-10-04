@@ -1373,6 +1373,74 @@ def t_now_line():
         f"四条调用路（agent×2 / chat×2）都走 system_now()（实际 {src.count('system_now()')} 处）")
 
 
+def t_from_self_reaches_toolbox():
+    """`ToolBox.ctx()['from_self']` 必须是**真的那条消息的事实**。
+
+    ## 为什么专门钉这一条（2026-10-04 真机上撞出来的真 bug）
+
+    `files.who_allows`（文件能力的触发者闸门）靠这个事实决定放不放行，而
+    `ToolBox.from_self` 默认 `None` = **「不知道」** → 一律拒绝。
+    当时的漏法是：`bot.run_agent` 构造 `ToolBox` 时**忘了透传** `from_self`，
+    于是它在生产里**永远是 None** —— 用户在文件传输助手里说「看看我桌面上有什么」，
+    被如实拒绝成「文件操作被配置限制了」。
+
+    ## 为什么离线自测当时全绿（这才是要堵的那一头）
+
+    `selftest_files.py` 的 `_run()` 默认 `from_self=True` ——
+    **自测自己把生产代码从没提供的那个事实塞了进去**。
+    这就是项目文档里那条「测试是绿的、生产是漏的」。
+
+    所以这一条**必须走真的 `bot.run_agent`**：自测自己塞不算数。
+    """
+    sec("from_self 这个事实真的传到了 ToolBox（走真 run_agent）")
+    import llm as llm_mod
+    import plugins
+
+    # 一个探针工具：把 ctx 里的 from_self **原样回显** —— 不猜、不推断
+    plugins.REGISTRY.register_tool({
+        "name": "_probe_from_self",
+        "description": "探针",
+        "parameters": {"type": "object", "properties": {}},
+        "handler": lambda a, c: "from_self=" + repr(c.get("from_self")),
+        "guidance": "探针",
+    }, source="_selftest_bot_loop")
+
+    class _Cli:
+        pass
+
+    seen = []
+
+    class _LLM:
+        def chat_with_tools(self, system, messages, tools):
+            seen.append(messages)
+            if len(seen) == 1:
+                return llm_mod.ChatResult(
+                    "", [llm_mod.ToolCall("c1", "_probe_from_self", {})])
+            return llm_mod.ChatResult("done", [])
+
+    cfg = {"agent": {"max_queries": 3}}
+
+    def _tool_said(from_self):
+        del seen[:]
+        bot.run_agent(_LLM(), "sys", "问题", _Cli(), [], cfg, "filehelper", "",
+                      cfg_provider=lambda: cfg, history=[], state={},
+                      from_self=from_self)
+        outs = [m.get("content") for m in seen[1] if m.get("role") == "tool"]
+        return " ".join(str(o) for o in outs)
+
+    try:
+        chk("from_self=True" in _tool_said(True),
+            "run_agent(from_self=True) → 工具**真的**拿到 True")
+        chk("from_self=False" in _tool_said(False),
+            "run_agent(from_self=False) → 工具拿到 False")
+        # 反向：不给这个事实时必须还是 None（「不知道」绝不许变成 True，
+        # 那等于静默放宽文件能力的权限）
+        chk("from_self=None" in _tool_said(None),
+            "不给这个事实 → 工具拿到 None（不许变成 True）")
+    finally:
+        plugins.REGISTRY.rollback_source("_selftest_bot_loop")
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1405,6 +1473,7 @@ def main():
     t_broadcast_preview_note()
     t_auto_reply_truth_note()
     t_now_line()
+    t_from_self_reaches_toolbox()
 
     print("\n" + "=" * 60)
     if _FAIL:
