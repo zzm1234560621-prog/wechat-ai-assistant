@@ -618,6 +618,51 @@ def test_end_to_end_via_run_agent():
     return ok
 
 
+def test_home_hints():
+    """**别让模型猜用户目录名**（2026-10-04 真机第二撞）。
+
+    真机现场：模型不知道用户目录是哪个，于是猜了
+    `C:\\Users\\Administrator\\Desktop`（用户名是编的）和相对路径「桌面」，
+    两个都不存在 —— 然后它去提 `run_command echo %USERPROFILE%`，
+    这一圈**本来是它自己该知道的事**。
+
+    根因是我实现 `list` 不填 path 时只回了「全盘」两个字，还写着
+    「比如用户的桌面、文档、下载」—— 那句话**等于在鼓励它猜**。
+    """
+    print("\n── 11 · 用户目录提示（别猜用户名）──")
+    ok = True
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+
+    hints = files.home_hints()
+    paths = [p for p, _ in hints]
+    ok &= check("home_hints 第一项就是用户目录", paths and paths[0] == home, paths[:1])
+    ok &= check("home_hints 里带上了真实的桌面路径", desktop in paths, paths)
+    ok &= check("home_hints 标出了每个目录存不存在",
+                all(isinstance(e, bool) for _, e in hints))
+
+    out = files.handler({"action": "list"},
+                        {"cfg": {}, "from_self": True, "chat": "filehelper"})
+    ok &= check("不填 path 时**把真实路径摆出来**（模型抄这个就不会猜）",
+                desktop in out, out[:220])
+    ok &= check("并且明说「别自己拼用户名」", "别自己拼用户名" in out, out[:220])
+    ok &= check("并且告诉它 `~` 可用", "~" in out, out[:220])
+
+    # 猜错用户名（真机上就是这一步）
+    out = files.handler({"action": "list", "path": "C:/Users/Administrator/Desktop"},
+                        {"cfg": {}, "from_self": True, "chat": "filehelper"})
+    ok &= check("猜错用户名 → 如实说不存在，**并附上真实路径**",
+                "没有这个目录" in out and desktop in out, out[:220])
+
+    # 相对路径「桌面」：真机上这个最费解 —— 它会相对**仓库目录**解析
+    out = files.handler({"action": "list", "path": "桌面"},
+                        {"cfg": {}, "from_self": True, "chat": "filehelper"})
+    ok &= check("相对路径 → 说清它被解析成了什么（不是用户目录）",
+                "相对路径" in out and os.path.abspath("桌面") in out, out[:260])
+    ok &= check("相对路径那条也附上真实路径", desktop in out, out[:260])
+    return ok
+
+
 def main():
     print("电脑文件能力回归（`files.py`）")
     print("=" * 66)
@@ -631,6 +676,7 @@ def main():
     test_startup_notes()
     test_send_file_from_disk()
     test_end_to_end_via_run_agent()
+    test_home_hints()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

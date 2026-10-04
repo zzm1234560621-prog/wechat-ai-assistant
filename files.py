@@ -77,6 +77,52 @@ DEFAULT_CONFIRM = ("delete", "overwrite")
 # 用户照菜单回「确认」——**做掉的是另一件事**（规格 4.2）。
 KEY_FIELDS = ("action", "path", "src", "dst", "new_name", "text")
 
+_HOME_SUBDIRS = ("Desktop", "Documents", "Downloads", "Pictures")
+
+
+def home_hints():
+    """这台机器上**真实**的常用目录：`[(路径, 是否存在), ...]`。
+
+    为什么要它（2026-10-04 真机撞出来的）：模型不知道该去哪个用户目录，于是**猜** ——
+    它猜了 `C:\\Users\\Administrator\\Desktop`（用户名是编的）和相对路径「桌面」，
+    两个都不存在。而 spec 里早就写着「指导里要带解析后的 roots，否则模型会去猜目录名」，
+    实现时却只回了「全盘」两个字 —— **那等于在鼓励它猜**。
+
+    所以这里把**算出来的真路径**摆出来给它抄。
+    """
+    home = os.path.expanduser("~")
+    cands = [home] + [os.path.join(home, n) for n in _HOME_SUBDIRS]
+    out = []
+    for p in cands:
+        try:
+            out.append((p, os.path.isdir(p)))
+        except OSError:
+            out.append((p, False))
+    return out
+
+
+def _hints_text():
+    """给模型抄的那几行。**明说「别自己拼用户名」** —— 它上次就是这么错的。"""
+    home = os.path.expanduser("~")
+    lines = [f"    {p}" + ("" if ok else "（不存在）") for p, ok in home_hints()]
+    return ("这台机器上**真实**的常用目录（**原样照抄，别自己拼用户名**；"
+            f"写 `~` 也行，会展开成 {home}）：\n" + "\n".join(lines))
+
+
+def _missing_note(raw, real, cfg):
+    """路径不存在时补的话：**解释相对路径怎么被解析的** + 真实目录清单。
+
+    为什么专门解释相对路径：模型很爱给「桌面」这种相对路径，而它会被解析成
+    **助手工作目录**下的「桌面」（仓库目录里当然没有），模型完全想不到是这个原因。
+    """
+    bits = []
+    if raw and not os.path.isabs(str(raw)):
+        bits.append(f"「{raw}」是**相对路径**，我按助手的**工作目录**解析成了：{real}"
+                    f" —— 那不是你的用户目录（`桌面` 这种名字得配 `~` 或完整路径）。")
+    bits.append(_hints_text())
+    return "\n" + "\n".join(bits)
+
+
 _DEFAULT_LIST_LIMIT = 200
 _DEFAULT_FIND_DEPTH = 3
 _DEFAULT_FIND_DIRS = 20000
@@ -355,19 +401,21 @@ def _cut(lines, limit, what):
 # ────────────────────────────────────────────────────────────── 读类动作
 
 def _no_path_scope(cfg):
-    """不填 `path` 时的回答：把**当前能访问的范围**如实报出来。
+    """不填 `path` 时的回答：把**当前能访问的范围**和**真实的常用目录**都报出来。
 
     为什么要有这条路：工具指导文本是**启动时定死**的，而 `files.roots` 是配置里
     随时可改的 —— 把范围写死在指导里，改了配置之后模型就会拿着**过期的范围**
     去猜路径。让它现问一次最稳（口径同「注册表是唯一真源」）。
+
+    ⚠️ **必须带上 `home_hints()` 那几行真路径**（2026-10-04 真机踩出来的）：
+    当初只回了「全盘…比如用户的桌面、文档、下载」—— 那句话**等于在鼓励模型猜**，
+    而它猜的是 `C:\\Users\\Administrator\\Desktop`（用户名是编的）。给路径让它抄，
+    它就不会猜。
     """
     r = roots(cfg)
-    if not r:
-        return ("没给 path。当前 `files.roots` 是**空的 = 全盘**（系统目录仍然挡着），"
-                "所以要给一个明确的目录，比如用户的桌面、文档、下载或某个盘下的目录。"
-                f"\n{describe_scope(cfg)}")
-    return (f"没给 path。当前允许的目录是：{'、'.join(r)}。"
-            f"要从这些目录里的哪一个开始？\n{describe_scope(cfg)}")
+    head = ("没给 path。当前 `files.roots` 是**空的 = 全盘**（系统目录仍然挡着）。"
+            if not r else f"没给 path。当前允许的目录是：{'、'.join(r)}。")
+    return f"{head}\n{_hints_text()}\n{describe_scope(cfg)}"
 
 
 def _do_list(args, cfg):
@@ -380,7 +428,7 @@ def _do_list(args, cfg):
     if os.path.isfile(p):
         return f"「{p}」是个文件，不是目录。要看它的内容请用 action=read。"
     if not os.path.isdir(p):
-        return f"没有这个目录：{p}"
+        return f"没有这个目录：{p}" + _missing_note(raw, p, cfg)
     try:
         entries = sorted(os.listdir(p), key=lambda s: s.lower())
     except OSError as e:
@@ -413,7 +461,7 @@ def _do_find(args, cfg):
     if err:
         return err
     if not os.path.isdir(root):
-        return f"没有这个目录：{root}"
+        return f"没有这个目录：{root}" + _missing_note(raw, root, cfg)
     pat = str(args.get("name") or "").strip()
     if not pat:
         return ("find 要给 name —— 要找的文件名，可以用 * 通配，"
@@ -469,7 +517,7 @@ def _do_info(args, cfg):
     if err:
         return err
     if not os.path.exists(p):
-        return f"没有这个文件或目录：{p}"
+        return f"没有这个文件或目录：{p}" + _missing_note(args.get("path"), p, cfg)
     try:
         st = os.stat(p)
     except OSError as e:
@@ -492,7 +540,7 @@ def _do_read(args, cfg):
         # 如实拒绝并**指路**：不许抛原始异常上去，也不许把目录当文件读出乱码。
         return f"「{p}」是个目录，不是文件。要列目录请用 action=list。"
     if not os.path.isfile(p):
-        return f"没有这个文件：{p}"
+        return f"没有这个文件：{p}" + _missing_note(args.get("path"), p, cfg)
 
     cursor = str(args.get("cursor") or "").strip()
     if cursor:
@@ -831,8 +879,10 @@ def handler(args, ctx):
 GUIDANCE = """用户让你看、找、列、改电脑上的文件时用本工具（action 见下）。
 - 只用本工具做**文件操作**；要跑命令请用 run_command（那个每条都要用户确认），
   本工具**不执行任何程序**。
-- **不确定能访问哪些目录时，先 `action=list` 且不填 path** —— 它会当场告诉你
-  当前允许的范围。别猜路径（可能被 `files.roots` / `files.deny` 挡住）。
+- ⚠️ **别猜目录名**：用户目录写 `~` 就行（例：`~/Desktop`），或者先 `action=list`
+  **不填 path** —— 它会把**这台机器上真实存在**的用户目录 / 桌面 / 文档 / 下载
+  原样列出来让你抄。**绝不自己拼用户名**（真机踩过：模型猜了
+  `C:\\Users\\Administrator\\Desktop`，而实际用户根本不是这个名字，白跑一趟）。
 - 在系统目录（Windows / Program Files / ProgramData）里的一律会被如实拒绝，
   不许改用 run_command 绕过。
 - `read` 支持 Office / PDF / 图片 / 音频 / 压缩包 / 邮件 / SQLite 等，长内容会分页：
