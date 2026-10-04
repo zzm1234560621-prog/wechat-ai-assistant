@@ -864,8 +864,13 @@ def main():
 
     live_history.begin_poll(0.05)
     _left = live_history.poll_budget_left()
-    ok &= check("begin_poll(0.05) 开闸后剩余 <= 0.05s",
-                _left is not None and _left <= 0.05, _left)
+    # ⚠️ 这里必须是 **0 < _left <= 0.05**：旧写法只判 `_left <= 0.05`，于是**负数也通过**
+    # ——死线早已过期时它照样打 ✅，把「闸根本没开成 / 被谁改掉了」这种失败形态放过去，
+    # 只在下一句 `_query` 上偶发地炸出来（2026-10-05 实测：三次里红一次，报的是
+    # hook 的 AixedError，说明那一瞬间预算**没被判过期**）。收紧成会大声报错的判据，
+    # 把根因留给下面那句断言去指认。
+    ok &= check("begin_poll(0.05) 开闸后剩余 0 < left <= 0.05s",
+                _left is not None and 0 < _left <= 0.05, _left)
     time.sleep(0.06)
     try:
         live_history._query(c, "session.db", "SELECT 1")

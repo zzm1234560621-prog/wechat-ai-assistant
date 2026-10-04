@@ -58,10 +58,31 @@ Copy-Item (Join-Path $root 'settings.example.json') $pkg -Force
 # 而是「开发机上好用、发布包里静默失效」（本项目被咬过好几次）。
 # `plugins/` 是 2026-10-04 加的插件目录：少了它，README 里「复制 `plugins/_example.py`」
 # 就是死指令，而 `selftest_plugins.py` §11 会在朋友的机器上失败。
+# `searxng/` 是 2026-10-05 加的**随包携带的搜索后端**：少了它，别人机器上
+# `web_search` 永远用不了（`search.home` 会指到一个不存在的目录）——
+# 这正是这条倡议当初存在的理由。它的 .venv/缓存由下面那段剪掉。
 # 回归：`selftest_portable.py` 有一条「代码要用的目录都在这个清单里」。
-foreach ($d in @('docs', 'tools', 'plugins')) {
+foreach ($d in @('docs', 'tools', 'plugins', 'searxng')) {
     $p = Join-Path $root $d
     if (Test-Path $p) { Copy-Item $p $pkg -Recurse -Force }
+}
+
+# searxng 复制完之后，**必须剪掉两样东西**（它们会在开发机上长出来）：
+#   * `.venv\`（约 91MB）—— venv 里记的是绝对路径，跨机器拷必坏，和 bot 自己的 .venv
+#     同一条规矩；新机器上由「一键部署」第 3 步现建。
+#   * `sxng_cache_*.db` —— 运行期缓存，谁都不要。
+$sx = Join-Path $pkg 'searxng'
+if (Test-Path $sx) {
+    if (Test-Path (Join-Path $sx '.venv')) {
+        Remove-Item (Join-Path $sx '.venv') -Recurse -Force
+        Write-Output '已剪掉 searxng\.venv（venv 绝不跨机器拷）'
+    }
+    $junk = @(Get-ChildItem $sx -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'sxng_cache_*' -or $_.Name -eq '__pycache__' })
+    if ($junk) {
+        $junk | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Output "已剪掉 searxng 的运行期缓存 $($junk.Count) 项"
+    }
 }
 
 # ── 4 · hook 那一套（4.1.10.27 主线）────────────────────────────────
@@ -107,8 +128,9 @@ $quickstart = @'
     ⓪ 查微信版本（没装 / 不是 4.1.10.27 就装包里自带的那份官方安装程序）
     ① 装 hook 进微信（会弹 UAC，要管理员权限——这一步不做，后面全白搭）
     ② 装 Python 依赖（要联网下载，第一次几分钟）
-    ③ 启动助手（后台运行）
-    ④ 就地配「用哪个模型 + API Key」（不用去微信里打字）
+    ③ 可选组件（语音转文字 / 网上搜索；**会问你**，跳过也不影响其它功能）
+    ④ 启动助手（后台运行）
+    ⑤ 就地配「用哪个模型 + API Key」（不用去微信里打字）
   前提：这台电脑要有 **64 位 Python**（推荐 3.11）。`一键部署.bat` 找不到会直接告诉你
   装哪条命令（winget install -e --id Python.Python.3.11），装完再双击一次即可。
   装完之后日常用 **助手.bat**： [3] 启动 / [4] 停 / [5] 看状态 / [6] 看日志。
@@ -131,6 +153,19 @@ $quickstart = @'
   3. 双击 **启动助手.bat**（或 助手.bat → [3]）。
   4. 双击 **配置模型.bat** 按提示填；也可以之后在微信里发  /api <你的key>
 
+■ 可选组件（语音转文字 / 网上搜索）—— 它们**不随主程序装**
+  原因很实在：语音要下几百 MB 的本地模型，搜索后端要一份自己专用的虚拟环境，
+  这两样都不能塞进主程序的安装里。所以 `一键部署.bat` 的第 ③ 步会**问你**要不要装；
+  跳过了也完全不影响聊天、发消息、读文件、定时。以后想装/想关：双击 **可选组件.bat**。
+  · 语音转文字：装 faster-whisper + pilk，并下**本地模型**（大小看 config.yaml 的
+    `audio.model`，默认 small 约 464MB，走 hf-mirror 镜像）。音频一个字节都不出本机。
+  · 网上搜索：包**自带 SearXNG 源码**（searxng\），这一步会在它的目录里建一份
+    **自己专用的 .venv** 并装依赖。装好之后助手启动会把它一起带起来
+    （开关在 config.yaml 的 search.enabled / search.autostart）。
+  两项的「以后还要不要自动装」记在 settings.json 的 `optional` 里（关掉 = 不再自动装，
+  **已经装好的东西不会动**）。它写 settings.json 而不是 config.yaml，是因为程序
+  从不回写带注释的 config.yaml。
+
 ■ 装完之后怎么用
   双击 **助手.bat** 就是全部： [3] 启动 / [4] 停止重启 / [5] 看状态 /
   [6] 看日志 / [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启）。
@@ -143,7 +178,8 @@ $quickstart = @'
 
 ■ 这个包里**没有**什么
   · 没有聊天记录、没有本机配置、没有 API key（config.yaml 是示例，key 是空的）
-  · 没有 Python 虚拟环境（install.bat 会自己建）
+  · 没有 Python 虚拟环境（install.bat 会自己建；SearXNG 那份也一样，由第 ③ 步现建）
+  · 没有语音模型（几百 MB，第 ③ 步现下；不下就只是用不了语音转文字）
   · 没有 3.9.x 的微信安装包（旧后端才要，主线用不上）
 '@
 Set-Content -Path (Join-Path $pkg '从这里开始.txt') -Value $quickstart -Encoding UTF8
@@ -153,6 +189,24 @@ $fail = @()
 if (Test-Path (Join-Path $pkg 'data'))       { $fail += '包里有 data\（私人运行数据）' }
 if (Test-Path (Join-Path $pkg 'test_images')){ $fail += '包里有 test_images\（私人图片）' }
 if (Test-Path (Join-Path $pkg '.venv'))      { $fail += '包里有 .venv\（不该跨机器拷）' }
+# 随包携带的 SearXNG：**必须在**（否则别人机器上搜索永远用不了），
+# 且它自己的 venv / 运行期缓存**必须不在**（跨机器拷必坏）。
+$sx = Join-Path $pkg 'searxng'
+if (-not (Test-Path (Join-Path $sx 'searx\webapp.py'))) {
+    $fail += '包里没有 searxng\searx\webapp.py（搜索后端没随包 → 别人机器上 web_search 用不了）'
+}
+# ⚠️ 这条盯的是 2026-10-05 真踩的坑：仓库根的 `.gitignore` 里那条没锚定的 `data/`
+# 曾把 `searxng/searx/data/` 整个挡在 git 外面（磁盘上有、git 里没有）。打包走的是磁盘
+# 所以当时没露，但「从克隆重打包」就会静默少这块。这里钉住它，别再回去。
+if (-not (Test-Path (Join-Path $sx 'searx\data\engine_traits.json'))) {
+    $fail += 'searxng\searx\data\ 缺必需运行期数据（engine_traits.json 等）'
+}
+if (Test-Path (Join-Path $sx '.venv')) {
+    $fail += '包里有 searxng\.venv\（跨机器拷必坏，应由一键部署现建）'
+}
+$sxjunk = @(Get-ChildItem $sx -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'sxng_cache_*' })
+if ($sxjunk) { $fail += "包里有 searxng 运行期缓存：$($sxjunk.Name -join ', ')" }
 $logs = Get-ChildItem $pkg -Recurse -File -Filter '*-log.txt' -ErrorAction SilentlyContinue
 if ($logs) { $fail += "包里有安装日志：$(($logs | ForEach-Object { $_.Name }) -join ', ')" }
 $anylog = Get-ChildItem $pkg -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue

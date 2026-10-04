@@ -9,6 +9,7 @@
 所以这份自测**不会碰真 bot、不会关真进程**。
 """
 import os
+import shutil
 import sys
 import tempfile
 
@@ -242,13 +243,20 @@ def t7_search_service():
 
     try:
         # ── 目录约定 & 开关判据（纯函数，不注入）──
+        # ⚠️ 2026-10-05 改：约定从「上一级」扩成「项目内 / 上一级」**二选一**（随包携带）。
+        # 这条断言以前写死 `== 上一级`，在开发机上「碰巧」是对的（上一级那份存在），
+        # 到了**别人解压出来的包里**就必然失败——而自测恰恰是要在包里跑的那一份。
+        # 所以这里只断言「**确实落在两个约定位置之一**」，不预设是哪一个；
+        # 「两份都在时选能用的那份」由 T8 用注入的假 search_ready 精确钉住。
+        bundled = os.path.join(botctl.env.BASE, "searxng")
         conv = os.path.join(os.path.dirname(botctl.env.BASE), "searxng")
-        check("约定 = 本项目**上一级**的 searxng（不写死盘符/用户名）",
-              botctl.search_home(None) == conv, botctl.search_home(None))
+        got = botctl.search_home(None)
+        check("约定 = 项目内或上一级的 searxng（**不写死盘符/用户名**）",
+              got in (bundled, conv), got)
         check("config 的 search.home 优先",
               botctl.search_home({"search": {"home": r"E:\tools\searxng"}}) == r"E:\tools\searxng")
         check("home 是空白串 → 回退约定（不拿空路径去找）",
-              botctl.search_home({"search": {"home": "   "}}) == conv)
+              botctl.search_home({"search": {"home": "   "}}) in (bundled, conv))
 
         check("autostart 没写 = **开**（默认带起）", botctl.search_autostart_on({}) is True)
         check("显式 true = 开",
@@ -453,6 +461,97 @@ def t7_search_service():
             pass
 
 
+def t8_search_home_and_install():
+    sec("T8 · 搜索后端：目录判据只有一份 + 「建 venv」不许报假成功")
+
+    # ── ① search_home：配置优先；都留空时「能用那份优先」，否则挑存在的 ──
+    # 2026-10-05 随包携带 searxng\ 之后，位置成了「项目内 / 项目上一级」二选一。
+    # 开发机上两份都在（上一级那份装好了、包里那份只是源码）——**必须选装好的那份**，
+    # 否则正在跑的搜索服务会突然被判成「没装」。
+    saved = {n: getattr(botctl, n) for n in ("search_ready",)}
+    saved_base = botctl.env.BASE
+    try:
+        fake_base = os.path.join(tempfile.gettempdir(), "botctl_t8_proj")
+        bundled = os.path.join(fake_base, "searxng")
+        sibling = os.path.join(os.path.dirname(fake_base), "searxng")
+        botctl.env.BASE = fake_base
+
+        botctl.search_ready = lambda home=None: False
+        check("配置里写了 home → 就用它（不看约定位置）",
+              botctl.search_home({"search": {"home": "D:/x/searxng"}}) == "D:/x/searxng")
+
+        check("两份都没有 → 仍给「包里那份」的路径（首装建在这儿）",
+              botctl.search_home({}) == bundled, botctl.search_home({}))
+
+        botctl.search_ready = lambda home=None: os.path.normcase(str(home)) == os.path.normcase(sibling)
+        check("★ 上一级那份装好了、包里那份没装 → **选装好的那份**（不许把在跑的服务判成没装）",
+              botctl.search_home({}) == sibling, botctl.search_home({}))
+
+        botctl.search_ready = lambda home=None: os.path.normcase(str(home)) == os.path.normcase(bundled)
+        check("★ 包里那份装好了（新机器）→ 选它",
+              botctl.search_home({}) == bundled, botctl.search_home({}))
+
+        def _not_ready(home=None):
+            return False
+        botctl.search_ready = _not_ready
+        just_bundled = botctl.search_home({})
+        check("都装不好 → 挑**存在**的那份；都不存在也如实给一个路径（不抛）",
+              just_bundled == bundled, just_bundled)
+    finally:
+        botctl.env.BASE = saved_base
+        for n, v in saved.items():
+            setattr(botctl, n, v)
+
+    # ── ② search_install：三种失败都要**如实说**，绝不说成装好了 ──
+    ok, msg = botctl.search_install(home=os.path.join(tempfile.gettempdir(), "no_such_searxng_xyz"))
+    check("目录不存在 → 如实说是包不完整 / search.home 写错了",
+          ok is False and "找不到" in msg, msg)
+
+    d = tempfile.mkdtemp(prefix="botctl_t8_")
+    try:
+        sdir = os.path.join(d, "searxng")
+        os.makedirs(sdir)
+        saved2 = {n: getattr(botctl, n) for n in ("search_ready", "_base_python", "_stream")}
+        try:
+            botctl.search_ready = lambda home=None: False
+            ok, msg = botctl.search_install(home=sdir)
+            check("没有 requirements.txt → 如实说包不完整（不许去建 venv）",
+                  ok is False and "requirements.txt" in msg, msg)
+
+            open(os.path.join(sdir, "requirements.txt"), "w", encoding="utf-8").write("flask\n")
+            botctl._base_python = lambda: None
+            ok, msg = botctl.search_install(home=sdir)
+            check("找不到能建 venv 的 Python → 如实说 + 给出怎么装 Python",
+                  ok is False and "Python" in msg and "venv" in msg, msg)
+
+            botctl._base_python = lambda: ["py", "-3.11"]
+            calls = []
+
+            def _fake_stream(args, cwd=None):
+                calls.append(args)
+                return 1          # 建 venv 就失败
+
+            botctl._stream = _fake_stream
+            ok, msg = botctl.search_install(home=sdir)
+            check("建 venv 失败 → 不报成功",
+                  ok is False and "venv" in msg and calls and "venv" in calls[0], msg)
+
+            # pip 说成功、但 venv 里的解释器根本不在 → **仍然不算装好**
+            botctl._stream = lambda args, cwd=None: 0
+            ok, msg = botctl.search_install(home=sdir)
+            check("★ pip 全成功但 search_ready 仍为假 → **绝不说装好了**",
+                  ok is False and "跑不起来" in msg, msg)
+
+            botctl.search_ready = lambda home=None: True
+            ok, msg = botctl.search_install(home=sdir)
+            check("本来就好了 → 直接说不用再装", ok and "已经装好" in msg, msg)
+        finally:
+            for n, v in saved2.items():
+                setattr(botctl, n, v)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("botctl.py 自测（**绝不真的启停 bot**；所有真实交互都注入假实现）")
@@ -464,6 +563,7 @@ def main():
     t5_start_guards()
     t6_status_and_tail()
     t7_search_service()
+    t8_search_home_and_install()
     print("\n" + "=" * 60)
     print(f"全部通过 ✅ （{_PASS} 项）" if _OK else f"有失败项 ❌ （{_PASS} 项）")
     print("=" * 60)

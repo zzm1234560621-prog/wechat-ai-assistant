@@ -219,17 +219,22 @@ def _default_fetch(url, timeout_s):
 
 
 def _searxng_hint():
-    """SearXNG 在哪——**不许写死盘符/用户名**。
+    """SearXNG 在哪、装没装——**判据只有一份**，就是 `botctl.search_home()`。
 
-    约定是它和本项目**平级**（即本项目的上一级目录里的 `searxng\\`）。这里按这个约定
-    算出建议路径并说明怎么改：写死一个本机路径，换台电脑就变成一句**误导用户**的话
-    ——而用户看到的恰好是「连不上、该去哪儿起」这种最需要照着做对的提示。
+    ⚠️ 这里**不许**再自己算一遍路径。以前就是两处各写一份、靠注释提醒「改一处必须改两处」；
+    2026-10-05 随包携带 SearXNG 之后，位置成了「项目内 / 项目上一级 二选一」，
+    再抄一份必然走偏。写死本机盘符/用户名更不行：换台电脑就变成一句**误导用户**的话，
+    而用户看到的恰好是「连不上、该去哪儿起」这种最需要照着做对的提示。
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    guess = os.path.join(os.path.dirname(here), "searxng")
-    if os.path.isdir(guess):
-        return f"（按约定在本项目的上一级：{guess}，跑那个目录里的 start.bat）"
-    return "（SearXNG 要单独部署：源码放在本项目**上一级**的 searxng 目录，跑其中的 start.bat）"
+    try:
+        import botctl
+        home = botctl.search_home()
+    except Exception as e:
+        return f"（判断 SearXNG 装在哪一步出错：{type(e).__name__}；见 README「网上搜索」）"
+    if os.path.isdir(home):
+        return f"（SearXNG 在 {home}，跑那个目录里的 start.bat）"
+    return (f"（这台机器上还没装 SearXNG：它该在 {home}；"
+            f"助手.bat → [8] 更多 → [9] 搜索服务 里能装/修）")
 
 
 def _why_unreachable(cfg, err):

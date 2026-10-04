@@ -664,6 +664,13 @@ if __name__ == "__main__":
     except Exception:
         _cfg = {}
 
+    if "--status" in sys.argv:
+        # 给控制台/一键部署用的一行探针：**可用性只有 available() 这一份判据**
+        # （依赖在不在 + 模型下没下），别在菜单里另抄一套。
+        _ok, _why = available(_cfg)
+        print(("✅ " if _ok else "❌ ") + _why)
+        sys.exit(0 if _ok else 1)
+
     if "--setup" in sys.argv:
         print("先装依赖（不随主程序安装）：")
         print("  .venv\\Scripts\\python.exe -m pip install faster-whisper")
@@ -684,6 +691,7 @@ if __name__ == "__main__":
         sys.exit(1 if err else 0)
 
     print("用法：")
+    print("  python audio_read.py --status                # 一行：现在能不能转写（控制台在调）")
     print("  python audio_read.py --setup                 # 下本地模型（显式、不会被聊天触发）")
     print("  python audio_read.py --transcribe <音频路径>  # 手工转一条试试")
     print(f"\n当前：backend={backend(_cfg)} model={model_name(_cfg)} "

@@ -9,9 +9,17 @@ config.yaml
 settings.json
 .claude/settings.local.json
 
-# ---- 运行期数据 ----
-data/
+# ---- 运行期数据（**必须锚定到项目根**）----
+# 没锚定的 `data/` 会匹配**任意层级**的 data 目录：2026-10-05 把随包携带的 SearXNG
+# 快照搬进仓库时，`searxng/searx/data/`（17 个文件、约 15MB 的必需运行期数据：
+# engine_traits.json、currencies.json、语言检测模型 lid.176.ftz …）被它**静默**吃掉
+# ——磁盘上有、git 里没有。打包脚本 copy 的是磁盘，所以当时那个包是对的，
+# 但**从 git 克隆出来重打包就会缺这一块**，而且一点报错都没有。
+/data/
 *.log
+
+# ---- 随包携带的 SearXNG：它自己的运行期缓存（`.venv/` 已被上面覆盖）----
+searxng/sxng_cache_*
 
 # ---- 安装脚本的运行日志：每次跑都重写，而且里面带本机用户名和绝对路径
 # （`C:\Users\<你>\...` / 项目所在盘符），是私人信息，别提交 ----

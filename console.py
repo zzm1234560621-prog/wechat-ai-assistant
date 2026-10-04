@@ -19,6 +19,7 @@ import time
 
 import botctl
 import envsetup as env
+import settings
 
 BASE = env.BASE
 
@@ -86,6 +87,18 @@ def run(script, args=None, admin=False):
                           build_admin_command(script, args)])
     else:
         subprocess.run([sys.executable] + cmd, cwd=BASE)
+
+
+def run_venv(script, args=None):
+    """用 **venv 的** Python 跑一个脚本。
+
+    ⚠️ `run()` 用的是**系统 Python**（console 自己就是这个），而「下语音模型」这类脚本
+    必须在 venv 里跑（它要 import faster-whisper / yaml）。两件事别混。
+    """
+    if env.venv_python() is None:
+        print("[!] 虚拟环境还没建好或已失效——先跑 install.bat（或菜单 [2] 安装依赖）。")
+        return None
+    return subprocess.run([env.VENV_PY, script] + (args or []), cwd=BASE)
 
 
 def auto():
@@ -390,6 +403,197 @@ def act_search_stop():
     return ("[√] " if ok else "[!] ") + msg
 
 
+def act_search_install():
+    cfg = botctl.load_cfg()
+    home = botctl.search_home(cfg)
+    print(f"搜索后端目录：{home}")
+    print("它会在这个目录里建一份**自己专用的** .venv 并装依赖（和助手的 venv 分开，")
+    print("免得 flask/lxml 这些互相顶版本）。第一次要联网下载，可能几分钟。")
+    if not _confirm("现在装？(Y/n) ", default_no=False):
+        return "已取消。"
+    ok, msg = botctl.search_install(cfg=cfg, home=home)
+    if ok:
+        _set_opt("search", True)
+    return ("[√] " if ok else "[!] ") + msg
+
+
+# ── 可选组件：语音转文字 / 网上搜索后端 ─────────────────────────────────
+# 为什么要有这一段（2026-10-05）：这两样**代码都在、包里也都在**，但依赖与模型都不随包
+# （faster-whisper 在 requirements.txt 里只能写成注释行；SearXNG 的 464MB 模型 / 91MB venv
+# 更不能跨机器拷）——于是「装完就能用」在别人机器上并不成立，README 却把语音条转文字
+# 当卖点。这里补的就是那个**安装入口**，并把「这一项要不要装」记进 settings.json
+# （按项目约定：程序绝不回写带注释的 config.yaml）。
+#
+# 每项一个 owner，这里只做菜单与编排，不实现第二份：
+#   * 语音：envsetup.install_optional（pip）+ audio_read.py --setup（下模型）
+#   * 搜索：botctl.search_install（建 venv + pip）
+OPTIONAL_ITEMS = (
+    ("voice", "语音转文字（装依赖 + 下模型）"),
+    ("search", "网上搜索后端（建 venv + 装依赖）"),
+)
+
+
+def _opt_wanted(name):
+    """这一项「一键部署要不要自动装」。settings.json 的 `optional.<name>`；
+    **没写过 = 要**（用户 2026-10-03 的决定就是一键部署自动装齐、每项可关）。"""
+    try:
+        v = (settings.load().get("optional") or {}).get(name)
+    except Exception:
+        v = None
+    return v is None or v is True
+
+
+def _set_opt(name, on):
+    """把开关写进 settings.json（读-改-写，**不动 config.yaml**）。"""
+    try:
+        d = settings.load()
+        opt = dict(d.get("optional") or {})
+        opt[name] = bool(on)
+        d["optional"] = opt
+        settings.save(d)
+        return True
+    except Exception as e:
+        print(f"[!] 开关没写成：{type(e).__name__}: {e}")
+        return False
+
+
+def _install_voice():
+    """装语音转文字：先 pip 装依赖，再下模型（两步都不是同一件事，分开说）。"""
+    ok, msg = env.install_optional("voice")
+    print(("[√] " if ok else "[!] ") + msg)
+    if not ok:
+        return "语音转文字的**依赖**没装成，模型先不下了（下了也用不了）。"
+    print("[可选组件] 接下来下模型（大小看 config.yaml 的 `audio.model`，默认 small ≈464MB，"
+          "走 hf-mirror 镜像）…")
+    run_venv("audio_read.py", ["--setup"])
+    ok2, msg2 = _voice_state()
+    if ok2:
+        _set_opt("voice", True)
+    return ("[√] " if ok2 else "[!] ") + msg2
+
+
+def _voice_state():
+    """语音转文字现在能不能用——**判据走 audio_read.available()**（用 venv 的 python 问它）。"""
+    py = env.venv_python()
+    if py is None:
+        return False, "虚拟环境还没建好，语音转文字用不了（先装依赖）。"
+    try:
+        r = subprocess.run([py, "audio_read.py", "--status"], cwd=BASE,
+                           capture_output=True, timeout=60, text=True,
+                           encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"问不动语音那一侧（{type(e).__name__}: {e}）"
+    out = (r.stdout or "").strip().splitlines()
+    return r.returncode == 0, (out[-1] if out else "（没有输出）")
+
+
+def _search_state():
+    """搜索后端现在能不能用（依赖装没装 / 服务在不在跑）。"""
+    try:
+        cfg = botctl.load_cfg()
+        home = botctl.search_home(cfg)
+        port = botctl.search_port(cfg)
+    except Exception as e:
+        return False, f"读不出搜索配置（{type(e).__name__}: {e}）"
+    if not os.path.isdir(home):
+        return False, f"没有 SearXNG 目录（{home}）——包不完整，或 search.home 写错了。"
+    if not botctl.search_ready(home):
+        return False, f"依赖还没装（{home}）——用 [2] 装。"
+    pid = botctl.search_owner(port)
+    if pid:
+        return True, f"依赖已装，服务在跑（pid {pid}，端口 {port}）。"
+    return True, f"依赖已装，但**服务没在跑**（端口 {port}）——用 [1] 启动。"
+
+
+OPTIONAL_ACTIONS = {
+    "voice": _install_voice,
+    "search": act_search_install,
+}
+OPTIONAL_STATE = {
+    "voice": _voice_state,
+    "search": _search_state,
+}
+
+
+def optional_menu():
+    """可选组件：装 / 看 / 决定「一键部署要不要自动装」。"""
+    while True:
+        print()
+        print("=" * 46)
+        print("  可选组件（不随主程序装；不装也不影响聊天/发消息/读文件/定时）")
+        print("=" * 46)
+        for i, (name, label) in enumerate(OPTIONAL_ITEMS, start=1):
+            ok, why = OPTIONAL_STATE[name]()
+            mark = "✅" if ok else "❌"
+            auto = "开" if _opt_wanted(name) else "关"
+            print(f"   {mark} {name}：{label}")
+            print(f"       {why}")
+            print(f"       一键部署时自动装：**{auto}**")
+            print(f"       [{i}] 现在装 / 重装")
+        print("   [3] 切换「一键部署时自动装」的开关")
+        print("   [0] 返回")
+        print("=" * 46)
+        c = _clean(input("请输入数字选择："))
+        if c == "0":
+            return None
+        if c == "3":
+            _submenu("自动安装开关（写 settings.json）", [
+                (str(i), f"{name}：现在{'关掉' if _opt_wanted(name) else '打开'}",
+                 (lambda n=name: _toggle_opt(n)))
+                for i, (name, _label) in enumerate(OPTIONAL_ITEMS, start=1)
+            ])
+            continue
+        hit = next((a for i, (name, _l) in enumerate(OPTIONAL_ITEMS, start=1)
+                    if c == str(i) for a in [OPTIONAL_ACTIONS[name]]), None)
+        if hit is None:
+            print("无效选择。")
+            continue
+        msg = hit()
+        if msg:
+            print(msg)
+        input("\n按回车继续 ... ")
+
+
+def _toggle_opt(name):
+    """切换一项的开关。**关掉不等于卸载**——已装的依赖不动，只是以后不再自动装。"""
+    if _opt_wanted(name):
+        _set_opt(name, False)
+        return f"已关：以后「一键部署」不再自动装 {name}。已装的东西**不动**（要装回来再切一次）。"
+    _set_opt(name, True)
+    return f"已开：以后「一键部署」会自动装 {name}。"
+
+
+def _install_optional_all():
+    """一键部署的第 4 步：把**打开的**那几项一次装齐。返回要补的说明（没有就 None）。
+
+    关掉的那几项**跳过并说明**（不许静默少装）：用户看到「跳过了」，才知道该怎么补。
+    """
+    skipped = []
+    failed = []
+    for name, label in OPTIONAL_ITEMS:
+        if not _opt_wanted(name):
+            skipped.append(name)
+            continue
+        print()
+        print(f"--- {name}：{label} ---")
+        print(OPTIONAL_STATE[name]()[1])
+        if not _confirm("    现在装？(Y/n) ", default_no=False):
+            skipped.append(name)
+            continue
+        msg = OPTIONAL_ACTIONS[name]()
+        print(msg)
+        if not OPTIONAL_STATE[name]()[0]:
+            failed.append(name)
+    if not (skipped or failed):
+        return None
+    out = []
+    if skipped:
+        out.append("跳过了：" + "、".join(skipped) + "（之后想装：双击「可选组件.bat」）")
+    if failed:
+        out.append("这几项**没装成**：" + "、".join(failed) + "（原因看上面；不影响聊天等功能）")
+    return "\n".join(out)
+
+
 # ── 装 hook 之前的版本闸（微信版本 = 整件事的前置条件）──────────────────
 # 为什么要有这一段（2026-10-04 真机）：另一台电脑上微信是 4.1.15.13，用户按 [9] 一键配置
 # 走完一遍——version.dll 放进了微信目录、hook-install-log.txt 写着「已放置，SHA256 = …」，
@@ -580,12 +784,13 @@ def first_run():
     """
     print()
     print("=" * 46)
-    print("  一键配置（查微信版本 → 装 hook → 装依赖 → 启动 → 配模型；一路回车即可）")
+    print("  一键配置（查微信版本 → 装 hook → 装依赖 → 可选组件 → 启动 → 配模型；一路回车即可）")
     print("=" * 46)
     print("  0) 查微信版本（不对就用包里自带的那份换成 " + WANTED_WEIXIN + "）")
     print("  1) 把 hook 装进微信（要管理员，会弹 UAC）")
     print("  2) 装 Python 依赖")
-    print("  3) 启动助手，然后在微信里配 API Key")
+    print("  3) 可选组件（语音转文字 / 网上搜索；不装也不影响其它功能）")
+    print("  4) 启动助手，然后在微信里配 API Key")
     print()
     print("⚠️ 前提：这台电脑要装了 **64 位 Python**（3.11 推荐）。")
     print("   没有的话先去 python.org 装（勾上 Add to PATH），或：")
@@ -629,9 +834,19 @@ def first_run():
     else:
         print("    已跳过。以后想装：菜单 [2]。")
 
-    # ── 3 · 启动 + 配模型 ──
+    # ── 3 · 可选组件 ──
     print()
-    print("--- 第 3 步：启动 + 配置模型 ---")
+    print("--- 第 3 步：可选组件（语音转文字 / 网上搜索）---")
+    print("    这两样**不随主程序装**：语音要下模型（几百 MB），搜索要它自己一份 venv。")
+    print("    现在装齐，之后就不用管了；跳过也不影响聊天、发消息、读文件、定时。")
+    note = _install_optional_all()
+    if note:
+        print()
+        print(note)
+
+    # ── 4 · 启动 + 配模型 ──
+    print()
+    print("--- 第 4 步：启动 + 配置模型 ---")
     if _confirm("    现在启动助手（后台）？(Y/n) ", default_no=False):
         ok, msg = botctl.start()
         print(("[√] " if ok else "[!] ") + msg)
@@ -667,7 +882,7 @@ def menu():
         print("   [6] 看日志")
         print("   [7] 一键开始（检测 -> 装依赖 -> 启动）")
         print("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）")
-        print("   [9] 一键配置（装 hook + 装依赖 + 启动 + 配模型）")
+        print("   [9] 一键配置（装 hook + 装依赖 + 可选组件 + 启动 + 配模型）")
         print("   [0] 退出")
         print("=" * 46)
 
@@ -714,11 +929,12 @@ def menu():
                      lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
                 ])),
                 ("8", "打开状态页（本地只读网页）", act_status_page),
-                ("9", "搜索服务（网上搜索后端 启 / 停 / 看）", lambda: _submenu(
+                ("9", "搜索服务（网上搜索后端 启 / 停 / 看 / 装）", lambda: _submenu(
                     "搜索服务（SearXNG，网上搜索的后端）", [
                         ("1", "启动搜索服务", act_search_start),
                         ("2", "停止搜索服务", act_search_stop),
                         ("3", "看状态（进程 / 能不能查 / 开关 / 自启）", act_search_status),
+                        ("4", "装 / 修依赖（在它自己的目录里建 venv）", act_search_install),
                     ])),
             ])
         elif c == "9":
@@ -755,6 +971,9 @@ def main():
         if arg in ("first", "--first-run", "setup", "一键配置", "一键部署"):
             first_run()
             return                      # 部署完就结束；菜单是 助手.bat 的事
+        if arg in ("optional", "--optional", "可选组件"):
+            optional_menu()             # 「可选组件.bat」只调它，自己不实现任何东西
+            return
         menu()
     except KeyboardInterrupt:
         print("\n已退出。")

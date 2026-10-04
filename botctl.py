@@ -30,6 +30,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -374,13 +375,30 @@ def search_port(cfg=None):
 
 
 def search_home(cfg=None):
-    """SearXNG 源码目录：config 的 `search.home` 优先，留空按约定 = 本项目**上一级**的 `searxng\\`。
+    """SearXNG 目录。**判据只有这一份**——`web_read._searxng_hint()` 也调它，别再抄第二份
+    （抄了就会「报错指向 A、启动去找 B」）。
 
-    这条约定和 `web_read._searxng_hint()` 是**同一条**（那句报错文案就是照它算路径的），
-    改一处必须改两处，否则会「报错指向 A、启动去找 B」。**绝不写死盘符/用户名。**
+    配置的 `search.home` 优先；留空时按顺序试两个约定位置：
+
+      1. `<项目>\\searxng\\`      —— **2026-10-05 起随包携带的那份**（新机器上只有它）；
+      2. `<项目上一级>\\searxng\\` —— 老约定（开发机上是它，且装着单独的 .venv）。
+
+    ⚠️ **两份都在时「能用那份优先」**（有 `.venv\\Scripts\\python.exe`）：否则开发机上
+    （上一级那份装好了、包里这份只是源码）会突然被判成「没装」，正在跑的搜索服务白挂。
+    **绝不写死盘符/用户名。**
     """
     raw = str(_search_sec(cfg).get("home") or "").strip()
-    return raw or os.path.join(os.path.dirname(env.BASE), "searxng")
+    if raw:
+        return raw
+    bundled = os.path.join(env.BASE, "searxng")
+    sibling = os.path.join(os.path.dirname(env.BASE), "searxng")
+    for d in (bundled, sibling):
+        if search_ready(d):          # 装好的优先（只看解释器在不在，不实跑）
+            return d
+    for d in (bundled, sibling):
+        if os.path.isdir(d):         # 都没装好 → 挑存在的那份（首装会在这份里建 venv）
+            return d
+    return bundled
 
 
 def search_python(home=None):
@@ -589,6 +607,89 @@ def search_start(cfg=None, home=None, wait=40):
                    f"  看日志：{SEARCH_LOG}\n{tail(8, SEARCH_LOG)}")
 
 
+def _stream(args, cwd=None):
+    """跑一条**要边跑边看**的命令（pip 装依赖得几分钟），原样把输出交给用户。
+
+    和 `_run` 的区别：`_run` 是「拿输出回来解析」（netstat/tasklist），这里是「让它说话」——
+    装依赖失败时那几行 pip 输出就是**唯一**的线索，捕获了再转述只会丢信息。
+    """
+    try:
+        return subprocess.run(args, cwd=cwd).returncode
+    except OSError as e:
+        print(f"[搜索服务] 起不来：{type(e).__name__}: {e}")
+        return 1
+
+
+def _base_python():
+    """找一个**能用来建 venv** 的解释器。返回 argv 列表；找不到返回 None。
+
+    优先当前这个解释器（`sys.executable`），但**绝不在我们自己的 `.venv` 里再套一层**
+    ——那种 venv 的 base 是同一个 Python，能建，只是容易让人看糊。
+    退路按 `env.PREFERRED_PY` 试 `py -3.11` 这些（和 install.bat 挑 Python 的顺序同一份
+    常量，别另写一串版本号）；再退到 PATH 上的 `python`。
+    """
+    exe = sys.executable
+    our_venv = os.path.normcase(os.path.join(env.BASE, ".venv") + os.sep)
+    if exe and not os.path.normcase(os.path.abspath(exe)).startswith(our_venv):
+        return [exe]
+    py = shutil.which("py")
+    if py:
+        for v in env.PREFERRED_PY:
+            if _run([py, "-" + v, "-c", "import sys"], timeout=30)[0] == 0:
+                return [py, "-" + v]
+    p = shutil.which("python")
+    return [p] if p else None
+
+
+def search_install(cfg=None, home=None):
+    """给搜索后端**建 venv + 装依赖**（第一次装 / 换机器时跑）。返回 `(ok, 一句人话)`。
+
+    两条不明显的规矩：
+
+      * **单独一份 venv**：SearXNG 的依赖（flask / lxml / curl_cffi / valkey…）和 bot 的
+        不是一套，塞进 bot 的 `.venv` 会互相顶版本；
+      * **它的 `.venv` 绝不进包**：venv 里记的是绝对路径，跨机器拷必坏——和 bot 自己
+        `.venv` 同一条规矩。所以随包只带源码，venv 到这台上现建。
+
+    「装完了没」的判据是 `search_ready()`（解释器真在），**不是 pip 的退出码**——
+    所以这里绝不因为 pip 说成功就报成功。
+    """
+    home = home or search_home(cfg)
+    if not os.path.isdir(home):
+        return False, (f"找不到 SearXNG 目录：{home}\n"
+                       f"  包里本该自带（项目根的 `searxng\\`）；没有就是包不完整。\n"
+                       f"  装在别处就在 config.yaml 写 `search.home` 指过去。")
+    if search_ready(home):
+        return True, f"搜索后端的依赖已经装好了（{search_python(home)}），不用再装。"
+    req = os.path.join(home, "requirements.txt")
+    if not os.path.isfile(req):
+        return False, f"SearXNG 目录里没有 requirements.txt（{req}）——包可能不完整。"
+
+    py = _base_python()
+    if not py:
+        return False, ("找不到能建 venv 的 Python。先装 64 位 Python 3.11"
+                       "（winget install -e --id Python.Python.3.11），再跑一次。")
+
+    venv_dir = os.path.join(home, ".venv")
+    print(f"[搜索服务] 建 venv：{venv_dir}（用 {' '.join(py)}）")
+    if _stream(py + ["-m", "venv", venv_dir], cwd=home) != 0:
+        return False, ("建 venv 失败。上面那几行有原因；常见是没有这个 Python 版本，"
+                       "或者目录没有写权限。")
+
+    pyv = search_python(home)
+    print("[搜索服务] 装依赖（要联网下载，第一次几分钟）…")
+    if _stream([pyv, "-m", "pip", "install", "--upgrade", "pip"], cwd=home) != 0:
+        print("[搜索服务] ⚠️ 升级 pip 失败（不致命），继续直接装依赖。")
+    if _stream([pyv, "-m", "pip", "install", "-r", req], cwd=home) != 0:
+        return False, (f"装依赖失败（pip 退出码非 0）。上面那段 pip 输出里是真正的原因；"
+                       f"SearXNG 的依赖里有 lxml / curl_cffi 这类轮子，装不上多半是网络。")
+
+    if not search_ready(home):
+        return False, "pip 说装完了，但 venv 里的解释器跑不起来——**不能算装好**。"
+    return True, (f"装好了：{pyv}\n"
+                  f"  起服务：助手.bat → [8] 更多 → [9] 搜索服务 → [1]，或那个目录里的 start.bat")
+
+
 def search_stop(cfg=None, dry_run=False, wait=20):
     """停搜索服务。没在跑也算 ok（幂等），但会如实说。"""
     port = search_port(cfg)
@@ -712,9 +813,13 @@ def main():
         ok, msg = search_stop(cfg=load_cfg(), dry_run="--dry-run" in sys.argv)
         print(("[√] " if ok else "[!] ") + msg)
         sys.exit(0 if ok else 1)
+    elif arg == "search-install":
+        ok, msg = search_install(cfg=load_cfg())
+        print(("[√] " if ok else "[!] ") + msg)
+        sys.exit(0 if ok else 1)
     else:
         print("用法：python botctl.py status|health|log [行数]|follow|start|stop|restart"
-              "|search-status|search-start|search-stop")
+              "|search-status|search-start|search-stop|search-install")
         sys.exit(2)
 
 

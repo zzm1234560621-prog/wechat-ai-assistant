@@ -181,3 +181,65 @@ def check_interpreter():
             "轮子，安装也许会失败；若失败请改用 Python 3.11 重跑 install.bat。"
         )
     return True, ""
+
+
+# ── 可选组件：不随主程序安装的能力 ─────────────────────────────────────
+# 为什么单独有这么一段：
+#   * 这些依赖**绝不能**写成 requirements.txt 的正式行——`required_pkgs()` 是从它派生的，
+#     写成正式行，没装的人就会「装完还是起不来」死循环，installer 还会去拖重包
+#     （faster-whisper 踩过这个坑，见 selftest_audio 那条钉死的用例）；
+#   * 可只留注释又等于**没有任何安装入口**：2026-10-05 实测，包发给别人之后「语音转文字」
+#     根本装不出来，而 README 把「语音条转文字」写在功能卖点里——功能是死的，还没人知道。
+# 所以：清单仍在 requirements.txt（唯一真源）里保持**注释**形态，安装入口放在这里。
+OPTIONAL_PIP = {
+    "voice": {
+        "label": "语音转文字（本地 faster-whisper，音频一个字节不出本机）",
+        "specs": ["faster-whisper", "pilk"],
+        "imports": ["faster_whisper", "pilk"],
+    },
+}
+
+
+def missing_optional(name):
+    """某个可选组件在 venv 里还缺哪些包。venv 不可用 / 探不动 → 当**全缺**。"""
+    names = list((OPTIONAL_PIP.get(name) or {}).get("imports") or [])
+    if not names:
+        return []
+    py = venv_python()
+    if py is None:
+        return names
+    code = (
+        "import importlib.util as u;"
+        f"names={names!r};"
+        "print('\\n'.join(n for n in names if u.find_spec(n) is None))"
+    )
+    r = _run([py, "-c", code], timeout=60)
+    if r is None or r.returncode != 0:
+        return names
+    return [n for n in r.stdout.decode("utf-8", "ignore").split() if n]
+
+
+def install_optional(name):
+    """把某个可选组件的依赖装进 **bot 自己的 venv**。返回 `(ok, 一句人话)`。
+
+    「装好了没」的判据是装完**再查一次 import**，不是 pip 的退出码——
+    pip 说成功而 import 找不到是真会发生的（版本不匹配 / 装到了别的解释器）。
+    """
+    comp = OPTIONAL_PIP.get(name)
+    if not comp:
+        return False, f"没有这个可选组件：{name}（有的是：{', '.join(OPTIONAL_PIP)}）"
+    py = venv_python()
+    if py is None:
+        return False, "虚拟环境还没建好或已失效——先跑 install.bat（或菜单 [2] 安装依赖）。"
+    specs = list(comp["specs"])
+    print(f"[可选组件] {comp['label']}")
+    print(f"[可选组件] 装 {', '.join(specs)}（要联网下载，第一次几分钟）…")
+    r = subprocess.run([py, "-m", "pip", "install", *specs])
+    if r.returncode != 0:
+        return False, ("pip 装不上（退出码非 0）——上面那段输出里是真正的原因。"
+                       "faster-whisper 会带上 ctranslate2 / onnxruntime 这些轮子，"
+                       "装不上多半是网络。")
+    left = missing_optional(name)
+    if left:
+        return False, f"pip 说装完了，可 import 还是找不到：{', '.join(left)}——**不能算装好**。"
+    return True, f"装好了：{', '.join(specs)}"

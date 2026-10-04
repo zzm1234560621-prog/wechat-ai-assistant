@@ -4,5 +4,9 @@
     "chats": [],
     "enabled": false,
     "review": false
+  },
+  "optional": {
+    "voice": true,
+    "search": true
   }
 }

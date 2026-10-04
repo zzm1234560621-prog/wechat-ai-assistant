@@ -1,7 +1,16 @@
 # 网上搜索（`web_search` / `web_read.py`）——设计、证据与运维
 
-> 状态：**已实现**（2026-10-02）。bot 侧代码 + 离线自测已通过；搜索后端是**本机自建的
-> SearXNG**（源码在 `D:\wechat-ai-assistant\searxng`，**与 bot 仓库平级，不在仓库里**）。
+> 状态：**已实现**（2026-10-02）。bot 侧代码 + 离线自测已通过；搜索后端是**自建的
+> SearXNG**。
+>
+> ⚠️ **2026-10-05 更新（源码位置与安装入口都变了，别再照旧路径走）**：
+> 源码**随包携带在 `<项目>\searxng\`**（随包 = 跟着发布包一起发出去，仓库里就带着，
+> 1000 个文件 / 约 20MB）；老约定 `<项目上一级>\searxng\` **仍然认**，两份都在时
+> **「装好依赖的那份」优先**（见 `botctl.search_home`，那是唯一判据）。
+> 安装入口：`一键部署.bat` 的第 ③ 步，或双击 **`可选组件.bat`**，
+> 或 助手.bat → [8] 更多 → [9] 搜索服务 → [4]。
+> 本文下面凡是写着 `%SEARXNG%` 的地方，都是**2026-10-02 当时
+> 开发机上的绝对路径**，现已替换成 `%SEARXNG%`（= 你这份 SearXNG 目录）。
 >
 > 这份文档回答三个问题：**为什么不能用「直接抓搜索页」**、**SearXNG 怎么装/怎么起**、
 > **改这块时必须守哪些规矩**。
@@ -35,12 +44,14 @@
 
 ## 2. 装与起（源码，无 key、无费用）
 
-目录布局（**故意放在 bot 仓库之外**，不污染 `wechat-ai-assistant` 那份 git）：
+目录布局（⚠️ 2026-10-05 起**默认随包携带在 bot 仓库里的 `searxng\`**；
+下面这个「放仓库之外」的布局是 2026-10-02 的老约定，**仍然被认**，开发机上是它）：
 
 ```
-D:\wechat-ai-assistant\
-├── wechat-ai-assistant\      # bot 仓库（web_read.py 在这里）
-└── searxng\                  # 搜索后端（本文件所在目录结构见下）
+<项目上一级>\
+├── wechat-ai-assistant\      # bot 仓库
+│   └── searxng\              # ← 2026-10-05 起：随包携带的源码（新机器上只有这一份）
+└── searxng\                  # ← 老约定；开发机上是它，且装着独立的 .venv
     ├── .venv\                # 独立 venv：**绝不装进 bot 的 .venv**
     ├── searx\                # SearXNG 源码
     ├── requirements.txt
@@ -48,18 +59,22 @@ D:\wechat-ai-assistant\
     └── start.bat             # 启动脚本（窗口留着 = 服务在跑）
 ```
 
+**两份都在时哪份算数**：`botctl.search_home()` 是唯一判据——配置 `search.home` 优先，
+留空则**「能用的那份」（有 `.venv\Scripts\python.exe`）优先**，都没装好才按
+「项目内 → 上一级」挑。所以开发机不会因为包里多了份源码就被判成「没装」。
+
 安装步骤（一次性）：
 
 ```powershell
 # 1) 取源码（git clone 也行；本次是被沙箱挡了 git 的 schannel 才改用 tarball）
 #    https://codeload.github.com/searxng/searxng/tar.gz/refs/heads/master
 # 2) 独立 venv + 依赖（走清华镜像，几分钟）
-C:\Users\...\Python311\python.exe -m venv D:\wechat-ai-assistant\searxng\.venv
-D:\wechat-ai-assistant\searxng\.venv\Scripts\python.exe -m pip install `
-  -r D:\wechat-ai-assistant\searxng\requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+C:\Users\...\Python311\python.exe -m venv %SEARXNG%\.venv
+%SEARXNG%\.venv\Scripts\python.exe -m pip install `
+  -r %SEARXNG%\requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 # 3) settings.yml：把 __SECRET_KEY__ 换成随机值
 # 4) 启动
-D:\wechat-ai-assistant\searxng\start.bat
+%SEARXNG%\start.bat
 ```
 
 `settings.yml`（本机专用）里三件事最关键：
@@ -205,7 +220,7 @@ search.enabled=False           → 不发任何请求（用会抛异常的 fetch
 
 | 现象 | 原因 | 怎么办 |
 |---|---|---|
-| 助手回「连不上本机的搜索服务（http://127.0.0.1:8888）」 | SearXNG 没在跑 | 跑 `D:\wechat-ai-assistant\searxng\start.bat`，确认 `http://127.0.0.1:8888` 能打开 |
+| 助手回「连不上本机的搜索服务（http://127.0.0.1:8888）」 | SearXNG 没在跑 | 跑 `%SEARXNG%\start.bat`，确认 `http://127.0.0.1:8888` 能打开 |
 | 「返回的是网页、不是 JSON」 | `settings.yml` 的 `search.formats` 少了 `json` | 加上 `json` 后重启 SearXNG |
 | 「网上搜索没开启（config.yaml 的 search.enabled）」 | 开关是关的 | 改 `search.enabled: true` 后重启 bot |
 | 「这次提问已经搜过 N 次（上限 …）」 | 撞了 `search.max_per_round` | 正常保护；确实要更多就调大它 |

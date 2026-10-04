@@ -26,9 +26,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 SELF = os.path.basename(os.path.abspath(__file__))
 
 # 不查的目录：虚拟环境 / 缓存 / 运行期数据 / 旧打包产物 / 自测图片
-# / 第三方 hook 源码（那是别人仓库的快照，不归我们管，也不该改）
+# / 第三方源码快照（别人仓库的东西，不归我们管，也不该改）：
+#   * `src-4.1.10.27` —— 随包携带的 WeChat-Hook 源码；
+#   * `searxng`       —— 2026-10-05 起随包携带的搜索后端（1000+ 个 .py）。
+# 第三方树整棵跳过是**必须的**：它们是别人写的东西，里面出现本机盘符/用户名是他们的自由，
+# 拿我们的「不许写死本机路径」去查它们，只会在用户的机器上报一条假失败
+# （本项目修过同类坑：包里少放一个文件就让用户看到假失败）。
 SKIP_DIR_NAMES = {".venv", "__pycache__", "data", "dist", "test_images", ".git",
-                  "src-4.1.10.27"}
+                  "src-4.1.10.27", "searxng"}
 CODE_EXT = (".py", ".ps1", ".bat")
 
 # 「会执行的代码里绝不该出现」的本机身份。注释里提到是允许的（先剥注释再匹配）。
@@ -214,6 +219,7 @@ def main():
             "docs": "规格与笔记（README/CLAUDE.md 到处在指它们）",
             "tools": "打包/自测用到的脚本（resize.ps1、office2text.ps1…）",
             "plugins": "插件目录（`_example.py` 模板在这儿，README 让人复制它）",
+            "searxng": "随包携带的搜索后端（少了它，别人机器上 web_search 永远用不了）",
         }
         missing = sorted(d for d in need_dirs
                          if os.path.isdir(os.path.join(BASE, d)) and d not in listed)

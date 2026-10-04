@@ -1,0 +1,77 @@
+# 本机搜索后端专用配置 —— 给 wechat-ai-assistant 的 web_search 工具用。
+#
+# 定位：**只给自己用的回环实例**。所以：
+#   * 只绑 127.0.0.1，绝不开 0.0.0.0、绝不 public_instance（那会连限流/反代都得管）；
+#   * limiter 关掉（只有本机的 bot 会来查，开着只会误伤自己）；
+#   * formats 里加上 json —— **少这一行，bot 拿到的就是一个 HTML 页面**，
+#     web_read 会如实报「settings.yml 里 json 没开」。这是最容易漏的一步。
+#   * use_default_settings：以 SearXNG 自带的设置为基础，这里只覆盖下面几项。
+#     ⚠️ **别把本文件复制去覆盖 searx/settings.yml**，那样这个开关就指向自己了。
+#
+#   * engines.keep_only：**2026-10-02 逐引擎实测之后收敛到这两个**——
+#     本机网络下真正能返回结果的只有：
+#       360search（360 搜索，7 条相关结果）
+#       quark     （夸克，9 条相关结果）
+#     其余实测（**别再一个个去试，下面就是证据**）：
+#       baidu       → 引擎报 CAPTCHA（人机验证）
+#       sogou       → unexpected crash
+#       duckduckgo  → timeout / Suspended
+#       google / brave / qwant / yahoo / presearch / mojeek / wikipedia /
+#       startpage   → 全部 timeout（本机连不上）
+#       bing        → 不报错，但 0 条（和「直接抓 Bing 得到无关结果」是同一件事）
+#     不收敛的话**每次搜索都要等这些引擎各自超时**（outgoing.request_timeout 6 秒），
+#     而搜索是同步的、占着 bot 收消息那条线程——所以这里必须 keep_only。
+#     以后想加引擎：先在浏览器里试
+#       http://127.0.0.1:8888/search?q=测试&engines=<引擎名>&format=json
+#     确认**真有结果**再加进来。
+use_default_settings:
+  engines:
+    keep_only:
+      - 360search
+      - quark
+
+# ⚠️ 光 keep_only 不够：这两个引擎在 SearXNG 默认配置里都是 `disabled: true`
+# （`searx/settings.yml` 里 360search 第 294 行、quark 第 2058 行都是 disabled: true），
+# keep_only 只是**筛掉别的**，不会把被禁用的打开。所以必须在这里显式启用
+# （settings_loader 第 169-174 行会把这里的字段 update 到默认条目上）。
+# 少了这一段，SearXNG 会稳稳地返回 **0 条结果且不报任何错**——最难查的那种。
+engines:
+  - name: 360search
+    disabled: false
+  - name: quark
+    disabled: false
+
+general:
+  instance_name: "本地搜索（微信助手用）"
+  enable_metrics: false
+  donation_url: false
+  contact_url: false
+
+search:
+  safe_search: 1
+  autocomplete: ""            # 本机自用，不需要联想（少一个出站请求）
+  default_lang: "zh-CN"
+  formats:
+    - html                    # 留 html 便于人肉打开 http://127.0.0.1:8888 看引擎状态
+    - json                    # ← bot 靠这个
+
+server:
+  port: 8888
+  bind_address: "127.0.0.1"
+  base_url: false
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  http_protocol_version: "1.1"
+  secret_key: "504eb387955f9200f31a2843ff3b1c0cb12003b8dd033136ddf193ad4365c891"   # 由安装脚本随机生成（只在本机会话里用）
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  # 引擎出站超时。**别调大**：单个引擎卡住会拖住整次搜索，
+  # 而搜索是同步的、占着 bot 收消息那条线程。
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  pool_connections: 100
+  pool_maxsize: 20

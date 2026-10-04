@@ -15,6 +15,7 @@
 """
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
@@ -29,6 +30,7 @@ sys.path.insert(0, HERE)
 import bypass_update
 import console
 import envsetup as env
+import settings
 import wechat_version as wv
 
 _FAIL = []
@@ -507,6 +509,69 @@ def main():
                 "★ 日志里没有 DONE 就超时返回 None（不许把「还在装」当「装好了」）")
         finally:
             console.HOOK_DIR = real_hook
+
+    # ── T6 可选组件（语音转文字 / 网上搜索）的安装入口 ───────────────────
+    # 2026-10-05：这两样**代码在、包里也在**，但依赖和模型都不随包（faster-whisper 在
+    # requirements.txt 里只能写成注释行；SearXNG 的模型/venv 更不能跨机器拷）——
+    # 于是「装完就能用」在别人机器上并不成立，README 却把语音条转文字当卖点。
+    # T6 钉的就是那个**安装入口**，以及它最容易被改坏的两条。
+    print("\n6) T6 可选组件的安装入口")
+    chk("voice" in env.OPTIONAL_PIP, f"注册表里有语音这一项：{list(env.OPTIONAL_PIP)}")
+    comp = env.OPTIONAL_PIP["voice"]
+    chk(comp["specs"] and comp["imports"], "每项都写清「装什么」和「装完 import 什么」")
+
+    # ★ 最要紧的一条：这些包**绝不能**变成 requirements.txt 的正式行。
+    # 写成正式行 → required_pkgs() 要求它们 → 没装的人「装完还是起不来」死循环，
+    # installer 还会去拖重包（faster-whisper 真实踩过，selftest_audio 也钉着）。
+    formal = {env.requirement_name(s).lower() for s in env.requirements_specs()}
+    leaked = sorted(p.lower() for p in comp["specs"] if p.lower() in formal)
+    chk(not leaked, f"★ 可选依赖不许出现在 requirements.txt 的正式行里：{leaked}")
+
+    # 没建 venv / 探不动 → 一律当**全缺**（宁可让上层重装一次，也不假装齐全）
+    real_py = env.venv_python
+    try:
+        env.venv_python = lambda: None
+        chk(env.missing_optional("voice") == list(comp["imports"]),
+            "venv 不可用时 missing_optional 当全缺")
+        chk(env.install_optional("voice")[0] is False
+            and "虚拟环境" in env.install_optional("voice")[1],
+            "venv 没建好时装可选组件 → 如实拒绝，不假装成功")
+    finally:
+        env.venv_python = real_py
+    chk(env.install_optional("根本没有这一项")[0] is False,
+        "组件名写错 → 如实报「没有这个可选组件」")
+    chk(env.missing_optional("根本没有这一项") == [],
+        "未知组件不抛异常（菜单列错了不该把控制台炸掉）")
+
+    # console 那一侧：菜单项必须是**同一个清单**驱动的，不许菜单里有、实现里没有
+    items = {n for n, _label in console.OPTIONAL_ITEMS}
+    chk(items == set(console.OPTIONAL_ACTIONS) == set(console.OPTIONAL_STATE),
+        f"菜单/动作/状态三张表一一对应：{items}")
+    chk(callable(console.optional_menu) and callable(console._install_optional_all),
+        "可选组件菜单与「一键部署第 3 步」都存在")
+
+    # 开关写 settings.json（**不回写带注释的 config.yaml**），且「没写过 = 要装」
+    with tempfile.TemporaryDirectory() as td:
+        real_settings_path = settings.SETTINGS_PATH
+        try:
+            settings.SETTINGS_PATH = os.path.join(td, "settings.json")
+            chk(console._opt_wanted("voice") is True, "★ 没写过 = 要装（一键部署默认装齐）")
+            console._set_opt("voice", False)
+            chk(console._opt_wanted("voice") is False, "关掉之后记住")
+            chk((settings.load().get("optional") or {}).get("voice") is False,
+                "开关真的落在 settings.json 的 optional 段")
+            console._set_opt("search", True)
+            chk((settings.load().get("optional") or {}).get("voice") is False,
+                "★ 改一项不许把另一项冲掉（读-改-写，不是整段覆盖）")
+        finally:
+            settings.SETTINGS_PATH = real_settings_path
+
+    # settings.example.json 里要**带上**这个段：包里那份是它拷过去的，少了用户就不知道有开关
+    ex_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.example.json")
+    with open(ex_path, encoding="utf-8") as f:
+        example = json.load(f)
+    chk(isinstance(example.get("optional"), dict) and "voice" in example["optional"],
+        f"settings.example.json 里有 optional 段：{example.get('optional')}")
 
     # ── 汇总 ──────────────────────────────────────────────────────────
     print()
