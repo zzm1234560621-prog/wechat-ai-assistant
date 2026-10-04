@@ -560,6 +560,64 @@ def test_send_file_from_disk():
     return ok
 
 
+def test_end_to_end_via_run_agent():
+    """**用户的真实场景**：在控制会话里说一句「看看我桌面上有什么」。
+
+    ## 为什么单独立这一条（2026-10-04 真机撞出来的）
+
+    当时的局面是：
+
+    * `selftest_files` 的 `_run()` **自己塞** `from_self=True` → 绿；
+    * `selftest_bot_loop` 验「事实到得了 `ToolBox`」（探针工具）→ 绿；
+    * **而生产里 `computer_files` 一律被拒** —— 因为 `run_agent` 根本没把
+      `from_self` 传进 `ToolBox`。
+
+    **两条测试各自都对，拼起来才坏。** 单点测试天然抓不到这个，所以这里
+    **直接走完整那条路**：真 `bot.run_agent` + 真 `computer_files`，
+    什么事实都不自己塞（只给 `run_agent`，跟主循环一样）。
+    """
+    print("\n── 10 · 端到端：真 run_agent + 真 computer_files（用户的那句话）──")
+    ok = True
+    import llm as llm_mod
+    import bot
+
+    with tempfile.TemporaryDirectory() as td:
+        _mk(os.path.join(td, "桌面上的东西.txt"), "hi")
+        cfg = {"agent": {"max_queries": 3}, "files": {"roots": [td]}}
+
+        class _Cli:
+            pass
+
+        class _LLM:
+            def __init__(self):
+                self.rounds = 0
+
+            def chat_with_tools(self, system, messages, tools):
+                self.rounds += 1
+                if self.rounds == 1:
+                    return llm_mod.ChatResult("", [llm_mod.ToolCall(
+                        "c1", "computer_files", {"action": "list", "path": td})])
+                self.messages = messages
+                return llm_mod.ChatResult("看过了", [])
+
+        def _tool_output(from_self):
+            llm = _LLM()
+            bot.run_agent(llm, "sys", "看看我桌面上有什么", _Cli(), [], cfg,
+                          "filehelper", "", cfg_provider=lambda: cfg,
+                          history=[], state={}, from_self=from_self)
+            outs = [m.get("content") for m in getattr(llm, "messages", [])
+                    if m.get("role") == "tool"]
+            return " ".join(str(o) for o in outs)
+
+        out = _tool_output(True)
+        ok &= check("我在控制会话里说 → **真的列出来了**（不再是被配置拒绝）",
+                    "桌面上的东西.txt" in out and "不能用" not in out, out[:200])
+        out = _tool_output(False)
+        ok &= check("别人发来的 → 仍然如实拒绝（闸门没被这次修复放宽）",
+                    "不能用" in out, out[:200])
+    return ok
+
+
 def main():
     print("电脑文件能力回归（`files.py`）")
     print("=" * 66)
@@ -572,6 +630,7 @@ def main():
     test_who_gate()
     test_startup_notes()
     test_send_file_from_disk()
+    test_end_to_end_via_run_agent()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")
