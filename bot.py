@@ -1189,7 +1189,14 @@ def restore_pending(chats, cfg):
                     # wxid 发一段预览文字（真机上是「发出去了但没人收到」这种最难查的错）。
                     # 少了 file，发文件的待确认项会退化成「发一段文字」。
                     label=it.get("label"), items=it.get("items"), spec=it.get("spec"),
-                    file=it.get("file"), ttl=ttl)
+                    file=it.get("file"),
+                    # ⚠️ `extra` **必须整包透传**（2026-10-04 加）。
+                    # 新 kind 的动作身份全在里面 —— 漏了这一句，重启后那条待确认项
+                    # 会**静默退化成别的操作**：判重键算出来跟原来不一样（于是可能
+                    # 重复入队），执行器也拿不到自己要的字段。
+                    # 这就是上面 label/items/spec/file 那个死法的同一个形状，
+                    # 所以新 kind 的字段一律走 extra、**不再加具名参数**。
+                    extra=it.get("extra"), ttl=ttl)
                 if dupe:
                     # 盘上有两条一模一样的（旧版本留下的）：只恢复一条，并**明说**。
                     print(f"[bot] 恢复待确认队列：第 {dupe} 条已经一模一样，"

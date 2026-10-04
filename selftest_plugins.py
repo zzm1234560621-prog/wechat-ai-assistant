@@ -498,6 +498,107 @@ def test_events():
     return ok
 
 
+def test_pending_kind():
+    print("\n── 9 · 待确认 kind：extra 整包还原 + 判重键并入动作身份 ──")
+    ok = True
+    import time as _t
+    import bot
+
+    rep = plugins.REGISTRY
+    kind = "selftest_kind"
+    chat = "selftest_kind_chat"
+    chat2 = "selftest_restore_chat"
+
+    def _cleanup():
+        for s in ("selftest", "selftest2"):
+            rep.rollback_source(s)
+        agent_tools._PENDING.pop(chat, None)
+        agent_tools._PENDING.pop(chat2, None)
+
+    _cleanup()
+
+    hit, msg = _raises(lambda: rep.register_pending_kind(
+        "bad_kind", lambda i: "d", lambda i, c: (0, None), source="selftest"))
+    ok &= check("不给 key_fields → **加载期失败**，并说清后果",
+                hit and "key_fields" in msg and "另一件事" in msg, msg)
+    hit, msg = _raises(lambda: rep.register_pending_kind(
+        kind, "不是函数", lambda i, c: (0, None),
+        key_fields=["path"], source="selftest"))
+    ok &= check("describe_fn 不可调用 → 失败", hit, msg)
+    hit, msg = _raises(lambda: rep.register_pending_kind(
+        kind, lambda i: "d", "不是函数", key_fields=["path"], source="selftest"))
+    ok &= check("apply_fn 不可调用 → 失败", hit, msg)
+
+    applied = []
+    rep.register_pending_kind(
+        kind,
+        lambda it: "动作：" + str((it.get("extra") or {}).get("path")),
+        lambda it, ctx: (applied.append(it.get("extra")) or 1, None),
+        key_fields=["path"], source="selftest")
+    ok &= check("pending_key_fields 返回声明的字段",
+                rep.pending_key_fields(kind) == ["path"],
+                rep.pending_key_fields(kind))
+    hit, msg = _raises(lambda: rep.register_pending_kind(
+        kind, lambda i: "d", lambda i, c: (0, None),
+        key_fields=["x"], source="selftest"))
+    ok &= check("kind 重名 → 失败（撞了会让一类的动作用另一类的执行器）", hit, msg)
+
+    cfg = {"agent": {"confirm_ttl": 300}}
+    a = agent_tools.set_pending(chat, "", "", "", kind=kind,
+                                extra={"path": "D:/A.txt"}, ttl=300)
+    b = agent_tools.set_pending(chat, "", "", "", kind=kind,
+                                extra={"path": "D:/B.txt"}, ttl=300)
+    ok &= check("两条**不同**动作**不判重**（删 A / 删 B 不许被判成同一条）",
+                a is None and b is None
+                and len(agent_tools.list_pending(chat, 300)) == 2,
+                (a, b, len(agent_tools.list_pending(chat, 300))))
+    c = agent_tools.set_pending(chat, "", "", "", kind=kind,
+                                extra={"path": "D:/A.txt"}, ttl=300)
+    ok &= check("两条**逐字相同**的动作仍判重（返回菜单编号、不重复入队）",
+                c is not None and len(agent_tools.list_pending(chat, 300)) == 2, c)
+
+    items = agent_tools.list_pending(chat, 300)
+    ok &= check("describe_pending 走注册的描述器",
+                agent_tools.describe_pending(items[0]).startswith("动作："),
+                agent_tools.describe_pending(items[0]))
+    n, err = agent_tools.send_pending(None, items[0])
+    ok &= check("send_pending 走注册的执行器，如实返回 (条数, 错误)",
+                n == 1 and err is None and applied
+                and applied[0].get("path") == "D:/A.txt", (n, err, applied))
+
+    def _boom(it, ctx):
+        raise RuntimeError("炸了")
+
+    rep.register_pending_kind("selftest_boom", lambda i: "d", _boom,
+                              key_fields=["x"], source="selftest2")
+    n2, e2 = agent_tools.send_pending(None, {"kind": "selftest_boom",
+                                             "extra": {"x": 1}})
+    ok &= check("执行器抛错 → 如实报错（这一步已是用户确认过的真动作，绝不假装成功）",
+                n2 == 0 and e2 and "RuntimeError" in e2, (n2, e2))
+
+    # ⚠️ 静默退化陷阱：`bot.restore_pending` 是**逐字段白名单**传参的。
+    # 漏了 `extra` 不会报错，而是重启后那条待确认项**认不出自己的动作**。
+    bot.state_set("pending", {chat2: [{
+        "kind": kind, "to_wxid": "", "to_name": "", "text": "", "count": 1,
+        "extra": {"path": "D:/要还原的.txt"}, "ts": _t.time()}]})
+    got = bot.restore_pending([chat2], cfg)
+    back = agent_tools.list_pending(chat2, 300)
+    ok &= check("restore_pending 之后 extra **一个不少**（防静默退化）",
+                got == 1 and back
+                and (back[0].get("extra") or {}).get("path") == "D:/要还原的.txt",
+                (got, back))
+
+    agent_tools._PENDING.pop(chat, None)
+    agent_tools.set_pending(chat, "", "", "", kind="agent", extra="垃圾", ttl=300)
+    ok &= check("非 dict 的 extra 当没给（不收垃圾进队列再指望下游容错）",
+                agent_tools.list_pending(chat, 300)[0].get("extra") is None)
+
+    _cleanup()
+    ok &= check("rollback_source 也撤掉待确认种类",
+                rep.pending_kind(kind) is None and rep.pending_kind("selftest_boom") is None)
+    return ok
+
+
 def main():
     print("插件契约回归（`plugins.py`）")
     print("=" * 66)
@@ -509,6 +610,7 @@ def main():
     test_load_dir()
     test_scoped_source()
     test_events()
+    test_pending_kind()
     print("=" * 66)
     if _ok:
         print("全部通过 ✅")

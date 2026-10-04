@@ -124,6 +124,8 @@ class Registry:
         self._events = {e: [] for e in EVENTS}
         # 事件耗时记账：source -> **连续**超时次数（中间有一次快就清零）。
         self._slow = {}
+        # 待确认种类：{kind: {describe, apply, key_fields, source}}。
+        self._kinds = {}
         # 被自动停用的插件。**不落盘**：只在本次运行生效，改好代码重启即恢复。
         self._disabled = set()
         # 日志出口。加载器会把它换成 bot 的 print。
@@ -245,20 +247,25 @@ class Registry:
         return [n for n in self._order if self._tools[n]["source"] == "builtin"]
 
     def rollback_source(self, source):
-        """把某个 `source` 注册的东西全部撤掉，返回撤掉的工具名。
+        """把某个 `source` 注册的东西**全部**撤掉（工具 + 事件 + 待确认种类），
+        返回被撤掉的工具名。
 
-        **给加载器做「半加载」回滚用**：插件在 `setup` 里注册了工具 A、
-        再在 B 上抛错，如果留着 A，那这个插件就是**半加载**状态 ——
-        它的工具模型看得到，但它的其它东西（事件、待确认 kind）没生效。
-        这种状态最难查（「怎么有个工具，但又不好使」），所以宁可不加载。
+        **给加载器做「半加载」回滚、也给自动停用用**：插件在 `setup` 里注册了
+        工具 A、事件 B、种类 C，然后抛错 —— 只要留一样，这个插件就是**半加载**
+        状态（模型看得到工具、但事件没生效，或者反过来）。半加载最难查
+        （「怎么有个工具，但又不好使」），所以宁可不加载、一次撤干净。
 
-        工具注册表是**唯一真源**，回滚也只能回滚自己注册的那一份 ——
-        绝不能顺手把别人的也清掉，所以按 `source` 精确匹配。
+        只能撤**自己注册的那一份**（按 `source` 精确匹配）—— 绝不能顺手把别人的
+        也清掉，那样 bug 会以「另一个插件莫名消失」的形式出现。
         """
         gone = [n for n in self._order if self._tools[n]["source"] == source]
         for n in gone:
             self._order.remove(n)
             self._tools.pop(n, None)
+        for ev in list(self._events):
+            self._events[ev] = [x for x in self._events[ev] if x[0] != source]
+        for k in [k for k, v in self._kinds.items() if v["source"] == source]:
+            self._kinds.pop(k, None)
         return gone
 
     # ------------------------------------------------------------ 事件
@@ -339,7 +346,7 @@ class Registry:
             self.auto_disable(source)
 
     def auto_disable(self, source, why="连续超时"):
-        """自动停用某个插件：撤掉它的工具与事件，并**明说是谁、为什么**。
+        """自动停用某个插件：撤掉它的工具 / 事件 / 待确认种类，并**明说是谁、为什么**。
 
         **不假装能超时中断**（Python 中断不了同步调用）。停用是唯一能真正
         止血的动作，代价是这个插件的功能没了 —— 所以必须说清楚，
@@ -348,20 +355,77 @@ class Registry:
         if source in self._disabled:
             return []
         self._disabled.add(source)
+        n_ev = sum(1 for lst in self._events.values() for x in lst if x[0] == source)
+        n_kind = sum(1 for v in self._kinds.values() if v["source"] == source)
         gone = self.rollback_source(source)
-        dropped = 0
-        for ev, lst in self._events.items():
-            keep = [x for x in lst if x[0] != source]
-            dropped += len(lst) - len(keep)
-            self._events[ev] = keep
         self.log(f"[plugins] ❌ 插件「{source}」{why}，**已自动停用**："
-                 f"撤掉 {len(gone)} 个工具、{dropped} 个事件。"
+                 f"撤掉 {len(gone)} 个工具、{n_ev} 个事件、{n_kind} 个待确认种类。"
                  f"停用只在本次运行生效 —— 改好代码重启就恢复。")
         return gone
 
     def disabled_plugins(self):
         """被自动停用的插件名（给自测与状态页用）。"""
         return sorted(self._disabled)
+
+    # ------------------------------------------------------------ 待确认种类
+    #
+    # 插件与核心共用**同一条** `set_pending` 队列 —— 插件工具绝不许绕开确认闸，
+    # 所以这里注册的不是「另一条队列」，而是「这一类动作怎么描述、怎么执行、
+    # 以及它的**身份**由哪几个字段决定」。
+
+    def register_pending_kind(self, kind, describe_fn, apply_fn, key_fields=None,
+                              source="plugin"):
+        """注册一个待确认种类。
+
+        * `describe_fn(item) -> str` —— 给编号菜单用的一行人类描述。
+          ⚠️ **必须原样展示要执行的内容**（同 `shell` 显示命令原文那条规矩）：
+          中间任何转述/改写都等于把确认闸做废。
+        * `apply_fn(item, ctx) -> (真正执行了几条, 错误)` —— 用户回「确认」后执行。
+          `ctx` 是 `{"cfg": ..., "client": ...}`。
+        * `key_fields=[...]` —— **该 kind 的判重字段（必填）**，见下。
+        """
+        k = str(kind or "").strip()
+        if not k:
+            raise PluginError(f"[{source}] 待确认种类缺 kind 名")
+        if k in self._kinds:
+            raise PluginError(
+                f"[{source}] 待确认种类「{k}」和 {self._kinds[k]['source']} 撞了 —— "
+                f"撞了会让其中一类的动作被另一类的描述/执行器处理")
+        if not callable(describe_fn):
+            raise PluginError(f"[{source}] 待确认种类「{k}」的 describe_fn 不是可调用的")
+        if not callable(apply_fn):
+            raise PluginError(f"[{source}] 待确认种类「{k}」的 apply_fn 不是可调用的")
+
+        kf = list(key_fields or [])
+        if not kf or not all(isinstance(x, str) and x.strip() for x in kf):
+            # ⚠️ 这一条是**强制项**，不是优化。看不到后果就不会有人守它：
+            #    「删掉 A」和「删掉 B」两条 `fileop`，kind 相同、其余字段全空
+            #    → 判重键**完全一样** → 第二条被当成「和上面那条一模一样」而不登记，
+            #    用户照菜单回「确认」——**做掉的是另一件事**。删除是不可逆的。
+            #    所以不给 key_fields 的种类**加载期就失败**，不许静默套用旧元组。
+            raise PluginError(
+                f"[{source}] 待确认种类「{k}」必须声明 key_fields（判重字段）。"
+                f"不给就等于两条**不同的动作**被判成同一条 —— 用户照菜单回「确认」，"
+                f"做掉的是另一件事（见 docs/plugin-contract-spec.md 4.2）")
+
+        self._kinds[k] = {
+            "kind": k, "describe": describe_fn, "apply": apply_fn,
+            "key_fields": [x.strip() for x in kf], "source": source,
+        }
+        return self._kinds[k]
+
+    def pending_kind(self, kind):
+        """取一个待确认种类的 spec（没注册则 None）。"""
+        return self._kinds.get(str(kind or ""))
+
+    def pending_key_fields(self, kind):
+        """取一个待确认种类的判重字段（没注册则 None）。"""
+        spec = self.pending_kind(kind)
+        return list(spec["key_fields"]) if spec else None
+
+    def pending_kinds(self):
+        """已注册的待确认种类名（按注册顺序）。"""
+        return list(self._kinds)
 
     # ------------------------------------------------------------ 派发
 
@@ -435,6 +499,12 @@ class ScopedRegistrar:
     def register_event(self, name, fn):
         """挂生命周期事件（`EVENTS` 白名单）。"""
         return self._reg.register_event(name, fn, source=self.source)
+
+    def register_pending_kind(self, kind, describe_fn, apply_fn, key_fields=None):
+        """注册待确认种类（走核心**同一条**确认队列，没有例外通道）。"""
+        return self._reg.register_pending_kind(kind, describe_fn, apply_fn,
+                                               key_fields=key_fields,
+                                               source=self.source)
 
 
 def plugins_dir(base=None):

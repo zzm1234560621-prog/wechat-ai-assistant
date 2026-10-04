@@ -1645,7 +1645,27 @@ def _action_key(item):
         count = int(item.get("count") or 1)
     except (TypeError, ValueError):
         count = 1
-    return (str(item.get("kind") or "agent"),
+
+    # ⚠️ **新 kind 的动作身份在 `extra` 里，所以它必须进判重键。**
+    #
+    # 不加这一项的后果是很具体的（会删错文件）：「删掉 A」和「删掉 B」两条
+    # `fileop`，kind 相同、to_wxid 空、text 空、其余字段全空 → 判重键**完全一样**
+    # → 第二条被当成「和上面那条一模一样」而**不登记**，用户看到的是
+    # 「已经有一条相同的了」，照着菜单回「确认」——**删掉的是 A**。
+    #
+    # 注册过的 kind 只按它**声明的** `key_fields` 比（那是它自己声明的身份，
+    # 由 `plugins.register_pending_kind` 强制声明）；没注册但带了 extra 的，
+    # 整包比 —— **宁可多比，不可误判重**（误判重 = 静默丢掉一个动作）。
+    kind = str(item.get("kind") or "agent")
+    extra = item.get("extra")
+    if isinstance(extra, dict):
+        kf = plugins.REGISTRY.pending_key_fields(kind)
+        extra_key = (_canon({k: extra.get(k) for k in kf}) if kf
+                     else _canon(extra))
+    else:
+        extra_key = ""
+
+    return (kind,
             str(item.get("to_wxid") or ""),
             count,
             _paths(item.get("file")),
@@ -1654,7 +1674,8 @@ def _action_key(item):
             str(item.get("cmd") or ""),
             _canon(item.get("items")),
             _canon(item.get("spec")),
-            str(item.get("text") or ""))
+            str(item.get("text") or ""),
+            extra_key)
 
 
 def _dupe_index(chat, key, ttl=None):
@@ -1701,7 +1722,7 @@ def _dupe_index(chat, key, ttl=None):
 
 def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
                 image=None, xml=None, cmd=None, timeout=None, label=None,
-                items=None, spec=None, file=None, ttl=None):
+                items=None, spec=None, file=None, extra=None, ttl=None):
     """登记一条待确认发送。kind 区分来源：agent（用户让助手发的）/ auto（自动回复草稿）。
 
     bot 对两者要求不一样：自动回复草稿只认明确的中文确认词，避免用户在控制
@@ -1741,11 +1762,25 @@ def set_pending(chat, to_wxid, to_name, text, kind="agent", count=1,
         而用户菜单里只有一条。
     `ttl` 只在判重时用来判断旧条目还活不活，**必须是 agent.confirm_ttl 的那个值**
     （和 bot 确认分支、save_pending 用同一个）；不传就用默认 300 秒。
+
+    `extra`（2026-10-04 加的，给**新 kind** 用）：一类动作自己的一包字段，
+    **整包存、整包还**。为什么加它而不是继续加具名参数：
+
+      `bot.restore_pending()` 是**逐字段白名单**传参的 —— 每加一个新字段就要记得
+      改**两处**（这里 + restore_pending），漏了不会报错，而是**重启后那条待确认项
+      静默退化成别的操作**。`label`（素材那条认不出是哪一条）、`items`/`spec`
+      （群发批次变成「没有收件人」，真机上是「发出去了但没人收到」）、`file`
+      （退化成一发段文字）**都踩过这个死法**。
+
+    所以**新 kind 的字段一律走 `extra`**，不再加具名参数；既有的 9 个具名参数
+    **一个都不动**（不动 = 不回归）。非 dict 一律当没给（不收垃圾）。
     """
     item = {"to_wxid": to_wxid, "to_name": to_name, "text": text,
             "image": image, "xml": xml, "file": file,
             "cmd": cmd, "timeout": timeout, "label": label,
             "items": items, "spec": spec,
+            # 新 kind 的一包字段。非 dict 当没给（绝不把垃圾存进队列再指望下游容错）。
+            "extra": extra if isinstance(extra, dict) else None,
             "kind": kind, "count": int(count or 1), "ts": time.time()}
     # ⚠️ **kind="auto" 不判重**（有意为之，别顺手加回来）：它和别的 kind 不是一类东西。
     # 那些是「用户/模型要求的一个动作」，重复要求 = 同一条动作；而自动回复草稿是
@@ -1893,6 +1928,19 @@ def describe_pending(item):
 
     kind = str(item.get("kind") or "agent")
     to_name = _mask_name(item.get("to_name"))
+
+    # 0) **注册过的待确认种类**（插件 / 核心模块自注册）先走它们自己的描述器。
+    #    内置那些（shell / file / image / broadcast / auto / agent）在下面按既有顺序
+    #    处理，**一个字都不改** —— 它们的文案有回归用例钉着。
+    _spec = plugins.REGISTRY.pending_kind(kind)
+    if _spec is not None:
+        try:
+            return str(_spec["describe"](item))
+        except Exception as e:
+            # 描述器出错时**绝不能编一句听着像那么回事的话** —— 用户是照着菜单
+            # 回「确认」的。如实说「认不出」，并明确让他先别确认。
+            _warn(f"待确认种类「{kind}」的描述器出错：{type(e).__name__}: {e}")
+            return f"（一条 {kind} 动作，但它的描述器出错了 —— 先不要确认）"
 
     # 1) 待确认执行的本地命令：显示原文（防提示词注入的关键）
     if kind == "shell":
@@ -2138,6 +2186,22 @@ def send_pending(client, item, interval=0.0, allowed_dirs=None, cfg=None):
     `cfg`：发**文件**那条分支要用它决定端点（`aixed_api.send_file_via`）。
     不给（None）就走默认端点，调用方拿不到配置时行为不变。
     """
+    # -1) **注册过的待确认种类**（插件 / 核心模块自注册）走它们自己的执行器。
+    #     内置那些在下面按既有顺序处理，一个字都不改。
+    #     ⚠️ 注册的是「怎么描述、怎么执行」，**不是另一条队列** —— 插件工具
+    #     走的仍是这一条确认闸，没有例外通道。
+    _spec = plugins.REGISTRY.pending_kind(str(item.get("kind") or "agent"))
+    if _spec is not None:
+        try:
+            n, err = _spec["apply"](item, {"cfg": cfg, "client": client})
+        except Exception as e:
+            # 执行出错要如实报，绝不假装成功（这一步已经是用户确认过的**真动作**）
+            return 0, f"执行出错：{type(e).__name__}: {e}"
+        try:
+            return int(n or 0), err
+        except (TypeError, ValueError):
+            return 0, f"执行器返回了奇怪的条数：{n!r}"
+
     wxid = item.get("to_wxid")
     # 0) 群发批次：`items` 是**逐字要发**的 [{wxid, name, text}]。
     #    中途失败**立刻停**并如实报「已发出 i/N，剩下的没发」——继续发等于在
