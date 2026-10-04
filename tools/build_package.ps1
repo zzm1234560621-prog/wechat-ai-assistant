@@ -54,7 +54,12 @@ Copy-Item (Join-Path $root 'config.example.yaml')   $pkg -Force
 Copy-Item (Join-Path $root 'settings.example.json') $pkg -Force
 
 # ── 3 · 文档与工具 ────────────────────────────────────────────────────
-foreach ($d in @('docs', 'tools')) {
+# ⚠️ **这里是一个显式清单，新目录必须手动加进来** —— 加漏了不会报错，
+# 而是「开发机上好用、发布包里静默失效」（本项目被咬过好几次）。
+# `plugins/` 是 2026-10-04 加的插件目录：少了它，README 里「复制 `plugins/_example.py`」
+# 就是死指令，而 `selftest_plugins.py` §11 会在朋友的机器上失败。
+# 回归：`selftest_portable.py` 有一条「代码要用的目录都在这个清单里」。
+foreach ($d in @('docs', 'tools', 'plugins')) {
     $p = Join-Path $root $d
     if (Test-Path $p) { Copy-Item $p $pkg -Recurse -Force }
 }

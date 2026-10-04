@@ -179,6 +179,42 @@ def main():
               "往上只退一级会得到 'AppData'——于是「禁用微信自动更新」去拒绝一个"
               "不存在的账户，静默失效")
 
+    # ── 5 · 打包脚本要收齐「代码要用到的目录」──────────────────────────
+    print("── 5 · build_package.ps1 的目录清单是不是齐的 ──")
+    # 为什么要有这一条（2026-10-04 差点漏出去）：`build_package.ps1` 里那段
+    # `foreach ($d in @('docs','tools', ...))` 是**显式清单**。加漏一个目录不会报错，
+    # 而是「开发机上好用、发布包里静默失效」—— 这次是 `plugins/`：
+    # 少了它，README 里「复制 `plugins/_example.py`」成了死指令，
+    # 而 `selftest_plugins.py` 的「模板存在」那条会在**朋友的机器上**失败。
+    bp = os.path.join(BASE, "tools", "build_package.ps1")
+    if not os.path.isfile(bp):
+        check("找得到 tools/build_package.ps1", False, bp)
+    else:
+        text = open(bp, "r", encoding="utf-8", errors="replace").read()
+        m = re.search(r"foreach\s*\(\s*\$d\s+in\s+@\(([^)]*)\)\s*\)", text)
+        listed = set()
+        if m:
+            listed = {s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()}
+        check("build_package.ps1 里有目录清单，且解析得到它", bool(listed), f"解析到：{listed}")
+
+        # 代码真正要用到的目录（相对仓库根）。**新增目录就加到这里** ——
+        # 然后上面那份清单忘了加，这份自测就会红。
+        need_dirs = {
+            "docs": "规格与笔记（README/CLAUDE.md 到处在指它们）",
+            "tools": "打包/自测用到的脚本（resize.ps1、office2text.ps1…）",
+            "plugins": "插件目录（`_example.py` 模板在这儿，README 让人复制它）",
+        }
+        missing = sorted(d for d in need_dirs
+                         if os.path.isdir(os.path.join(BASE, d)) and d not in listed)
+        check("每个代码要用到的目录都在打包清单里", not missing,
+              "漏了就会「开发机好用、发布包静默失效」：" +
+              "；".join(f"{d}（{need_dirs[d]}）" for d in missing))
+
+        # 反向：清单里写了、仓库里却没有的目录（无害，但说明清单过时了）
+        stale = sorted(d for d in listed if not os.path.isdir(os.path.join(BASE, d)))
+        if stale:
+            print(f"  ℹ️  清单里有仓库里不存在的目录（只是提示）：{stale}")
+
     print("=" * 64)
     if _ok:
         print("全部通过 ✅")
