@@ -28,6 +28,7 @@ import botctl
 import callgate
 import executor
 import file_read
+import files
 import groups
 import live_history
 import plugins
