@@ -34,12 +34,12 @@ _NAME_SEP = r"[、,，;；/]"
 
 _USAGE = (
     "用法（组名不能带空格；多个人用「、」隔开）：\n"
-    "  /分组                      看所有分组和成员\n"
-    "  /分组 建 <组名> <人名、人名>  建一个组\n"
-    "  /分组 加 <组名> <人名、人名>  往组里加人（组不存在就建）\n"
-    "  /分组 移 <组名> <人名、人名>  从组里移人\n"
-    "  /分组 删 <组名>             删掉整个组\n"
-    "  /分组 标签                  看**微信自带**的标签（只读，不算分组）\n"
+    "  /groups                    看所有分组和成员\n"
+    "  /groups add <组名> <人名、人名>   建一个组，或往已有的组里加人（不存在就建）\n"
+    "  /groups remove <组名> <人名、人名>  从组里移人\n"
+    "  /groups del <组名>           删掉整个组\n"
+    "  /groups labels                看**微信自带**的标签（只读，不算分组）\n"
+    "（中文子命令也还能用：/分组 建|加 / 移 / 删 / 标签）\n"
     "群发按组发：说「给大学同学组发…」，或 to=\"分组:大学同学\"；\n"
     "微信标签也能直接发：说「给亲人发…」，或 to=\"标签:亲人\"。"
 )
@@ -101,7 +101,7 @@ def status_text(cfg):
     gs = all_groups(cfg)
     if not gs:
         return ("还没有任何分组。\n"
-                "建一个：/分组 建 大学同学 张三、李四\n"
+                "建一个：/groups add 大学同学 张三、李四\n"
                 "（群发时就能说「给大学同学组发…」）")
     lines = [f"分组（{len(gs)}）："]
     for name in group_names(cfg):
@@ -131,7 +131,7 @@ def labels_text(client):
     """
     if client is None:
         return ("这条链路读不到微信标签（没有查库能力）。\n"
-                "自己建分组照样能群发：/分组 建 大学同学 张三、李四")
+                "自己建分组照样能群发：/groups add 大学同学 张三、李四")
     try:
         labs = live_history.label_names(client)
     except Exception as e:
@@ -157,7 +157,7 @@ def labels_text(client):
         lines.append(f"  · {l['name']}（{len(ws)} 人）")
     lines.append("")
     lines.append("群发按标签发：说「给<标签名>发…」，或 to=\"标签:<标签名>\"。")
-    lines.append("⚠️ 标签在微信那边改；这里只能看。要自己攒一份名单就用 /分组 建。")
+    lines.append("⚠️ 标签在微信那边改；这里只能看。要自己攒一份名单就用 /groups add。")
     return "\n".join(lines)
 
 
@@ -202,7 +202,7 @@ def _space_hint(names):
     if not bad:
         return ""
     return (f"（「{bad[0]}」里有空格。**组名不能带空格**，人名之间用「、」隔开，"
-            f"例：/分组 建 大学同学 张三、李四）")
+            f"例：/groups add 大学同学 张三、李四）")
 
 
 def _resolve_many(resolve, names, resolve_each):
@@ -280,7 +280,7 @@ def handle_command(arg, cfg, resolve=None, resolve_each=True, client=None):
             return _USAGE, False
         gname, namelist = bits[0].strip(), bits[1].strip()
         if gname not in gs:
-            return f"没有「{gname}」这个分组。发 /分组 看有哪些。", False
+            return f"没有「{gname}」这个分组。发 /groups 看有哪些。", False
         names = _split_names(namelist)
         if not names:
             return _USAGE, False
@@ -307,7 +307,7 @@ def handle_command(arg, cfg, resolve=None, resolve_each=True, client=None):
         if not gname:
             return _USAGE, False
         if gname not in gs:
-            return f"没有「{gname}」这个分组。发 /分组 看有哪些。", False
+            return f"没有「{gname}」这个分组。发 /groups 看有哪些。", False
         n = len(gs.pop(gname))
         _save(gs)
         return f"已删掉分组「{gname}」（原来 {n} 人）。人本身没动。", True

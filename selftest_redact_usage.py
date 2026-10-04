@@ -562,7 +562,7 @@ except Exception as _e:
 # /预算 的展示文案：关着和开着都要能读
 usage.USAGE_PATH = _budget_path
 _txt_off = usage.budget_text({"budget": {"daily_cost": 0}})
-chk("没开" in _txt_off and "/预算" in _txt_off, f"关着时告诉你怎么开：{_txt_off[:50]!r}")
+chk("没开" in _txt_off and "/budget" in _txt_off, f"关着时告诉你怎么开：{_txt_off[:50]!r}")
 _txt_on = usage.budget_text({"budget": {"daily_cost": 0.00001}})
 chk("已用" in _txt_on, f"开着时报已用多少：{_txt_on[:60]!r}")
 

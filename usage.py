@@ -411,11 +411,11 @@ def budget_block_text(cfg=None):
             f"到了你设的上限 {_fmt_cost(limit)}（`budget.daily_cost`）。\n"
             f"{note}\n"
             f"（这道闸只挡**模型调用**——查历史、发消息、定时这些不花钱的功能照旧。"
-            f"要放开就发 `/预算 <金额>`，或 `/预算 关`。）")
+            f"要放开就发 `/budget <金额>`，或 `/budget off`。）")
 
 
 def budget_text(cfg=None):
-    """`/预算` 命令的输出。"""
+    """`/budget` 命令的输出（中文命令词 `/预算` 也还能用）。"""
     limit, spent, blocked, note = budget_status(cfg)
     if limit <= 0:
         s = summary(days=1)
@@ -424,14 +424,14 @@ def budget_text(cfg=None):
                 if cur is not None else "最近 24 小时的调用算不出花费（没价目表）")
         return (f"💰 消费闸：**没开**（`budget.daily_cost` 是 0）。\n"
                 f"{tail}。\n"
-                f"要开就发：`/预算 20`（意思是最近 24 小时最多花 20 元；单位同 /用量）。")
+                f"要开就发：`/budget 20`（意思是最近 24 小时最多花 20 元；单位同 /usage）。")
     head = (f"💰 消费闸：上限 {_fmt_cost(limit)}（最近 24 小时），"
             f"已用约 {_fmt_cost(spent)}"
             + ("　→ **已到上限，正在拦模型调用**" if blocked else "　→ 还没到"))
     lines = [head]
     if note:
         lines.append(note)
-    lines.append("改：`/预算 <金额>`；关：`/预算 关`。")
+    lines.append("改：`/budget <金额>`；关：`/budget off`。")
     return "\n".join(lines)
 
 

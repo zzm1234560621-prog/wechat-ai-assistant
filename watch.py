@@ -34,13 +34,14 @@ _BOMB = re.compile(r"\([^()]*[+*]\)[+*]")
 
 _USAGE = (
     "用法：\n"
-    "  /盯着 —— 看名单\n"
-    "  /盯着 加 <昵称|wxid|roomid> —— 他发消息就通知我（不回他）\n"
-    "  /盯着 删 <昵称|wxid>\n"
-    "  /盯着 开|关 —— 总开关\n"
-    "  /盯着 关键词 <正则> —— **任何会话**里出现这个模式就通知我（不回）\n"
-    "  /盯着 关键词        —— 看已有关键词\n"
-    "  /盯着 关键词 删 <正则>\n"
+    "  /watch —— 看名单\n"
+    "  /watch add <昵称|wxid|roomid> —— 他发消息就通知我（不回他）\n"
+    "  /watch del <昵称|wxid>\n"
+    "  /watch on|off —— 总开关\n"
+    "  /watch keyword <正则> —— **任何会话**里出现这个模式就通知我（不回）\n"
+    "  /watch keyword        —— 看已有关键词\n"
+    "  /watch keyword del <正则>\n"
+    "（中文子命令也还能用：/watch 加|删 / 开|关 / 关键词）\n"
     "群也能盯：群填 roomid（形如 xxx@chatroom）。\n"
     "⚠️ 关键词只看**文本消息**，而且只扫每条消息的**前 %d 个字符**"
     "（正则回溯会卡住收消息线程，所以必须有上限）。" % KEYWORD_SCAN_CHARS
@@ -91,7 +92,7 @@ def check_pattern(pattern):
     """
     p = str(pattern or "").strip()
     if not p:
-        return False, "关键词是空的。用法：/盯着 关键词 <正则>，例如 /盯着 关键词 报价|合同"
+        return False, "关键词是空的。用法：/watch 关键词 <正则>，例如 /盯着 关键词 报价|合同"
     if len(p) > KEYWORD_MAX_LEN:
         return False, (f"这个正则太长了（{len(p)} 字 > 上限 {KEYWORD_MAX_LEN}）。"
                        f"写短一点：只保留真正要匹配的那几个词。")
@@ -162,12 +163,12 @@ def status_text(cfg):
     lines = [f"盯着：{'开启' if enabled(cfg) else '已关闭'}",
              f"名单（{len(recs)}）："]
     if not recs:
-        lines.append("  （空）发 /盯着 加 <昵称|wxid> 添加")
+        lines.append("  （空）发 /watch 加 <昵称|wxid> 添加")
     for r in recs:
         lines.append(f"  · {r.get('name') or r.get('wxid')}（{r.get('wxid')}）")
     lines.append(f"关键词（{len(kws)}）：")
     if not kws:
-        lines.append("  （空）发 /盯着 关键词 <正则> 添加，例如 /盯着 关键词 报价|合同")
+        lines.append("  （空）发 /watch 关键词 <正则> 添加，例如 /盯着 关键词 报价|合同")
     for k in kws:
         lines.append(f"  · {k['raw']}")
     lines.append("")
@@ -235,7 +236,7 @@ def handle_command(arg, cfg, resolve, name_hint=None):
 
     if sub in ("off", "关", "关闭"):
         _save(enabled=False, chats=recs)
-        return "盯着已关闭，名单保留着（发 /盯着 开 恢复）。", True
+        return "盯着已关闭，名单保留着（发 /watch 开 恢复）。", True
 
     if sub in ("add", "加", "添加"):
         if not rest:
@@ -257,7 +258,7 @@ def handle_command(arg, cfg, resolve, name_hint=None):
         if rec is None:
             recs.append({"wxid": wxid, "name": disp})
             _save(chats=recs, enabled=enabled(cfg))
-            tail = "" if enabled(cfg) else "\n（盯着总开关是关着的，发 /盯着 开 才会生效）"
+            tail = "" if enabled(cfg) else "\n（盯着总开关是关着的，发 /watch 开 才会生效）"
             return f"已开始盯着：{disp}。他发消息我会通知你，不回他。{tail}", True
         if rec.get("name") != disp:      # 昵称变了顺手更新
             rec["name"] = disp
@@ -272,7 +273,7 @@ def handle_command(arg, cfg, resolve, name_hint=None):
         wxid = str(cand.get("wxid")) if not err and cand else rest
         rec = _find(recs, wxid) or _find(recs, rest)
         if rec is None:
-            return f"名单里没有「{rest}」。发 /盯着 看名单。", False
+            return f"名单里没有「{rest}」。发 /watch 看名单。", False
         _save(chats=[r for r in recs if r is not rec], enabled=enabled(cfg))
         return f"已不再盯着：{rec.get('name') or rec.get('wxid')}。", True
 
@@ -283,17 +284,17 @@ def handle_command(arg, cfg, resolve, name_hint=None):
                 return ("还没有关键词。\n" + _USAGE), False
             return ("已有关键词（**任何会话**里命中都会通知我）：\n"
                     + "\n".join(f"  · {k['raw']}" for k in kws)
-                    + "\n\n删除：/盯着 关键词 删 <正则>\n"
+                    + "\n\n删除：/watch 关键词 删 <正则>\n"
                       f"⚠️ 只扫**文本**消息的前 {KEYWORD_SCAN_CHARS} 个字符。"), False
         head, _, tail_arg = rest.partition(" ")
         if head.lower() in ("del", "delete", "删", "删除", "移除"):
             target = tail_arg.strip()
             if not target:
-                return "用法：/盯着 关键词 删 <正则>", False
+                return "用法：/watch 关键词 删 <正则>", False
             kws = keywords(cfg)
             kept = [k for k in kws if k["raw"] != target and k["pattern"] != target]
             if len(kept) == len(kws):
-                return f"关键词里没有「{target}」。发 /盯着 关键词 看已有的。", False
+                return f"关键词里没有「{target}」。发 /watch 关键词 看已有的。", False
             _save(keywords=kept, chats=recs, enabled=enabled(cfg))
             return f"已删除关键词「{target}」。", True
         ok, why = check_pattern(rest)
@@ -304,7 +305,7 @@ def handle_command(arg, cfg, resolve, name_hint=None):
             return f"关键词「{rest}」已经在里面了。", False
         kws.append({"pattern": rest, "raw": rest})
         _save(keywords=kws, chats=recs, enabled=enabled(cfg))
-        tail = "" if enabled(cfg) else "\n（盯着总开关是关着的，发 /盯着 开 才会生效）"
+        tail = "" if enabled(cfg) else "\n（盯着总开关是关着的，发 /watch 开 才会生效）"
         return (f"已加入关键词「{rest}」：任何会话里命中就通知我（不回他）。\n"
                 f"⚠️ 只看**文本**消息，而且只扫每条消息的前 {KEYWORD_SCAN_CHARS} 个字符"
                 f"——出现在很后面的词匹配不到。{tail}"), True

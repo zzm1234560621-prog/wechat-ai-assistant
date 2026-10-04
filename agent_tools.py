@@ -2661,7 +2661,7 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None,
         if not out:
             return [], "list", ("自动回复名单是空的，没有可群发的人。"
                                 "要么先 /auto add 几个人，要么建个分组"
-                                "（/分组 建 大学同学 张三、李四），"
+                                "（/groups add 大学同学 张三、李四），"
                                 "或者说「所有人」发给所有好友。")
         return out, "list", ""
 
@@ -2681,7 +2681,7 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None,
             have = "、".join(groups.group_names(cfg)) or "（还没有任何分组）"
             return [], "group", (f"没有「{gname}」这个分组，我**一个人都没发**。"
                                  f"现有分组：{have}。"
-                                 f"要新建就发 /分组 建 {gname} 张三、李四。")
+                                 f"要新建就发 /groups add {gname} 张三、李四。")
         ms = gs[gname]
         if not ms:
             return [], "group", f"分组「{gname}」是空的，没有可发的人。"
@@ -2705,7 +2705,7 @@ def broadcast_recipients(contacts, cfg, to="", self_wxid="", aliases=None,
         if client is None:
             return [], "label", ("这条链路读不到微信标签，我**一个人都没发**。"
                                  "要发给一组人可以先自己建一个分组："
-                                 "/分组 建 <组名> 张三、李四。")
+                                 "/groups add <组名> 张三、李四。")
         try:
             labs = live_history.label_names(client)
         except Exception as e:
@@ -4805,7 +4805,7 @@ class ToolBox:
             # 发旧的那张（那是发错东西，且不可逆）。如实说清楚，让用户换个方式重发。
             return items, ("控制会话里有一张更新的图，但我既拿不到它的明文、也取不到它的"
                            "原始内容，所以这次**一张都没发**。请让用户重发一次"
-                           "（**以「文件」方式发**才有明文可发），或者用 /素材 看看"
+                           "（**以「文件」方式发**才有明文可发），或者用 /assets 看看"
                            "暂存区里现在有什么。")
         try:
             items, _added, _dropped = assets.stash(

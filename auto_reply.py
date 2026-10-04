@@ -1099,9 +1099,10 @@ _USAGE = (
     "/auto del <昵称|wxid>\n"
     "/auto mode <昵称|wxid> self|assistant   身份（self=假装你本人 / assistant=明说是助手）\n"
     "/auto persona <昵称> [描述]   这个人的语气人设；不带描述=看，清空=恢复默认\n"
-    "/auto persona <昵称> 学习     从你和他的历史对话里学语气+称呼（覆盖已有的）\n"
+    "/auto persona <昵称> learn    从你和他的历史对话里学语气+称呼（覆盖已有的）\n"
     "/auto address <昵称> [称呼]   你平时怎么叫他；不带=看，清空=不套称呼\n"
-    "/auto address <昵称> 学习     只从历史里学称呼，**一个字都不动人设**\n"
+    "/auto address <昵称> learn    只从历史里学称呼，**一个字都不动人设**\n"
+    "（中文参数也还能用：学习 / 清空 / 全局 —— 命令词用 /auto 不变）\n"
     "  ⚠️ 称呼**不要求**他在自动回复名单里（名单外的人也能设/学/清）；\n"
     "     名字带空格也行：/auto address Johny 黄 儿子 阿黄\n"
     "/auto persona 全局 [self|assistant] [描述]   没单独设的人用的默认人设\n"
@@ -1227,7 +1228,7 @@ def handle_command(arg, cfg, client, can_lookup=True, name_hint=None,
         if wxid in watch.chats(cfg):
             return (f"{disp} 已经在「盯着」名单里了（只通知、不回他）。自动回复是"
                     f"「代你回」，两边同时开既通知又回复，是互斥的——想自动回复就先发"
-                    f" /盯着 删 {disp}。"), False
+                    f" /watch del {disp}。"), False
 
         rec = next((r for r in recs if str(r.get("wxid")) == wxid), None)
         disp = str(name_hint or "").strip() or disp

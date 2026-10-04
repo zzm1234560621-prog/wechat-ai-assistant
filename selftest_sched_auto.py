@@ -281,7 +281,7 @@ def t4_mutual_exclusion():
         client = FakeClient(_CONTACTS)
         out, changed = auto_reply.handle_command("add 李四", cfg, client)
         chk(not changed, "拒了，没改配置")
-        chk("盯着" in out and "互斥" in out and "/盯着 删" in out,
+        chk("盯着" in out and "互斥" in out and "/watch del" in out,
             f"错误文案说清「二选一」并给了怎么解（实际：{out}）")
         chk(tmp.read()["auto_reply"]["chats"] == [], "名单没被写进去")
 
@@ -416,8 +416,8 @@ def t7_id_not_reused():
 
 def t8_usage_matches_impl():
     print("T8. _USAGE 文案和实际子命令对得上")
-    chk("开|关 —— 总开关" in scheduler._USAGE and "编号|all" not in scheduler._USAGE,
-        "定时文案不再承诺 /定时 开|关 <编号|all>")
+    chk("on|off —— 总开关" in scheduler._USAGE and "编号|all" not in scheduler._USAGE,
+        "定时文案不再承诺 on|off <编号|all>")
     # 文案里承诺的每个子命令，都要在 handle_command 里真的有人接
     for frag in ("/auto on | off", "add", "del", "mode", "persona", "address",
                  "学习", "review", "ctx"):

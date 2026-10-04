@@ -315,14 +315,14 @@ def _yn(v):
 # （项目里 review/persona 撞名那次就是因为两处各有一套说法，用户必然改错东西。）
 BOT_ROUTES = {
     "自动回复": "/auto", "auto": "/auto", "回复": "/auto",
-    "盯着": "/盯着", "watch": "/盯着", "监听": "/盯着",
-    "定时": "/定时", "schedule": "/定时", "任务": "/定时",
-    "分组": "/分组", "group": "/分组",
-    "预算": "/预算", "budget": "/预算",
-    "用量": "/用量", "usage": "/用量", "花费": "/用量",
-    "素材": "/素材", "图片": "/素材",
-    "导出": "/导出", "export": "/导出",
-    "自检": "/自检", "体检": "/自检",
+    "盯着": "/watch", "watch": "/watch", "监听": "/watch",
+    "定时": "/schedule", "schedule": "/schedule", "任务": "/schedule",
+    "分组": "/groups", "group": "/groups",
+    "预算": "/budget", "budget": "/budget",
+    "用量": "/usage", "usage": "/usage", "花费": "/usage",
+    "素材": "/assets", "图片": "/assets",
+    "导出": "/export", "export": "/export",
+    "自检": "/selfcheck", "体检": "/selfcheck",
     "状态": "/status", "status": "/status",
     "帮助": "/help", "help": "/help",
     "模型": "/provider", "provider": "/provider", "服务商": "/provider",
@@ -651,7 +651,7 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None, chat=None):
 
     if cmd in ("/导出", "/export"):
         if not arg:
-            return ("用法：/导出 <昵称|备注|微信号>　把这个会话的对话导成一个可读文件。\n"
+            return ("用法：/export <昵称|备注|微信号>　把这个会话的对话导成一个可读文件。\n"
                     "（只导**文本**消息；文件落在导出目录里，会顺带清理旧的导出。）"), False
         fresh = settings.effective(load_config())
         try:
@@ -669,7 +669,7 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None, chat=None):
             try:
                 days = max(1, min(365, int(arg)))
             except (TypeError, ValueError):
-                return "用法：/用量 [天数]，例如 /用量 30", False
+                return "用法：/usage [天数]，例如 /usage 30", False
         try:
             return usage.summarize(days), False
         except Exception as e:
@@ -692,14 +692,14 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None, chat=None):
         if low in ("关", "关闭", "off", "0", "不限", "none", "清空"):
             settings.set_value("budget", {"daily_cost": 0})
             return ("消费闸已关闭（`budget.daily_cost = 0`），模型调用不再受它限制。"
-                    "\n（`/用量` 照样能看花了多少。）"), True
+                    "\n（`/usage` 照样能看花了多少。）"), True
         try:
             v = float(a)
         except (TypeError, ValueError):
-            return ("用法：`/预算` 看状态；`/预算 20` 设上限（元 / 最近 24 小时）；"
-                    "`/预算 关` 关闭。"), False
+            return ("用法：`/budget` 看状态；`/budget 20` 设上限（元 / 最近 24 小时）；"
+                    "`/budget off` 关闭。"), False
         if not (v > 0):                      # 含 NaN / inf / 负数
-            return ("上限要是一个正数，例如 `/预算 20`；要关掉就发 `/预算 关`。"), False
+            return ("上限要是一个正数，例如 `/budget 20`；要关掉就发 `/budget off`。"), False
         settings.set_value("budget", {"daily_cost": v})
         return (f"消费闸已开：**最近 24 小时**最多花 {v:g}（`budget.daily_cost`）。\n"
                 f"到上限时会**拒绝调用模型**并告诉你是哪条在拦；"

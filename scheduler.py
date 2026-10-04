@@ -40,18 +40,19 @@ _WEEKDAY_CN = "一二三四五六日"
 
 _USAGE = (
     "用法（也可以直接跟助手说「明天9点提醒我给张三发…」）：\n"
-    "  /定时 —— 看列表\n"
-    "  /定时 加 <时间> <对象> <内容> —— 加一个发文本的\n"
-    "  /定时 加提醒 <时间> <内容> —— 到点**提醒我**（发回本会话），不用填对象\n"
-    "  /定时 加提问 <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
-    "  /定时 删 <编号> —— 删掉\n"
-    "  /定时 开|关 —— 总开关（只有这两个子命令，不能带编号）\n"
+    "  /schedule —— 看列表\n"
+    "  /schedule add <时间> <对象> <内容> —— 加一个发文本的\n"
+    "  /schedule remind <时间> <内容> —— 到点**提醒我**（发回本会话），不用填对象\n"
+    "  /schedule ask <时间> <问题> —— 到点让助手答这个问题，答案发回本会话\n"
+    "  /schedule del <编号> —— 删掉\n"
+    "  /schedule on|off —— 总开关（只有这两个子命令，不能带编号）\n"
     "时间写法：9:00 是每天，明天9:00 是只一次，"
     "10-02 9:00 也是只一次，每周一 9:00 是每周，每30分钟 是每隔一段，"
     "10分钟后 / 10分钟之后 / 半小时后 / 2小时后 / 3天后 是只一次（从**现在**起算）。\n"
-    "例：/定时 加 明天9:00 张三 记得带伞\n"
-    "    /定时 加提醒 10分钟之后 喝水\n"
-    "    /定时 加提问 每天8:00 整理一下谁还没回我、昨天有什么漏的"
+    "例：/schedule add 明天9:00 张三 记得带伞\n"
+    "    /schedule remind 10分钟之后 喝水\n"
+    "    /schedule ask 每天8:00 整理一下谁还没回我、昨天有什么漏的\n"
+    "（中文子命令也还能用：/定时 加 / 加提醒 / 加提问 / 删 / 开|关）"
 )
 
 
@@ -352,7 +353,7 @@ def status_text(cfg):
         return head + "\n还没有任务。\n\n" + _USAGE
     lines = [head, ""]
     lines += ["  " + describe(t) for t in recs]
-    lines += ["", "改完发 /定时 看最新状态。"]
+    lines += ["", "改完发 /schedule 看最新状态。"]
     return "\n".join(lines)
 
 
@@ -495,7 +496,7 @@ def _bad_task(t, reason, warn):
         return
     try:
         warn(f"⏰ 定时任务 [{tid}] 数据有问题，本轮**只跳过它自己**，"
-             f"其他任务照常：{reason}。发 /定时 删 {tid} 可删掉，或 /定时 看列表核对。")
+             f"其他任务照常：{reason}。发 /schedule del {tid} 可删掉，或 /schedule 看列表核对。")
     except Exception:
         # warn 不该抛，真抛了就算了：不能因为「报警失败」把调度搞停
         pass
@@ -599,16 +600,16 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None)
         if not rest:
             _save(enabled=False, tasks=recs)
             return ("定时总开关已关闭，所有任务都不会触发。"
-                    "（再发 /定时 开 恢复时，每个任务会按各自时间**重新排下一次**，"
+                    "（再发 /schedule 开 恢复时，每个任务会按各自时间**重新排下一次**，"
                     "不会把暂停期间漏掉的补发出去。）"), True
         return f"已暂停：{_touched(_toggle(recs, rest, False) or recs, rest)}", True
 
     if sub in ("del", "delete", "删", "删除"):
         if not rest:
-            return "用法：/定时 删 <编号>（编号见 /定时）", False
+            return "用法：/schedule del <编号>（编号见 /schedule）", False
         keep = [t for t in recs if str(t.get("id")) != rest]
         if len(keep) == len(recs):
-            return f"没有编号 {rest} 的任务。发 /定时 看列表。", False
+            return f"没有编号 {rest} 的任务。发 /schedule 看列表。", False
         _save(tasks=keep)
         _retire_id(rest)      # 本次运行内不再把 rest 发给新任务（编号撞了就删错人）
         return f"已删除任务 {rest}。", True
@@ -641,13 +642,13 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None)
             text = _drop_self_token(tail)
             who = ""
             if not text:
-                return "要说清楚提醒什么。例：/定时 加提醒 10分钟之后 喝水", False
+                return "要说清楚提醒什么。例：/schedule remind 10分钟之后 喝水", False
         elif want_ask:
             # 提问式：整段剩下的话就是问题，不用解析对象（答案回控制会话）
             text = " ".join(tail).strip()
             who = ""
             if not text:
-                return "要说清楚问什么。例：/定时 加提问 每天8:00 整理谁还没回我", False
+                return "要说清楚问什么。例：/schedule ask 每天8:00 整理谁还没回我", False
         else:
             if not tail:
                 return _USAGE, False
@@ -690,11 +691,11 @@ def handle_command(arg, cfg, resolve, can_lookup=True, name_hint=None, now=None)
         _save(tasks=recs)
         tail_msg = ("" if enabled(cfg) else
                     "\n（定时总开关是关着的，这次只登记了任务，不会触发；"
-                    "发 /定时 开 才会生效）")
+                    "发 /schedule 开 才会生效）")
         warn = ("\n\n⚠️ 语音通话的发送路径还没打通，到点只会给你报错，不会真打出去。"
                 if want_call else "")
         return (f"已加定时任务 [{task['id']}]：{describe(task)}\n"
-                f"改完发 /定时 看列表。{tail_msg}{warn}"), True
+                f"改完发 /schedule 看列表。{tail_msg}{warn}"), True
 
     return _USAGE, False
 
