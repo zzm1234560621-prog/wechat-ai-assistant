@@ -12,8 +12,10 @@
 需要读配置时就**在函数里延迟导入**，并且自己兜住异常（见 `_status_page`）。
 """
 import os
+import re
 import subprocess
 import sys
+import time
 
 import botctl
 import envsetup as env
@@ -22,6 +24,13 @@ BASE = env.BASE
 
 # hook 相关脚本（都在 installers\wechat-4.1.10.27\ 下，**都要管理员**）
 HOOK_DIR = os.path.join(BASE, "installers", "wechat-4.1.10.27")
+
+# 本主线唯一支持的微信版本。hook（version.dll）是按 4.1.10.27 的**函数偏移**编译的，
+# 换个版本就注不进去——而且**不报错**：DLL 会被微信正常加载、只是挂钩失败，
+# 30001 永远没人监听，用户看到的只有 bot 一直「连不上 30001」。
+# ⚠️ 这个字面量与 installers/wechat-4.1.10.27/_common.ps1 里那份 $WX_WANTED_VERSION
+#    必须一致（selftest_portable.py 盯着这一对），改一处就得改另一处。
+WANTED_WEIXIN = "4.1.10.27"
 
 
 def _ps_quote(s):
@@ -323,6 +332,12 @@ def act_log_tail():
 
 
 def act_hook(script, what):
+    # 装 hook / 装回 hook 之前先过版本闸：版本不对时装了也不生效（见 ensure_weixin_version）。
+    # 「摘 hook」**不过闸** —— 想摘的时候，版本对不对都得能摘掉。
+    if script in ("do_hook_install.ps1", "do_restore_hook.ps1"):
+        if not ensure_weixin_version():
+            return ("已中止：微信版本不是 " + WANTED_WEIXIN + "，装 hook 不会生效。\n"
+                    "    想先排查可以先看 助手.bat → [8] → [5] 查看微信版本。")
     if not _confirm(f"确认「{what}」？可能要管理员权限。(y/N) "):
         return "已取消。"
     ok, msg = run_ps1(script)
@@ -375,6 +390,182 @@ def act_search_stop():
     return ("[√] " if ok else "[!] ") + msg
 
 
+# ── 装 hook 之前的版本闸（微信版本 = 整件事的前置条件）──────────────────
+# 为什么要有这一段（2026-10-04 真机）：另一台电脑上微信是 4.1.15.13，用户按 [9] 一键配置
+# 走完一遍——version.dll 放进了微信目录、hook-install-log.txt 写着「已放置，SHA256 = …」，
+# 看起来全部成功，可 30001 从来没有被监听，bot 就一直重试「连不上 30001」。
+# 根因：hook 只支持 4.1.10.27；版本不对时 DLL 会被**正常加载**却挂钩失败，**不报错**。
+# 所以「装 hook」前面必须先过这一关，而且要能顺手把版本换对（包里自带官方安装程序）。
+
+def weixin_version_action(version):
+    """纯函数：按检测到的微信版本决定「装 hook」之前该做什么。
+
+      "ok"        —— 就是 WANTED_WEIXIN，直接装
+      "downgrade" —— 明确是别的版本：必须先换成 WANTED_WEIXIN，否则装了也不生效
+      "unknown"   —— 读不出版本（没装 / 拿不到文件版本资源）。**不许当成 mismatch**：
+                     读不出不等于版本不对，一律拦住会挡住本来能装的机器，交给调用方如实问。
+    """
+    v = str(version or "").strip().split(" ")[0]
+    if not v:
+        return "unknown"
+    return "ok" if v == WANTED_WEIXIN else "downgrade"
+
+
+def parse_install_log(text):
+    """纯函数：从 do_install.ps1 写的 install-log.txt 里读回 (exit code, 装完的版本)。
+
+    为什么非读日志不可：do_install.ps1 是在**另一个提权窗口**里跑的，输出回不来、
+    退出码也拿不到。「装上了」只能靠它自己写下的证据：exit code 是 0，**且**装完的
+    ProductVersion 真的等于目标版本。读不到就返回 (None, None)，调用方必须如实说
+    「没验成」——退出码 0 也可能是「跑完了但还是旧版本」，只看退出码就是假成功。
+    """
+    code, ver = None, None
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        m = re.search(r"exit code:\s*(-?\d+)", s)
+        if m:
+            code = int(m.group(1))
+        m = re.search(r"Weixin\.exe ProductVersion\s*=\s*(\S+)", s)
+        if m:
+            ver = m.group(1)
+    return code, ver
+
+
+def detect_weixin():
+    """探测本机微信版本，返回 `(version, install, err)`。
+
+    ⚠️ `wechat_version` **延迟导入**：本文件顶层只许有标准库 + envsetup（见模块头注释）
+    ——顶层一旦 import 崩了，「装依赖」这条自救路自己就先死了。
+    探测失败也绝不抛：这里只是「先看一眼」，不该拦住控制台。
+    """
+    try:
+        import wechat_version as wv
+        info = wv.detect()
+    except Exception as e:                  # noqa: BLE001 —— 探测失败一律降级成「不知道」
+        return "", "", f"{type(e).__name__}: {e}"
+    if not info:
+        return "", "", ""
+    return str(info.get("version") or ""), str(info.get("install") or ""), ""
+
+
+def _installer_exe():
+    return os.path.join(HOOK_DIR, "WeChatWin_" + WANTED_WEIXIN + ".exe")
+
+
+def ensure_weixin_version(ask=True):
+    """装 hook 前的版本闸。True = 版本对（或用户明确要继续），False = 别往下走。
+
+    两级守卫里的**外面那一级**：拦在「装之前」，并且能顺手把版本换对。
+    `do_hook_install.ps1` 里那道闸是**里面那一级**，管手敲命令 / 直接双击脚本的人。
+    两级都要有——只留 .ps1 那道的话，用户在一个提权新窗口里看不到结果，还是会以为装完了。
+    """
+    ver, install, err = detect_weixin()
+    action = weixin_version_action(ver)
+
+    if action == "ok":
+        print(f"    [√] 微信版本 {ver} —— 正是本 hook 唯一支持的版本。")
+        return True
+
+    if action == "unknown":
+        print("    [!] 没检测到微信，或读不出微信版本号。")
+        if err:
+            print(f"        探测出错：{err}")
+        if not install:
+            print("        这台电脑看起来还没装微信电脑版。")
+        print(f"        hook 是按微信 **{WANTED_WEIXIN}** 编译的；版本不对时它**不报错**，"
+              "只是 30001 永远没人监听。")
+        exe = _installer_exe()
+        if os.path.isfile(exe):
+            # 「没装微信」和「版本不对」要走的其实是同一条路：装包里那份 4.1.10.27。
+            print("        包里有官方安装程序，可以顺手装上：")
+            print("          " + exe)
+            if ask and _confirm(f"        现在静默安装 {WANTED_WEIXIN} 吗？(Y/n) ",
+                                default_no=False):
+                return _install_weixin()
+        else:
+            print(f"        ⚠️ 包里没有安装程序（{exe}）——得先自己装好 {WANTED_WEIXIN}。")
+        return _confirm("        跳过检查、仍然继续装 hook？(y/N) ")
+
+    # action == "downgrade"
+    print(f"    [!] 这台电脑的微信是 **{ver}**，而 hook 只支持 **{WANTED_WEIXIN}**。")
+    print("        版本不对时 DLL 会被正常加载，但挂钩失败——**不报错、不崩**，")
+    print("        只是 30001 永远没人监听（bot 就一直「连不上 30001」）。")
+    print("        包里自带官方安装程序，可以就地换成 " + WANTED_WEIXIN + "：")
+    print("          " + _installer_exe())
+    print("        ⚠️ 它先结束微信进程，装完**要重新扫码登录**（会掉一次登录态）。")
+    if not ask:
+        return False
+    if not _confirm(f"        现在静默安装 {WANTED_WEIXIN} 吗？(Y/n) ", default_no=False):
+        print("        已跳过。版本没换之前，装 hook 这一步不会有意义。")
+        return False
+    return _install_weixin()
+
+
+def _install_weixin():
+    """静默装包里那份 4.1.10.27，并**复核**结果。True = 确实装上了。
+
+    「版本不对」和「压根没装」走同一条路，所以两个分支共用它，别各写一份。
+    """
+    ok, msg = run_ps1("do_install.ps1")
+    print(("[√] " if ok else "[!] ") + msg)
+    if not ok:
+        return False
+    return _verify_downgrade(time.time())
+
+
+def _wait_install_done(t0, timeout=300):
+    """等 `do_install.ps1` 在新窗口里真的跑完；返回它的日志正文，超时返回 None。
+
+    ⚠️ **必须等**：`run_ps1` 是「拉起一个新窗口就返回」的异步动作，而那次安装要几十秒
+    （239MB 的安装包，本机实测约 1 分钟）。立刻去读日志，读到的必然是上一轮的旧日志或
+    写了一半的日志 —— 于是「还在装」会被误报成「没换成」。判据用日志里的 `=== DONE ===`
+    并且文件 mtime 要晚于我们发起的那一刻（否则读到的就是上一次运行留下的那份）。
+    """
+    p = os.path.join(HOOK_DIR, "install-log.txt")
+    print("        安装中（几十秒到几分钟；它自己写完了才会往下走）…", end="", flush=True)
+    t = time.time()
+    last_dot = t
+    while time.time() - t < timeout:
+        try:
+            if os.stat(p).st_mtime >= t0:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                if "=== DONE ===" in text:
+                    print(" 完成")
+                    return text
+        except OSError:
+            pass
+        time.sleep(3)
+        if time.time() - last_dot >= 15:
+            print(".", end="", flush=True)
+            last_dot = time.time()
+    print("\n    [!] 等了 %d 秒还没看到安装完成（日志也没更新）。" % timeout)
+    print("        可能：UAC 被点了「否」、安装器被安全软件拦住，或安装包放的位置不对。")
+    return None
+
+
+def _verify_downgrade(t0):
+    """换完版本之后**复核**：读 do_install.ps1 留下的 install-log.txt。
+
+    提权窗口里的输出回不来，「跑过了」不等于「装上了」——唯一的凭据是那份日志。
+    验不过就如实说没换成，**绝不往后走**（否则又是一个「装了半天、端口不通」）。
+    """
+    text = _wait_install_done(t0)
+    if text is None:
+        return False
+    p = os.path.join(HOOK_DIR, "install-log.txt")
+    code, ver = parse_install_log(text)
+    print(f"    安装日志：exit code = {code}，装完版本 = {ver or '（没读到）'}")
+    if code == 0 and ver == WANTED_WEIXIN:
+        print(f"    [√] 已经是 {WANTED_WEIXIN} 了。接下来装 hook，装完**打开微信扫码登录**。")
+        return True
+    print(f"    [X] **没换成 {WANTED_WEIXIN}**（日志：{p}）。")
+    print("        常见原因：UAC 被点了「否」、被安全软件拦住，或安装程序弹了")
+    print("        「你已安装新版本的微信，安装更早的版本？」而没人点「继续安装」。")
+    print("        修好之后按一次 [9]，或自己双击那个 exe 选「继续安装」。")
+    return False
+
+
 def first_run():
     """**第一次装**：把「别人想用的话该点哪儿」变成一次点击。
 
@@ -382,11 +573,16 @@ def first_run():
     可它原来藏在 `[8] 更多… → [7] Hook → [1] 装 hook` 里——
     第一次拿到这个包的人根本不会翻到那儿。用户问「别人想用的话点哪个呢」才暴露出来。
     所以把它摆到顶层，按真实顺序走一遍。
+
+    ⚠️ 第 0 步（2026-10-04 加）**不是可有可无的**：钩子是**版本锁死**的，微信不是
+   4.1.10.27 时装 hook 会"成功"但永不生效（不报错、端口不通）。排在装 hook 之前，
+   是因为版本不对时后面每一步都是白做。
     """
     print()
     print("=" * 46)
-    print("  一键配置（装 hook → 装依赖 → 启动 → 配模型；一路回车即可）")
+    print("  一键配置（查微信版本 → 装 hook → 装依赖 → 启动 → 配模型；一路回车即可）")
     print("=" * 46)
+    print("  0) 查微信版本（不对就用包里自带的那份换成 " + WANTED_WEIXIN + "）")
     print("  1) 把 hook 装进微信（要管理员，会弹 UAC）")
     print("  2) 装 Python 依赖")
     print("  3) 启动助手，然后在微信里配 API Key")
@@ -396,6 +592,17 @@ def first_run():
     print("     winget install -e --id Python.Python.3.11")
     print()
 
+    # ── 0 · 微信版本 ──
+    # 为什么放在最前面：hook 只支持 4.1.10.27，版本不对时**装 hook 会"成功"但永不生效**
+    # （DLL 被正常加载、挂钩失败、30001 一直没人监听），用户只看到 bot 反复「连不上 30001」。
+    # 2026-10-04 真机：另一台电脑微信是 4.1.15.13，[9] 走完一遍日志全绿、端口从没通。
+    print("--- 第 0 步：微信版本 ---")
+    if not ensure_weixin_version():
+        print("    [!] 微信版本不是 " + WANTED_WEIXIN + "，后面的步骤先不做了。")
+        print("        （版本换好之后再按一次 [9] 即可。）")
+        return None
+    print()
+
     # ── 1 · 装 hook ──
     ps1 = os.path.join(HOOK_DIR, "do_hook_install.ps1")
     print("--- 第 1 步：装 hook ---")
@@ -403,7 +610,7 @@ def first_run():
         print(f"[!] 包里没有装 hook 的脚本（{ps1}）——包可能不完整。")
     else:
         print("    它会把 version.dll 放进微信目录，并挡住微信自动更新把版本顶掉。")
-        print("    要求微信版本是 **4.1.10.27**（微信里「设置 → 关于微信」看一眼）。")
+        print("    要求微信版本是 **" + WANTED_WEIXIN + "**（上面那步已经确认过了）。")
         if _confirm("    现在装？(Y/n) ", default_no=False):
             ok, msg = run_ps1("do_hook_install.ps1")
             print(("[√] " if ok else "[!] ") + msg)
@@ -526,16 +733,28 @@ def menu():
 
 
 def main():
-    """入口。带 `first` 参数就直接进「一键配置」，不用先看菜单（便于脚本化 / 自动化）。
+    """入口。带 `first` 参数就直接进「一键部署」，走完就结束（便于脚本化 / 自动化）。
 
-    日常口径只有一个：**双击 `助手.bat` 看菜单**，第一次用按 `[9]`。
-    （我一度另外扔了一个根目录的 `一键配置.bat`，用户指出「在助手.bat里面有个选项就行」——
-    所以撤掉了：**多一个入口就是多一处要维护、也多一个「到底点哪个」的疑问**。）
+    两个入口，各有明确分工：
+      * `助手.bat` —— 日常菜单（状态 / 日志 / 起停 / 真机自检 / 全部自测）；
+      * `一键部署.bat` —— **给别的电脑装**：它只调 `python console.py first`，
+        流程全在本文件的 `first_run()` 里，自己不实现任何东西。
+
+    ⚠️ 别把它变成第二个「实现」：多一个入口的成本不在那一行调用，而在第二份逻辑
+    会跟第一份分叉（这个项目被「两份实现只改了一份」咬过好几次：`send_asset` 的指导、
+    `_wechat_save_roots` 与 C++ 侧判据都是）。也**别**把 `first` 改成还会进菜单——
+    部署完就该结束，菜单是 `助手.bat` 的事。
+
+    历史（别再来回改）：2026-10-02 撤掉过一个「一键配置.bat」，因为它当时只是
+    `助手.bat` 的重复入口（用户口径：「在助手.bat里面有个选项就行」）；2026-10-04
+    重新加回来是为「把包给别人的电脑，双击一个文件就装完」——那是独立需求，
+    所以名字叫「部署」而不是「配置」，而且它必须保持是个**薄壳**。
     """
     arg = sys.argv[1].strip().lower() if len(sys.argv) > 1 else ""
     try:
-        if arg in ("first", "--first-run", "setup", "一键配置"):
+        if arg in ("first", "--first-run", "setup", "一键配置", "一键部署"):
             first_run()
+            return                      # 部署完就结束；菜单是 助手.bat 的事
         menu()
     except KeyboardInterrupt:
         print("\n已退出。")

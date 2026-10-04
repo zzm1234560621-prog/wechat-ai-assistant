@@ -215,6 +215,34 @@ def test_health_login_alerts():
     ok &= check("刚探过登录时 due_login_check 为 False", h2.due_login_check() is False)
     h2.last_login_check_at = time.time() - 9999
     ok &= check("超过间隔后 due_login_check 为 True", h2.due_login_check() is True)
+
+    # ── 探针本身失败（连不上 hook）：**不许说成掉登录**（2026-10-05 真机事故）──
+    # 现场：hook 卡了几分钟不回连接，`_probe_login` 抛异常；旧实现把它记成
+    # 「微信似乎回到登录界面了（IsLogin=0）」，还教用户去扫码 —— 方向全错。
+    fake3 = FakeNotifier()
+    h3 = health.Health(
+        {"health": {"login_check_interval": 300, "alert_cooldown": 3600,
+                    "status_file": os.path.join(d, "s3.json")}},
+        notify_fn=fake3,
+    )
+    err4, _ = _capture(lambda: h3.note_login(None, "探不到登录态（连不上 hook）：拒绝连接"))
+    snap3 = h3.snapshot()
+    ok &= check("探针失败也要告警（不许静默）", len(fake3.calls) == 1, fake3.calls)
+    ok &= check("★ 文案不许说成「回到登录界面」",
+                "回到登录界面" not in err4 and "回到登录界面" not in fake3.calls[0][1],
+                (err4.strip(), fake3.calls))
+    ok &= check("★ 文案说清「不等于掉登录」", "不等于掉登录" in err4, err4.strip())
+    ok &= check("★ 探针失败不计入掉登录（lost=0，probe_failed=1）",
+                snap3["login_lost_count"] == 0 and snap3["login_probe_failed_count"] == 1,
+                (snap3["login_lost_count"], snap3["login_probe_failed_count"]))
+    ok &= check("login_ok 记成 None（未知）而不是 False",
+                snap3["login_ok"] is None, snap3["login_ok"])
+    ok &= check("_healthy() 不因为「探不到」就判死", h3._healthy() in (None, True),
+                h3._healthy())
+    fake3.calls.clear()
+    h3.note_login(False, "IsLogin=0")
+    ok &= check("明确掉登录时照旧报「掉登录」",
+                "掉登录" in fake3.calls[0][0] + fake3.calls[0][1], fake3.calls)
     return ok
 
 

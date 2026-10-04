@@ -9,6 +9,7 @@
   T2 console.py 管理员分支必然参数绑定失败（-ArgumentList '' 是空串）
   T3 bypass_update.py 对微信 4.x 静默无效（缺 xwechat 路径、找不到还退出码 0）
   T4 wechat_version.py 把路径拼进 PowerShell 单引号串（含 ' 就坏 / 可注入）
+  T5 装 hook 前的微信版本闸：别的版本上 hook 会**静默失效**（2026-10-04 真机事故）
 
 风格照抄 selftest_aixed.py / selftest_executor_chain.py：ok/FAIL + 结尾汇总 + 失败 sys.exit(1)。
 """
@@ -19,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -454,6 +456,57 @@ def main():
         v = wv._file_version(p_plain)
         chk(isinstance(v, str) and v.count(".") >= 2,
             f"真实安装的 Weixin.exe 能读出文件版本：{v!r}")
+
+    # ── T5 装 hook 前的微信版本闸（2026-10-04 真机事故）─────────────────
+    # 事故形态：另一台电脑微信是 4.1.15.13，[9] 一键配置把 version.dll 放进微信目录、
+    # 日志写着「已放置，SHA256 = …」，一切看着成功，但 30001 从没被监听 —— hook 是按
+    # 4.1.10.27 的函数偏移编译的，版本不对时 DLL 被正常加载却挂钩失败，**不报错**。
+    print("\n5) T5 装 hook 前的微信版本闸")
+    chk(console.WANTED_WEIXIN == "4.1.10.27",
+        f"目标版本常量是 4.1.10.27（实际 {console.WANTED_WEIXIN!r}）")
+    chk(console.weixin_version_action("4.1.10.27") == "ok", "目标版本 -> ok")
+    chk(console.weixin_version_action("  4.1.10.27 ") == "ok", "两侧空白也认（注册表/文件版本都可能带）")
+    chk(console.weixin_version_action("4.1.10.27.0") == "downgrade",
+        "★ 多一位就按 mismatch 处理（宁可多问一次，也不静默装到不匹配的版本上）")
+    chk(console.weixin_version_action("4.1.15.13") == "downgrade", "别的版本 -> downgrade")
+    chk(console.weixin_version_action("") == "unknown", "读不出版本 -> unknown")
+    chk(console.weixin_version_action(None) == "unknown",
+        "★ None 也是 unknown，**不许当成 mismatch**（读不出不等于版本不对，"
+        "一律拦会挡住本来能装的机器）")
+
+    # 安装日志读回：提权窗口的输出回不来，「装上了」只能靠日志里的两个事实
+    log_ok = ("=== 2026-10-04 23:00:00 ===\n"
+              "[3] 静默安装 WeChatWin_4.1.10.27.exe /S\n"
+              "  exit code: 0\n"
+              "[5] 主程序版本\n"
+              "  Weixin.exe ProductVersion = 4.1.10.27\n"
+              "=== DONE ===")
+    chk(console.parse_install_log(log_ok) == (0, "4.1.10.27"), "读回 (exit code 0, 4.1.10.27)")
+    chk(console.parse_install_log("  exit code: 0\n  Weixin.exe ProductVersion = 4.1.15.13")
+        == (0, "4.1.15.13"),
+        "★ 退出码 0 但版本没换 —— 调用方必须判失败（只看退出码就是假成功）")
+    chk(console.parse_install_log("") == (None, None),
+        "★ 日志读不出来时返回 (None, None)，不许当成功")
+
+    # 等安装完成：run_ps1 是「拉起新窗口就返回」的异步动作，而安装要几十秒 ——
+    # 立刻读日志必然读到旧的/写了一半的那份，于是「还在装」被误报成「没换成」。
+    with tempfile.TemporaryDirectory() as td:
+        real_hook = console.HOOK_DIR
+        try:
+            console.HOOK_DIR = td
+            logp = os.path.join(td, "install-log.txt")
+            with open(logp, "w", encoding="utf-8") as f:
+                f.write("=== x ===\n[3] 静默安装 WeChatWin_4.1.10.27.exe /S\n"
+                        "  exit code: 0\n[5] 主程序版本\n"
+                        "  Weixin.exe ProductVersion = 4.1.10.27\n=== DONE ===\n")
+            got = console._wait_install_done(0, timeout=5)
+            chk(bool(got) and "=== DONE ===" in got, "日志写完了就立刻拿到结果（不白等）")
+            with open(logp, "w", encoding="utf-8") as f:
+                f.write("=== x ===\n[3] 静默安装 WeChatWin_4.1.10.27.exe /S\n")  # 没写完
+            chk(console._wait_install_done(time.time() - 10, timeout=3) is None,
+                "★ 日志里没有 DONE 就超时返回 None（不许把「还在装」当「装好了」）")
+        finally:
+            console.HOOK_DIR = real_hook
 
     # ── 汇总 ──────────────────────────────────────────────────────────
     print()

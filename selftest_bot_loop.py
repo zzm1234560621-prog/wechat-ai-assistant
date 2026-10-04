@@ -97,13 +97,15 @@ class _LoginStub:
 
 
 def t_probe_login():
-    sec("登录态分诊（探测本身炸了要保守判「不在线」）")
+    sec("登录态分诊（三态：在线 / 明确掉登录 / 探针本身失败）")
     ok, detail = bot._probe_login(_LoginStub(True))
     chk(ok is True and detail == "", "在线 → (True, '')")
     ok, detail = bot._probe_login(_LoginStub(False))
     chk(ok is False and "登录" in detail, "IsLogin=0 → (False, 提示里含「登录」)")
     ok, detail = bot._probe_login(_LoginStub(boom=True))
-    chk(ok is False and "失败" in detail, "探测抛异常 → 保守判不在线，且说明原因")
+    chk(ok is None and "连不上 hook" in detail,
+        "★ 探测抛异常 → 返回 None（**不是** False）：连不上 hook ≠ 掉登录，"
+        "说成掉登录会把排查方向带偏（2026-10-05 真机）")
 
 
 # ============================================================

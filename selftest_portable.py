@@ -226,6 +226,85 @@ def main():
         if stale:
             print(f"  ℹ️  清单里有仓库里不存在的目录（只是提示）：{stale}")
 
+    # ── 6 · 装 hook 之前必须校验微信版本 ────────────────────────────────
+    print("── 6 · 装 hook 前会校验微信版本 ──")
+    # 为什么有这一条（2026-10-04 真机）：另一台电脑的微信是 4.1.15.13，[9] 一键配置把
+    # version.dll 放进了微信目录、hook-install-log.txt 写着「已放置，SHA256 = …」，
+    # 看着全部成功，但 30001 从来没有被监听 —— hook 是按 4.1.10.27 的函数偏移编译的，
+    # 版本不对时 DLL 被**正常加载**却挂钩失败、**不报错**。用户只看到 bot 一直
+    # 「连不上 30001」。所以「装 hook」之前必须先过版本闸，而且**两级都要有**：
+    # .ps1 里那级管手敲命令的人，控制台那级才能顺手把版本换对。
+    common_txt = open(common, "r", encoding="utf-8").read() if os.path.isfile(common) else ""
+    check("_common.ps1 里有唯一一份目标微信版本常量",
+          "$WX_WANTED_VERSION" in common_txt)
+    check("_common.ps1 提供 Test-WeixinVersion（区分 mismatch 与 unknown）",
+          "function Test-WeixinVersion" in common_txt and "'unknown'" in common_txt)
+    hook_txt = ""
+    hook = os.path.join(inst_dir, "do_hook_install.ps1")
+    if os.path.isfile(hook):
+        hook_txt = open(hook, "r", encoding="utf-8").read()
+    check("do_hook_install.ps1 放 DLL 之前过版本闸", "Test-WeixinVersion" in hook_txt)
+    check("版本不对时**根本不放 DLL**（明确退出，而不是继续放）",
+          "version mismatch" in hook_txt and "exit 2" in hook_txt,
+          "只警告不拦 = 用户仍然会看到「已放置，成功」这种假成功")
+
+    # Python 控制台与 .ps1 必须是**同一个版本号**（两处写死的字面量，只能靠这条对齐）
+    m_ps = re.search(r"\$WX_WANTED_VERSION\s*=\s*'([^']+)'", common_txt)
+    cons_path = os.path.join(BASE, "console.py")
+    cons_txt = open(cons_path, "r", encoding="utf-8").read() if os.path.isfile(cons_path) else ""
+    m_py = re.search(r'WANTED_WEIXIN\s*=\s*"([^"]+)"', cons_txt)
+    check("console.py 与 _common.ps1 的目标微信版本一致",
+          bool(m_ps and m_py and m_ps.group(1) == m_py.group(1)),
+          f"ps1={m_ps.group(1) if m_ps else None!r} py={m_py.group(1) if m_py else None!r}")
+    check("一键配置真的会去装 4.1.10.27（不是只打印一句提醒）",
+          "ensure_weixin_version" in cons_txt and 'run_ps1("do_install.ps1")' in cons_txt)
+
+    # 包里那份 version.dll 必须是**带登录门禁**的构建。厂商原版（483840 / 5ABB5002）是
+    # 2026-10-04 真机事故的根因之一：它的源码快照里 `g_IsLogin` 恒为 0，装上去的现象是
+    # 「hook 通了、查询全失败、IsLogin 恒 0」，而日志一切正常。判据用编译进二进制的
+    # 宽字符串（`xwechat_files` / `db_storage` 只有「找新鲜库」那套判据才会用到）。
+    dll = os.path.join(inst_dir, "version.dll")
+    gated = False
+    if os.path.isfile(dll):
+        raw = open(dll, "rb").read()
+        gated = (("xwechat_files".encode("utf-16-le") in raw)
+                 and ("db_storage".encode("utf-16-le") in raw))
+    check("包里的 version.dll 是带登录门禁的构建（不是厂商原版）", gated,
+          "厂商原版没有这套判据 → 装上去 IsLogin 恒 0、查询全失败。"
+          "别拿 version_old_backup.dll 覆盖它")
+
+    # ── 7 · 给别的电脑装：只有「一个 .bat」这一条路 ─────────────────────
+    print("── 7 · 一键部署入口（一个 .bat）──")
+    # 为什么有这条（2026-10-04）：用户口径是「部署在别的电脑上，用一个 .bat」。
+    # 它必须是个**薄壳**：真流程全在 console.py 的 first_run() 里。
+    # 从这里抄一份出去的那天起就会分叉——这个项目被「两份实现只改了一份」咬过好几次
+    # （send_asset 的模型指导、`_wechat_save_roots` 与 C++ 侧判据都是）。
+    deploy = os.path.join(BASE, "一键部署.bat")
+    dtxt = open(deploy, "r", encoding="utf-8", errors="replace").read() \
+        if os.path.isfile(deploy) else ""
+    check("一键部署.bat 在包里（双击就装完）", os.path.isfile(deploy))
+    check("它是薄壳：只调 console.py first", "console.py first" in dtxt)
+    copied = [k for k in ("do_hook_install", "do_install", "pip install", "WeChatWin_")
+              if k in dtxt]
+    check("它没有把部署流程抄第二份", not copied, f"抄了：{copied}")
+    bp_txt = open(bp, "r", encoding="utf-8", errors="replace").read() \
+        if os.path.isfile(bp) else ""
+    check("打包脚本的「从这里开始.txt」首推它",
+          "一键部署.bat" in bp_txt and "助手.bat**，按 **[9]" not in bp_txt)
+
+    # ── 8 · .bat 必须是纯 ASCII ────────────────────────────────────────
+    print("── 8 · .bat 全是纯 ASCII（GBK 控制台才不会乱码）──")
+    # 为什么（2026-10-04，写 `一键部署.bat` 时当场踩到）：cmd 按系统代码页（中文机是 936）
+    # 读 .bat，一个带 UTF-8 中文的脚本在控制台上是乱码。四个老 .bat 都是刻意写成纯 ASCII 的，
+    # 新加的也必须守着——这条自测就是那次踩坑的回归。
+    bats = [p for p in files if p.lower().endswith(".bat")]
+    dirty = []
+    for p in bats:
+        n = sum(1 for byte in open(p, "rb").read() if byte > 127)
+        if n:
+            dirty.append(f"{os.path.relpath(p, BASE)}({n} 字节)")
+    check(f"{len(bats)} 个 .bat 全是纯 ASCII", not dirty, f"含非 ASCII：{dirty}")
+
     print("=" * 64)
     if _ok:
         print("全部通过 ✅")

@@ -112,13 +112,18 @@ class Msg:
 
 
 class AixedClient:
+    # 允许调用方**按次**覆盖超时（`query_sql(db, sql, timeout=...)`）。live_history 用它
+    # 给轮询里的查询压短超时：hook 偶尔会卡住，而 15 秒 × 一轮六七个查询 = 一轮一分多钟，
+    # 用户看到的就是「发了消息没反应」（2026-10-05 真机）。
+    supports_call_timeout = True
+
     def __init__(self, base_url=DEFAULT_BASE_URL, timeout=15):
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
 
     # ---------- 底层 HTTP ----------
 
-    def _request(self, method, path, payload=None):
+    def _request(self, method, path, payload=None, timeout=None):
         url = self.base_url + path
         data, headers = None, {}
         if payload is not None:
@@ -126,7 +131,7 @@ class AixedClient:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                 body = r.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as e:
             detail = ""
@@ -201,10 +206,11 @@ class AixedClient:
 
     # ---------- 与 wcferry 对齐的接口 ----------
 
-    def query_sql(self, db, sql):
-        """执行 SQL，返回行列表（dict 或 list 均可）。"""
+    def query_sql(self, db, sql, timeout=None):
+        """执行 SQL，返回行列表（dict 或 list 均可）。`timeout` 给轮询那条路压短用。"""
         t0 = time.time()
-        resp = self._request("POST", "/QueryDB/execute", {"optDbName": db, "SQL": sql})
+        resp = self._request("POST", "/QueryDB/execute", {"optDbName": db, "SQL": sql},
+                             timeout=timeout)
         dt = time.time() - t0
         if dt >= SLOW_QUERY_SEC:
             print(f"[aixed] ⚠️ 慢查询 {dt:.2f}s  db={db}  sql={str(sql)[:70]}",
@@ -212,12 +218,16 @@ class AixedClient:
         self._check(resp, f"查库 {db} ")
         return self._rows(resp)
 
-    def get_dbs(self):
+    def get_dbs(self, timeout=None):
         """返回所有数据库名。
 
         实测返回形如 [{"dbHandle": 123, "dbName": "contact.db"}, ...]。
+
+        ⚠️ 这个接口会触发 700MB 进程里的**全内存扫描**（`m_dbs.clear()` + 重新搜），
+        所以只由 `live_history.force_rescan()` 调、且带着限流；这里的 `timeout`
+        就是给那条路压短用的——我们只要「句柄表被重建」这个副作用，返回快慢不重要。
         """
-        resp = self._request("POST", "/QueryDB/GetAllDBName", {})
+        resp = self._request("POST", "/QueryDB/GetAllDBName", {}, timeout=timeout)
         out = []
         for r in self._rows(resp):
             if isinstance(r, str):

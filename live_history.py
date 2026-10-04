@@ -80,6 +80,89 @@ def set_rescan_interval(seconds):
     _AUTO_RESCAN_INTERVAL = 0.0 if v <= 0 else v
 
 
+# ── 一轮轮询的「总时限 + 单查询超时」（2026-10-05 真机加的）────────────────
+# 为什么必须有两个闸：hook 偶尔会**卡住**——实测有一次它连着好几分钟对所有连接
+# 回 `WinError 10061` / 干脆不回应，而微信进程和 30001 都还在。一轮轮询要发 6~7 个
+# 查询，按客户端默认的 15 秒超时算，最坏一轮 100 秒；而心跳是每 30 轮一行 →
+# 「十分钟没有任何日志」，用户看到的就是「我发了消息它不理我」。
+# 有了闸：一轮最多花 `POLL_BUDGET_SEC` 秒，hook 一恢复**下一轮（≤5 秒）立刻**把新消息
+# 捞上来 —— 「长时间挂着 + 一说话就马上回复」靠的就是这两条。
+QUERY_TIMEOUT = 8.0          # 轮询里单条查询的上限（秒）
+POLL_BUDGET_SEC = 20.0       # 一轮轮询的总预算（秒）；<=0 = 不限
+
+# `message_N.db` 那条**补捞非文本**的路，重扫间隔故意比默认的 45 秒松得多。
+# 它实测经常「解析不出句柄」（CLAUDE.md 记着这条），于是每轮都探不通 → 每 45 秒
+# 就触发一次 `force_rescan`（GetAllDBName = 700MB 进程里的全内存扫描）。那是给微信
+# 上负担，也是把轮询拖慢的头号嫌疑。真要重扫的是 fts 那条权威路（间隔仍 300 秒）。
+MSGDBS_RESCAN_INTERVAL = 600.0
+
+
+class PollBudgetOut(RuntimeError):
+    """一轮轮询的总时限用完了 —— 本轮剩下的查询直接放弃，别再往 hook 上加。"""
+
+
+_poll_deadline = [0.0]        # 本轮死线（monotonic）；0 = 不限时
+_budget_logged_at = [0.0]
+
+
+def begin_poll(budget=None):
+    """每轮轮询开始时调一次，开启本轮总时限。返回死线（0 = 不限）。
+
+    `budget=None` 用默认 `POLL_BUDGET_SEC`；传 0/负数 = 这一轮不限时
+    （自测、`verify_real.py` 那种手工查库走这条，免得量着量着被判超时）。
+    """
+    b = POLL_BUDGET_SEC if budget is None else budget
+    _poll_deadline[0] = (time.monotonic() + b) if (b and b > 0) else 0.0
+    return _poll_deadline[0]
+
+
+def poll_budget_left():
+    """本轮还剩多少秒；没开闸（不限时）返回 None。"""
+    if not _poll_deadline[0]:
+        return None
+    return _poll_deadline[0] - time.monotonic()
+
+
+def _log_budget_trip():
+    """一轮被总时限截断时留一行日志（最多 30 秒一行，别刷屏）。
+
+    必须留痕：被截断＝这一轮没查完，用户可能因此晚几秒才收到回复——如果连日志
+    都没有，排查时就只能看到「轮询好像有点慢」。
+    """
+    left = poll_budget_left()
+    if left is None or left > 0:
+        return
+    now = time.monotonic()
+    if now - _budget_logged_at[0] < 30.0:
+        return
+    _budget_logged_at[0] = now
+    print(f"[live] ⚠️ 本轮轮询超过总时限（{POLL_BUDGET_SEC:g}s）被截断："
+          f"hook 响应慢或卡住了；游标不推进，下一轮接着试（消息不会丢）。",
+          file=sys.stderr, flush=True)
+
+
+def _note_hook_unreachable(exc):
+    """hook 整个连不上（不是某个库探不到）时记一笔。
+
+    和「分片查询失败」分开记，因为处置完全不同：分片失败多半是句柄表要重扫，
+    而**整个连不上**是微信没跑 / hook 卡住 / 端口不对。
+    """
+    _note_poll_error("hook", exc)
+
+
+def _invoke(fn, *args, timeout=None):
+    """按次超时调用客户端方法。
+
+    ⚠️ 只在**真客户端**（有 `supports_call_timeout`）上传 timeout：自测里那一堆
+    假客户端只认 `(db, sql)`，而用 `try/except TypeError` 去猜会把「查询里真的
+    TypeError」一起吞掉、还白打一次查询。
+    """
+    owner = getattr(fn, "__self__", None)
+    if timeout and getattr(owner, "supports_call_timeout", False):
+        return fn(*args, timeout=timeout)
+    return fn(*args)
+
+
 def _q(s):
     """SQL 字符串转义（SQLite 里单引号转成两个单引号）。"""
     return str(s).replace("'", "''")
@@ -181,7 +264,9 @@ def force_rescan(client, min_interval=None):
     触发重扫的入口。它自己**常常返回 500**（扫描中途崩），但**副作用是句柄表被重建**
     ——实测调用后 message_fts.db / message_0.db 都从 500 变回 200。
 
-    所以这里「调用并忽略结果」，只为拿副作用。
+    所以这里「调用并忽略结果」，只为拿副作用；**顺带给它一个短超时**：我们要的只是
+    服务端那次重建，等它把结果吐完没有意义，卡在这儿反而把一轮轮询的时间吃光
+    （2026-10-05：这是轮询被拖慢的两个源头之一）。
 
     min_interval 是本次调用要求的最小间隔，缺省用 RESCAN_MIN_INTERVAL。
     时间戳 `client._lh_last_rescan` 是**所有调用方共享**的，所以 GetAllDBName 的
@@ -198,31 +283,42 @@ def force_rescan(client, min_interval=None):
     except Exception:
         pass
     try:
-        client.get_dbs()
+        _invoke(client.get_dbs, timeout=QUERY_TIMEOUT)
     except Exception:
-        pass  # 返回 500 是常态，忽略
+        pass  # 返回 500 / 超时都是常态，忽略
     return True
 
 
-def _probe_heal(client, db, sql="SELECT 1 FROM sqlite_master LIMIT 1"):
+def _probe_heal(client, db, sql="SELECT 1 FROM sqlite_master LIMIT 1", min_interval=None):
     """探测；失败时强制重扫一次再试。
 
     hook 能发现的库会**漂移**（message_fts.db 和 message_0.db 交替掉线），
     重扫能把它们找回来——这是让整套东西能持续跑下去的关键。
+    `min_interval` 让调用方自己定「这条路值不值得为它重扫」：fts / contact 这类
+    权威路用默认 45 秒；`message_N.db` 那条补捞路用 `MSGDBS_RESCAN_INTERVAL`（松得多）。
     """
     if _probe(client, db, sql):
         return True
-    if force_rescan(client):
+    if force_rescan(client, min_interval=min_interval):
         return _probe(client, db, sql)
     return False
 
 
 def _query(client, db, sql):
-    """执行 SQL，兼容不同后端的方法名。"""
+    """执行 SQL，兼容不同后端的方法名。
+
+    轮询期间受 `begin_poll()` 开的总时限约束：超了就抛 `PollBudgetOut`，调用方
+    按「本轮没查到」处理。**失败时游标不推进**，所以下一轮还会再试，消息不会丢。
+    """
     fn = getattr(client, "query_sql", None) or getattr(client, "exec_db_query", None)
     if fn is None:
         raise RuntimeError("当前后端没有 query_sql 接口")
-    return fn(db, sql) or []
+    left = poll_budget_left()
+    if left is not None and left <= 0:
+        raise PollBudgetOut("本轮轮询总时限已到")
+    timeout = QUERY_TIMEOUT if left is None else min(QUERY_TIMEOUT, left)
+    rows = _invoke(fn, db, sql, timeout=timeout)
+    return rows or []      # 保持原来的返回语义：None/空一律给空列表
 
 
 def _pick(row, key, idx):
@@ -567,10 +663,16 @@ def _v4_msg_dbs(client, max_probe=8):
 
     探测式而不是取 GetAllDBName——那个接口每次调用都会触发全内存扫描。
     探到的结果缓存起来，只在第一次探测。
+
+    ⚠️ 这里用 `min_interval=MSGDBS_RESCAN_INTERVAL`（10 分钟）而不是默认的 45 秒：
+    这条路只是**补捞非文本**（图片/文件），而 `message_N.db` 实测经常就是解析不出句柄，
+    每轮探不通 → 每 45 秒一次全内存扫描，纯属给微信上负担、还把轮询拖慢
+    （2026-10-05 真机：轮询被拖到一轮十几秒、心跳十分钟不出一行）。
     """
     def build():
         return [f"message_{i}.db" for i in range(max_probe)
-                if _probe_heal(client, f"message_{i}.db")]
+                if _probe_heal(client, f"message_{i}.db",
+                               min_interval=MSGDBS_RESCAN_INTERVAL)]
 
     return _cached_positive(client, "_lh_v4_msgdbs", build)
 
@@ -2681,22 +2783,46 @@ def new_messages(client, cursors, limit=200):
     ⚠️ 如果游标格式跟**当前可用的路径**对不上（说明 hook 能发现的库换了，
     比如从 fts 切到 message_0.db），就先对齐游标、本轮不返回消息——
     否则会因为游标归零把整段历史当成新消息刷一遍。
+
+    ⚠️ 这个函数**会开启本轮总时限**（`begin_poll()`）：轮询里的每个查询都受它约束，
+    超了就抛 PollBudgetOut、本轮剩下的查询放弃。失败时游标只前进到确实取到的位置，
+    所以下一轮还会再试 —— **消息不会丢**。
     """
     cursors = dict(cursors or {})
-    v4 = is_wechat4(client)
-    # 用「分片表实际能不能查到」来决定走哪条路，而不是用 _uses_fts 的探测结果：
-    # probe 只验「查询不报错」，而 message_fts.db 句柄失效时查询是**成功但返回 0 行**，
-    # 探测照样通过。那样 expected 会是空集，下面的守卫每次成立，轮询永远空转，
-    # bot 就静默地收不到任何消息（明明 message_0.db 好好的）。
-    fts_tables = _v4_fts_tables(client) if v4 else []
-    fts = bool(fts_tables)
+    begin_poll()
+    try:
+        # 先花**一个最便宜的请求**确认 hook 活着（/QueryDB/status 不碰任何数据库句柄）。
+        # 为什么值得多这一个请求（2026-10-05 真机）：
+        #   * hook 卡住时，一轮里的 6~7 个查询会全部撞超时 —— 那是往一个已经卡死的
+        #     服务上继续加压，实测会把它的 listen backlog 顶满，之后连 TCP 都直接
+        #     10061（用户那边就是「发了消息没反应」）；
+        #   * 探到不通就整轮跳过（这一轮只发 1 个请求），探到通了就照常跑完整轮 ——
+        #     于是 hook 一恢复，**同一轮**就能把新消息捞上来（≤5 秒），不用等下一轮。
+        # 假客户端（自测里那些）没有 db_status，跳过这一关，行为与以前一致。
+        probe = getattr(client, "db_status", None)
+        if probe is not None:
+            try:
+                probe()
+            except Exception as e:
+                _note_hook_unreachable(e)
+                return [], cursors
 
-    expected = set(fts_tables) if fts else {"__time__"}
-    if not (set(cursors) & expected):
-        return [], latest_cursor(client)
+        v4 = is_wechat4(client)
+        # 用「分片表实际能不能查到」来决定走哪条路，而不是用 _uses_fts 的探测结果：
+        # probe 只验「查询不报错」，而 message_fts.db 句柄失效时查询是**成功但返回 0 行**，
+        # 探测照样通过。那样 expected 会是空集，下面的守卫每次成立，轮询永远空转，
+        # bot 就静默地收不到任何消息（明明 message_0.db 好好的）。
+        fts_tables = _v4_fts_tables(client) if v4 else []
+        fts = bool(fts_tables)
 
-    if fts:
-        return _v4_new_messages(client, cursors, limit)
-    if v4:
-        return _v4_new_messages_tables(client, cursors, limit)
-    return _v3_new_messages(client, cursors, limit)
+        expected = set(fts_tables) if fts else {"__time__"}
+        if not (set(cursors) & expected):
+            return [], latest_cursor(client)
+
+        if fts:
+            return _v4_new_messages(client, cursors, limit)
+        if v4:
+            return _v4_new_messages_tables(client, cursors, limit)
+        return _v3_new_messages(client, cursors, limit)
+    finally:
+        _log_budget_trip()

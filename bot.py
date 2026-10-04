@@ -2148,15 +2148,21 @@ def iter_wcferry_messages(wcf, tick=None):
 
 
 def _probe_login(client):
-    """探一次登录态，返回 (是否在线, 说明)。
+    """探一次登录态，返回 `(状态, 说明)`。**三态**：
+
+      True  = 在线；
+      False = 探到了、明确不在线（`IsLogin: 0`，微信停在登录界面）；
+      None  = **探针本身失败**（连不上 hook）。⚠️ 这**不等于**掉登录 ——
+              微信没在跑 / hook 卡住 / 端口不对都会长这样，说成「掉登录」会把
+              排查方向带偏（2026-10-05 真机就吃了这一口：日志写「微信似乎回到
+              登录界面了（IsLogin=0）」，其实微信好好的、是 hook 那几分钟不接连接）。
 
     只用 hook 的只读接口，**不碰数据库句柄表**（不触发那 700MB 进程里的全内存扫描）。
-    探测本身失败时按「不在线」处理并如实记下原因——分诊要保守，宁可多报一次。
     """
     try:
         ok = bool(client.is_login())
     except Exception as e:
-        return False, f"探登录态失败：{e}"
+        return None, f"探不到登录态（连不上 hook）：{e}"
     if not ok:
         return False, "IsLogin: 0（微信可能停在登录界面）"
     return True, ""

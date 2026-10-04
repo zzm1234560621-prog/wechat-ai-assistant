@@ -11,6 +11,14 @@
 # README 只能要求用户「换机器先手工改开头三行」。那不是能直接装的产品。
 # 现在全部自动探测，脚本可以放在任意目录、装到任意机器。
 
+# ── 这条主线唯一支持的微信版本（唯一真源，别再各处写一遍）──────────────────
+# hook（version.dll）是按 4.1.10.27 的**函数偏移**编译的。装在别的版本上，DLL 会被微信
+# 正常加载、**不报错、不崩**，只是挂钩失败 —— 30001 永远没人监听，用户看到的是
+# 「bot 一直连不上 30001」，而安装脚本打的是「已放置，成功」。
+# 2026-10-04 真机踩到：另一台电脑是 4.1.15.13，[9] 一键配置走完、日志全绿，端口从没通。
+# 所以「装 hook」之前必须先过版本闸（Test-WeixinVersion），常量只在这里写一份。
+$WX_WANTED_VERSION = '4.1.10.27'
+
 function Find-Weixin {
     # 返回微信 4.x 安装目录；找不到返回 $null（调用方必须如实报错，不许瞎写一个路径）。
     # 4.x 把安装路径写在 HKCU\SOFTWARE\Tencent\Weixin；提权后 HKCU 仍是同一个用户，读得到。
@@ -105,4 +113,17 @@ function Get-WeixinVersion {
     $exe = Join-Path $Dir 'Weixin.exe'
     if (-not (Test-Path $exe)) { return $null }
     try { return (Get-Item $exe).VersionInfo.ProductVersion } catch { return $null }
+}
+
+function Test-WeixinVersion {
+    # 'ok' = 就是目标版本，可以装 hook；
+    # 'mismatch' = 明确是别的版本（装了也不会生效，必须换版本）；
+    # 'unknown' = 读不出版本号（没装 / 拿不到文件版本资源）。
+    # ⚠️ 调用方**必须**区分 unknown 和 mismatch：读不出**不等于**版本不对
+    #    （可能只是那个 exe 没有版本资源），一律拦下来会挡住本来能装的机器。
+    param([string]$Dir)
+    $v = Get-WeixinVersion -Dir $Dir
+    if (-not $v) { return 'unknown' }
+    if ($v.Trim() -eq $WX_WANTED_VERSION) { return 'ok' }
+    return 'mismatch'
 }

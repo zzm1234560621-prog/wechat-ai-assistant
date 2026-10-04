@@ -831,6 +831,97 @@ def main():
     except aixed_api.AixedError as e:
         ok &= check("连不上应抛 AixedError", True)
 
+    print("\n── 轮询的总时限 / 按次超时 / 重扫限流（2026-10-05 真机事故的回归）──")
+    # 事故：hook 卡住几分钟（对所有连接回 10061），而一轮轮询 6~7 个查询按 15 秒超时算
+    # 最坏 100 秒，心跳又是每 30 轮一行 → 十分钟没有一行日志，用户只看到「发消息没反应」。
+    live_history.begin_poll(0)                     # 不限时（后面的用例自己会再开闸）
+    ok &= check("begin_poll(0) = 不限时", live_history.poll_budget_left() is None)
+
+    live_history.begin_poll(0.05)
+    _left = live_history.poll_budget_left()
+    ok &= check("begin_poll(0.05) 开闸后剩余 <= 0.05s",
+                _left is not None and _left <= 0.05, _left)
+    time.sleep(0.06)
+    try:
+        live_history._query(c, "session.db", "SELECT 1")
+        ok &= check("超时后 _query 抛 PollBudgetOut", False)
+    except live_history.PollBudgetOut:
+        ok &= check("★ 超时后 _query 抛 PollBudgetOut（不再往 hook 上加查询）", True)
+    except Exception as e:                         # noqa: BLE001
+        ok &= check("超时后 _query 抛 PollBudgetOut", False, repr(e))
+
+    class _CapClient:
+        supports_call_timeout = True
+
+        def __init__(self):
+            self.kw = "unset"
+
+        def query_sql(self, db, sql, timeout=None):
+            self.kw = timeout
+            return [{"x": 1}]
+
+    class _PlainClient:
+        def __init__(self):
+            self.args = None
+
+        def query_sql(self, db, sql):
+            self.args = (db, sql)
+            return []
+
+    cc, pc = _CapClient(), _PlainClient()
+    live_history.begin_poll(0)
+    live_history._query(cc, "session.db", "SELECT 1")
+    ok &= check("★ 真客户端收到按次超时", cc.kw == live_history.QUERY_TIMEOUT, cc.kw)
+    live_history._query(pc, "session.db", "SELECT 1")
+    ok &= check("假客户端（只认两个参数）照样能调", pc.args == ("session.db", "SELECT 1"),
+                pc.args)
+    ok &= check("轮询单查询超时比客户端默认 15 秒短",
+                0 < live_history.QUERY_TIMEOUT <= 8, live_history.QUERY_TIMEOUT)
+
+    class _RescanCounter:
+        def __init__(self):
+            self.rescans = 0
+
+        def query_sql(self, db, sql):
+            raise RuntimeError("get database handle which named %s failed" % db)
+
+        def get_dbs(self):
+            self.rescans += 1
+            return []
+
+    rc = _RescanCounter()
+    live_history.force_rescan(rc, min_interval=9999)
+    first = rc.rescans
+    live_history.force_rescan(rc, min_interval=9999)
+    ok &= check("★ 重扫被限流（同一客户端不连着扫）",
+                first == 1 and rc.rescans == 1, (first, rc.rescans))
+    ok &= check("★ message_N.db 那条补捞路的重扫间隔松得多",
+                live_history.MSGDBS_RESCAN_INTERVAL >= 10 * live_history.RESCAN_MIN_INTERVAL,
+                (live_history.MSGDBS_RESCAN_INTERVAL, live_history.RESCAN_MIN_INTERVAL))
+
+    class _DownClient:
+        def __init__(self):
+            self.queries = 0
+
+        def db_status(self):
+            raise RuntimeError("连不上 http://127.0.0.1:30001（WinError 10061）")
+
+        def query_sql(self, db, sql):
+            self.queries += 1
+            return []
+
+    dc = _DownClient()
+    live_history._POLL_ERRORS.pop("hook", None)
+    _cur = {"message_fts_v4_0": 5}
+    _msgs, _cur2 = live_history.new_messages(dc, _cur)
+    ok &= check("★ hook 连不上时整轮跳过（一个查库请求都不发）",
+                _msgs == [] and dc.queries == 0, (_msgs, dc.queries))
+    ok &= check("★ 游标原样返回（下一轮接着试，消息不会丢）", _cur2 == _cur, _cur2)
+    ok &= check("hook 连不上会单独记一笔（心跳里看得见）",
+                "hook" in live_history.poll_errors(), live_history.poll_errors())
+    live_history._POLL_ERRORS.pop("hook", None)
+    live_history.begin_poll(0)
+
     srv.shutdown()
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")

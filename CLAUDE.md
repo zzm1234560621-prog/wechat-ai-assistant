@@ -385,6 +385,13 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。
 - 回归用例：`selftest_aixed.py` 的 `_V4StaleFtsStub`。
 
+**但「没反应」还有另一种形态：轮询自己卡住**（不是句柄失效，是 hook 短暂不接连接）。
+2026-10-05 真机：`last_poll_at` 冻住、`bot.log` 十分钟没有心跳，而微信和 hook 都好着。
+现在一轮有**总时限**（`live_history.POLL_BUDGET_SEC`）、每轮先用一个最便宜的
+`/QueryDB/status` 探活（不通就整轮只发这一个请求）、`message_N.db` 的重扫间隔放到
+10 分钟 —— 目的就是**长时间挂着、一说话就马上回复**。
+**完整理由、常量与回归见 `docs/poll-reliability-notes.md`**（改这块前先读它）。
+
 ## 素材暂存（assets.py）
 
 发一次图/表情，之后说「发给谁」就能再发。**三条最易踩的与全部规矩见 `docs/assets-notes.md`**（2026-10-02 为腾出本文件 64KB 指令预算搬过去的）。回归：`selftest_assets.py`。
@@ -508,6 +515,24 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   「禁用微信自动更新」会**静默失效**）；② 这一组 `.ps1` **必须带 UTF-8 BOM**，
   PowerShell 5.1 没 BOM 时按系统代码页读，GBK 机器上中文全乱码（本机代码页是 65001，本机看不出）。
   回归：`selftest_portable.py`（无本机路径 / 8 个脚本都引入 `_common.ps1` / 全部带 BOM / 用户名解析正确）。
+- **装 hook 之前必须先校验微信版本**（2026-10-04 加，真机事故）：hook 是按 **4.1.10.27** 的
+  函数偏移编译的，装在别的版本上，DLL 会被微信**正常加载**却挂钩失败——**不报错、不崩**，
+  只是 30001 永远没人监听，而安装脚本打的是「已放置，SHA256 = …」这种成功字样。
+  真机：另一台电脑微信是 4.1.15.13，`[9] 一键配置` 走完一遍、日志全绿，端口从没通过，
+  用户只看到 bot 反复「连不上 30001」。所以**两级守卫都要有**：
+  ① `do_hook_install.ps1` 里那道闸（管手敲命令 / 直接双击脚本的人）——版本不对就
+  **什么都不做**（连自动更新 ACL 都不改）并 `exit 2`；② `console.ensure_weixin_version()`
+  （管菜单）——拦在装之前，并能顺手跑 `do_install.ps1` 换成 4.1.10.27，
+  再读 `install-log.txt` **复核**（exit code 0 **且** ProductVersion 真的换了才算成）。
+  版本常量唯一真源是 `_common.ps1` 的 `$WX_WANTED_VERSION`，`console.WANTED_WEIXIN`
+  必须与它一致（`selftest_portable.py` 钉着这一对；纯函数回归在 `selftest_install.py` T5）。
+  ⚠️ 别退回「读不出版本就拦」：读不出**不等于**版本不对，`unknown` 要如实问用户。
+- **包里那份 `version.dll` 必须是带登录门禁的构建**（2026-10-04 换过）：厂商原版
+  （483840 / `5ABB5002`）的源码快照里 `g_IsLogin` **恒为 0**（置 1 的那段登录 hook 在开源快照里
+  被移除了），装上去就是「hook 通了、查询全失败、`IsLogin` 恒 0」，而日志写着「已放置，成功」。
+  现在包里是**开发机现役那份**（499200 / `9FBD1340`，有「找新鲜库」那套判据），厂商原版归档成
+  `version_old_backup.dll`——**别再拷回去**。判据：二进制里有 `xwechat_files` + `db_storage`
+  宽字符串（`selftest_portable.py` §6 钉着这一条）。细节见 `docs/hook-login-gate-notes.md`。
 - **改 hook 源码**（`installers/wechat-4.1.10.27/src-4.1.10.27/WeChat-Hook-4.1.10.27`）后重编译：
   ```bash
   "C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe" \

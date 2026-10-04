@@ -281,12 +281,14 @@ class Health:
         self.last_hook_error_at = None
 
         # —— 登录态 ——
-        self.last_login_ok = None          # None = 还没探过
+        self.last_login_ok = None          # None = 还没探过 / 探针本身失败（连不上 hook）
         self.last_login_detail = ""
         self.last_login_at = None
         self.last_login_check_at = None    # 最近一次探登录的时间（不管结果是啥）
         self.login_lost_count = 0
         self.login_restored_count = 0
+        self.login_probe_failed_count = 0  # 探针本身失败了几次（连不上 hook）——
+                                           # **不算掉登录**，见 note_login 的注释
 
         # —— 告警 ——
         self.alert_count = 0
@@ -380,14 +382,30 @@ class Health:
     def note_login(self, ok, detail=""):
         """记录一次登录态探测结果；**掉登录要告警，恢复时再告警一次**。
 
-        同一类告警（掉登录 / 已恢复）在 alert_cooldown 秒内只发一次，防刷屏。
+        `ok` 是**三态**：True=在线 / False=明确掉登录 / **None=探针本身失败**。
+        ⚠️ None 绝不能当成掉登录（2026-10-05 真机）：`_probe_login` 连不上 hook 时
+        返回 None，那时微信往往好好的，只是 hook 卡住了几分钟。旧实现把它记成
+        `IsLogin=0 掉登录`，告警文案还教用户去扫码 —— 把排查方向整个带偏。
+
+        同一类告警（掉登录 / 已恢复 / 探不到）在 alert_cooldown 秒内只发一次，防刷屏。
         """
         try:
             now = time.time()
             self.last_login_check_at = now
             self.last_login_at = now
-            self.last_login_ok = bool(ok)
+            self.last_login_ok = None if ok is None else bool(ok)
             self.last_login_detail = str(detail or "")
+            if ok is None:
+                self.login_probe_failed_count += 1
+                self._alert_cooldown(
+                    "login_probe_failed",
+                    "探不到登录态（连不上 hook）",
+                    "读不到微信登录态：连不上本机的 hook（30001）。"
+                    "**这不等于掉登录** —— 常见原因是微信没在跑、hook 卡住、或端口不对；"
+                    "先别去扫码，看一眼微信窗口和 http://127.0.0.1:30001/QueryDB/status。"
+                    + (f"\n详情：{self.last_login_detail}" if self.last_login_detail else ""),
+                )
+                return
             if not ok:
                 self.login_lost_count += 1
                 self._alert_cooldown(
@@ -502,6 +520,7 @@ class Health:
             "last_login_check_age_seconds": _age(self.last_login_check_at, now),
             "login_lost_count": self.login_lost_count,
             "login_restored_count": self.login_restored_count,
+            "login_probe_failed_count": self.login_probe_failed_count,
             # 告警
             "alert_count": self.alert_count,
             "last_alert_at": _iso(self.last_alert_at),

@@ -19,6 +19,34 @@ if (-not $WX) {
 }
 "    [0] 微信目录：$WX" | Out-File $log -Append -Encoding utf8
 
+# ── 版本闸：版本不对就**什么都不做**（2026-10-04 加）────────────────────
+# 为什么必须拦在这儿：hook 按 4.1.10.27 的函数偏移编译。装在别的版本上，DLL 会被微信
+# 正常加载、**不报错、不崩**，只是挂钩失败——30001 永远没人监听。用户看到的是
+# 「bot 一直连不上 30001」，而本脚本打的是「已放置，SHA256 = …」这种成功字样。
+# 真机案例：另一台电脑是 4.1.15.13，一键配置 + 本脚本都"成功"，端口从没通过。
+# 所以顺序也重要：**先判版本、再动任何东西**（含下面的自动更新 ACL）。
+$ver = Get-WeixinVersion -Dir $WX
+switch (Test-WeixinVersion -Dir $WX) {
+    'ok' {
+        "    [0] 版本检查：微信 $ver ✓（本 hook 唯一支持的版本）" | Out-File $log -Append -Encoding utf8
+    }
+    'mismatch' {
+        "    [0] 版本检查：当前微信 $ver ≠ 本 hook 唯一支持的 $WX_WANTED_VERSION" | Out-File $log -Append -Encoding utf8
+        "    **已中止：没有放置 version.dll、也没有改自动更新设置。**" | Out-File $log -Append -Encoding utf8
+        "    放上去也不会生效——只会让人以为装好了（DLL 会被正常加载，但挂钩失败）。" | Out-File $log -Append -Encoding utf8
+        "    先换成 $WX_WANTED_VERSION（本目录下自带官方安装程序）：" | Out-File $log -Append -Encoding utf8
+        "      管理员 PowerShell： powershell -NoProfile -ExecutionPolicy Bypass -File .\do_install.ps1" | Out-File $log -Append -Encoding utf8
+        "      或直接双击 WeChatWin_$WX_WANTED_VERSION.exe，弹「安装更早的版本？」时点「继续安装」。" | Out-File $log -Append -Encoding utf8
+        "    装完**重启微信并登录**，再跑一次本脚本。" | Out-File $log -Append -Encoding utf8
+        "=== DONE (version mismatch) ===" | Out-File $log -Append -Encoding utf8
+        exit 2
+    }
+    default {
+        "    [!] 版本检查：读不出微信版本（拿不到文件版本资源）——继续放 DLL。" | Out-File $log -Append -Encoding utf8
+        "        读不出不等于版本不对；但若之后 30001 仍不通，请确认微信是 $WX_WANTED_VERSION。" | Out-File $log -Append -Encoding utf8
+    }
+}
+
 # 提权后 $env:APPDATA 可能指向管理员账户，所以自动找**登录用户**的目录
 # （以前这里写死成开发机的用户目录和用户名）
 $appData = Get-LoginUserAppData
