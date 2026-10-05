@@ -376,6 +376,42 @@ def test_notes_and_status_file():
     except Exception as e:
         ok &= check("写不进去时不抛异常", False, e)
 
+    # 相对路径必须按**项目目录**解析，不能按进程 CWD（2026-10-05 真机事故：
+    # bot 被计划任务/提权起时 CWD = C:\WINDOWS\System32，于是 ./data/status.json
+    # 落到系统目录、每轮写一次失败一次，刷满 bot.log 还把状态页弄瞎了）。
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(_tmpdir())
+        h_rel = health.Health(
+            {"health": {"status_file": os.path.join("data", "rel_status.json")}},
+            notify_fn=FakeNotifier())
+        want = os.path.join(health.PROJECT_ROOT, "data", "rel_status.json")
+        ok &= check("★ 相对 status_file 按项目目录解析（不跟 CWD 跑）",
+                    os.path.normcase(h_rel.status_file) == os.path.normcase(want),
+                    (h_rel.status_file, want))
+    finally:
+        os.chdir(old_cwd)
+
+    # 每轮都会失败的告警必须被节流：真机上它每 5 秒刷一行，把 bot.log 灌满。
+    h_t = health.Health({"health": {"status_file": os.path.join(d, "still_a_dir")}},
+                        notify_fn=FakeNotifier())
+    os.makedirs(os.path.join(d, "still_a_dir"), exist_ok=True)   # 指向目录 -> 必写失败
+    err_buf = io.StringIO()
+    with redirect_stderr(err_buf):
+        for _ in range(3):
+            h_t.write_status()
+    first = err_buf.getvalue()
+    ok &= check("★ 每轮都失败的告警被节流（同一句只打一行）",
+                first.count("[health] ⚠️ 写 ") == 1, first)
+    # 节流窗过去之后再失败：必须**如实补报**被折叠了几次（绝不静默）
+    _ts, _folded = h_t._warn_state["write_status"]
+    h_t._warn_state["write_status"] = (time.monotonic() - 3600, _folded)
+    err_buf2 = io.StringIO()
+    with redirect_stderr(err_buf2):
+        h_t.write_status()
+    ok &= check("★ 节流窗过后补报「折叠了几次」（不静默）",
+                "折叠" in err_buf2.getvalue(), err_buf2.getvalue())
+
     # alert() 的通知函数自己炸了：只记日志，绝不抛
     def bad_notify(title, text):
         raise RuntimeError("通知组件炸了")

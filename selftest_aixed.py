@@ -952,6 +952,73 @@ def main():
     live_history._POLL_ERRORS.pop("hook", None)
     live_history.begin_poll(0)
 
+    print("\n── 分片熔断：同一个查询连错之后别再每轮砸它（2026-10-05 第二次崩溃的回归）──")
+    # 事故：hook 对查询连续回 `HTTP 500`，而探活 `/QueryDB/status` **是通的**——
+    # 「整轮跳过」那道闸拦不住它，bot 每 5 秒照发 4 个 fts 分片 + message_0.db，
+    # 一路砸到一个已经出错的 hook 上（崩前最后一次查询还是 500）。
+    live_history.reset_shard_breakers()
+    live_history._POLL_ERRORS.clear()
+    _SHARD = "message_fts_v4_0"
+
+    class _Fts500:
+        """分片表报得出来，但查分片一律 500（真机那次就是这个形态）。"""
+
+        def __init__(self):
+            self.shard_queries = 0
+            self.shard_sqls = []
+            # 直接把分片表缓存塞进去：这一段的判据是「查询发不发」，不是探测
+            self._lh_fts_tables = (time.time(), [_SHARD])
+
+        def query_sql(self, db, sql):
+            if "sqlite_master" in sql:
+                return [{"name": _SHARD}]
+            if _SHARD in sql:
+                self.shard_queries += 1
+                self.shard_sqls.append(sql)
+                raise RuntimeError("/QueryDB/execute 返回 HTTP 500")
+            raise RuntimeError("get database handle which named %s failed" % db)
+
+    fc = _Fts500()
+    _cur = {_SHARD: 7}
+    for _i in range(live_history.SHARD_FAIL_LIMIT):
+        _msgs, _cur2 = live_history._v4_new_messages(fc, _cur)
+        ok &= check(f"熔断前第 {_i + 1} 轮照查（不然「不查了」没有对照）",
+                    fc.shard_queries == _i + 1, fc.shard_queries)
+    ok &= check("★ 连错到阈值后该分片被熔断",
+                live_history.shard_blocked(_SHARD), live_history.poll_errors())
+    live_history._v4_new_messages(fc, _cur)
+    ok &= check("★ 熔断期间一个查询都不发（别再往已经出错的 hook 上加压）",
+                fc.shard_queries == live_history.SHARD_FAIL_LIMIT, fc.shard_queries)
+    ok &= check("★ 游标原样不动（冷却结束从原地接着查：只会晚、不会丢）",
+                _cur2.get(_SHARD) == 7, _cur2.get(_SHARD))
+    # 半开：冷却到点自动放一次探针
+    live_history._shard_blocked_until[_SHARD] = time.monotonic() - 1
+    live_history._v4_new_messages(fc, _cur)
+    ok &= check("★ 冷却到点自动半开（放一次探针，不是永远不查）",
+                fc.shard_queries == live_history.SHARD_FAIL_LIMIT + 1, fc.shard_queries)
+    live_history._note_poll_ok(_SHARD)
+    ok &= check("★ 一次成功立刻解除熔断（恢复不等冷却、告警也清掉）",
+                not live_history.shard_blocked(_SHARD)
+                and _SHARD not in live_history.poll_errors())
+    ok &= check("熔断冷却别长到「用户一句话要等半天」",
+                0 < live_history.SHARD_COOLDOWN_SEC <= 60, live_history.SHARD_COOLDOWN_SEC)
+
+    print("\n── 每轮取多少行：追赶积压不许满速扫库（2026-10-05 真机）──")
+    ok &= check("★ 每分片每轮的行数比满页时代小一个数量级（200 → 20）",
+                live_history.POLL_ROWS_PER_SHARD <= 50,
+                live_history.POLL_ROWS_PER_SHARD)
+    ok &= check("★ fts 分片查询真的用了这个小页大小（不是在别处写死 200）",
+                any(f"LIMIT {live_history.POLL_ROWS_PER_SHARD}" in s for s in fc.shard_sqls),
+                (fc.shard_sqls or [""])[0][:80])
+    import inspect
+    _lim_default = inspect.signature(
+        aixed_api.AixedClient.poll_messages).parameters["limit"].default
+    ok &= check("★ aixed_api.poll_messages 不再自己写死 limit（那是第二个所有者，改了不生效）",
+                _lim_default is None, _lim_default)
+
+    live_history.reset_shard_breakers()
+    live_history._POLL_ERRORS.clear()
+
     srv.shutdown()
     print("\n" + "=" * 50)
     print("全部通过 ✅" if ok else "有失败项 ❌")

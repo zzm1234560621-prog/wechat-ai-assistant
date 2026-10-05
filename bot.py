@@ -171,7 +171,7 @@ def _stall_threshold(cfg):
         return 6
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 
 # 单实例锁占用的回环端口。换成别的数就行（别撞 hook 的 30001/29999）。
@@ -2462,6 +2462,61 @@ def _msg_ts_key(row):
         return 0
 
 
+# 「不是我该管的会话」被丢掉时的留痕（限流）。**只对拿不到会话名的那种**（`session_<N>`）
+# 留痕：正常的群消息一秒好几条，全打会把 bot.log 刷穿；而 `session_<N>` 是**故障形状**
+# —— 会话名映射抖动/过期时，控制会话会被认成 `session_297`，那条 `continue` 一声不吭，
+# 用户看到的就是「我发消息它不理」而日志里毫无痕迹（2026-10-05 真机）。
+_OFFTARGET_N = [0]
+_OFFTARGET_AT = [0.0]
+_OFFTARGET_INTERVAL = 60.0
+
+
+def _note_offtarget_skip(sender):
+    """被当成「非目标会话」丢掉的消息留一行痕。返回是否真打了。
+
+    ⚠️ 只认 `session_<数字>`：正常群/好友消息照旧安静（那是有意丢的，不是故障）。
+    """
+    if not str(sender or "").startswith("session_"):
+        return False
+    _OFFTARGET_N[0] += 1
+    now = time.monotonic()
+    if now - _OFFTARGET_AT[0] < _OFFTARGET_INTERVAL:
+        return False
+    _OFFTARGET_AT[0] = now
+    print(f"[bot] ⚠️ 有消息**拿不到会话名**（{sender}），被按「非目标会话」丢掉："
+          f"累计 {_OFFTARGET_N[0]} 条。这不是「没消息」——多半是会话名映射过期/抖动，"
+          f"重启助手即可恢复；这条痕迹就是为它留的。")
+    return True
+
+
+def _min_round_interval(cfg):
+    """连续有消息时，两轮之间**至少**隔多少秒（`poll_min_interval`，默认 1；<=0 = 关）。
+
+    ⚠️ 这不是「让助手变慢」：稳态（没有新消息）时它照旧等 `poll_interval`。
+    这个闸只在**连续有消息**时兜底 —— 2026-10-05 真机：重启后追赶积压时，
+    「有消息就不睡」让主循环连轴转（实测约 2 秒/轮；每轮 3 个 fts 分片各满页
+    200 行 ≈ **300 行/秒**），而每一行 appmsg 还会再回查一次 `message_N.db`
+    拿原始 XML —— 正好把持续的慢查询/500 压在刚起步的微信上，那几个窗口
+    就是当天的崩溃窗口。配合 `live_history.POLL_ROWS_PER_SHARD` 一起把速度压下来。
+    """
+    try:
+        v = float((cfg or {}).get("poll_min_interval", 1))
+    except (TypeError, ValueError):
+        return 1.0
+    return v if v > 0 else 0.0
+
+
+def _round_sleep(had_msgs, spent, interval, min_round):
+    """一轮结束后该睡多久（秒）。抽成纯函数只为了能自测（见 selftest_bot_loop）。
+
+    没消息：照旧睡 `interval` —— 正常轮询节奏，一个字都没改。
+    有消息：让这一轮至少占满 `min_round` 秒 —— 理由见 `_min_round_interval`。
+    """
+    if not had_msgs:
+        return float(interval)
+    return max(0.0, float(min_round) - float(spent))
+
+
 def iter_aixed_messages(client, interval, tick=None, cfg=None):
     """aixed 没有收消息接口，只能轮询数据库拿新消息。
 
@@ -2469,6 +2524,7 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
     """
     global _LAST_CURSOR_SAVE
     tick = tick or (lambda: None)
+    min_round = _min_round_interval(cfg)
     st = (cfg or {}).get("state") or {}
     try:
         resume_window = max(0, int(st.get("resume_window", 1800)))
@@ -2492,10 +2548,26 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
                   f"停机期间的旧消息只通知、不自动回复")
     if cursor is None:
         cursor, seen = client.prime()
+    # 分片被重建过 → 旧游标比新表头部还大 ⇒ 这条分片**永远**读不到新行，而且静默
+    # （不报错、不留痕）。对齐到头部**不会丢任何东西**：比新头部更大的 rowid 本来就不存在。
+    # ⚠️ 「落后很多就跳到头部」那一半故意没做（会少一批旧通知，属语义变更，要用户点头）。
+    try:
+        cursor, _fixed = live_history.align_stale_cursors(client, cursor)
+    except Exception:
+        _fixed = {}
+        traceback.print_exc()
+    if _fixed:
+        _detail = "、".join(f"{k} {old}→{head}" for k, (old, head) in _fixed.items())
+        print(f"[bot] ⚠️ {len(_fixed)} 个 fts 分片的游标**超过**了它当前的最大 rowid"
+              f"（分片被重建过，这条游标再也读不到新行）：{_detail}。已对齐到头部；"
+              f"**不会少收任何消息**（比新头部更大的 rowid 本来就不存在）。")
+        push_notice("⚠️ 检测到微信的消息索引分片被重建过，我已把一条「读不到新消息」的游标"
+                    "对齐到最新。**不会少收任何消息**，只是修掉一个静默收不到的状态。")
     print(f"[bot] 轮询模式：游标 = {cursor}，间隔 {interval}s")
     polls = 0
     fails = 0          # 连续轮询失败次数（成功一次就清零）
     while True:
+        round_started = time.monotonic()
         # 每一轮轮询之前先跑一次定时任务：空闲时这个循环每 interval 秒转一圈，
         # 所以定时精度就是 poll_interval（默认 5 秒）。
         tick()
@@ -2564,8 +2636,10 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
                     traceback.print_exc()
         for m in msgs:
             yield m
-        if not msgs:
-            time.sleep(interval)
+        # 歇口气：没消息按 poll_interval；**有消息也至少隔 `poll_min_interval`** ——
+        # 以前「有消息就完全不睡」，追赶积压时会变成满速扫库（见 _min_round_interval）。
+        time.sleep(_round_sleep(bool(msgs), time.monotonic() - round_started,
+                                interval, min_round))
 
 
 def acquire_single_instance():
@@ -2596,8 +2670,42 @@ def acquire_single_instance():
     return True
 
 
+def _chdir_project_root():
+    """把工作目录切到项目根。返回**原来的**目录（本来就在项目根 / 切不动时返回 None）。
+
+    为什么要有这一条（2026-10-05 真机）：
+    bot 被计划任务/提权方式启动时 CWD 是 `C:\\WINDOWS\\System32`，于是配置里那些
+    **相对路径**（`health.status_file: ./data/status.json`）被解析到系统目录去——
+    `[health] ⚠️ write_status: 写 C:\\WINDOWS\\System32\\data\\status.json 失败：[WinError 5]`
+    每 5 秒一行，把 bot.log 灌满、真正的崩溃线索（慢查询 → HTTP 500 → 10054）全被埋掉；
+    而状态页读的 `data/status.json` 从那一刻起再没更新过（「没反应」和「一切正常」
+    又变得分不出来——这正是 health 存在的理由）。
+
+    三个 .bat 入口本来都 `cd /d` 到项目目录，所以这不是新行为，只是把那条约定
+    补成**硬保证**：不管谁（人 / 计划任务 / 提权 / 别的自动化）怎么起，行为都一样。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        cur = os.getcwd()
+    except OSError:
+        cur = None
+    if cur and os.path.normcase(cur) == os.path.normcase(root):
+        return None
+    try:
+        os.chdir(root)
+    except OSError as e:
+        print(f"[bot] ⚠️ 切到项目目录失败（{root}）：{e}；"
+              f"配置里的相对路径可能被解析到别处", file=sys.stderr, flush=True)
+        return None
+    return cur
+
+
 def main():
+    moved_from = _chdir_project_root()
     setup_logging()
+    if moved_from:
+        print(f"[bot] 工作目录已从 {moved_from} 切到项目目录 {os.getcwd()}"
+              f"（配置里的相对路径都按项目目录解析）")
     if not acquire_single_instance():
         sys.exit(1)
     base_cfg = load_config()
@@ -3125,6 +3233,10 @@ def main():
                             traceback.print_exc()
 
                 if not in_targets and rec is None and watched is None and reply_only:
+                    # 有意丢掉非目标会话的消息 —— 但**拿不到会话名**的那种必须留痕，
+                    # 否则「映射抖动 → 控制会话被认成 session_N → 消息被丢」会一声不吭
+                    # （2026-10-05 真机就是这么变成「我发消息它不理」的）。
+                    _note_offtarget_skip(sender)
                     continue
 
                 query = (msg.content or "").strip()

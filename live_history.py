@@ -38,6 +38,62 @@ _SELF_WXID = ""
 # 结果 bot 看起来只是「没新消息」，实际已经卡死好几分钟，日志里毫无痕迹。
 _POLL_ERRORS = {}
 
+# ── 分片熔断：同一个查询连错 N 次之后就别再每轮重试（2026-10-05 第二次崩溃后加的）──
+# 现场：hook 对查询连续回 `HTTP 500`（`/QueryDB/execute 返回 HTTP 500`），而探活
+# `/QueryDB/status` **是通的** —— 也就是说「整轮跳过」那道闸（见 new_messages 开头）
+# 拦不住这种情况，bot 每 5 秒照发 4 个 fts 分片 + message_0.db，一路砸到一个已经
+# 出错的 hook 上。这里是第二道闸：同一个分片连错 SHARD_FAIL_LIMIT 次 ⇒ 冷却
+# SHARD_COOLDOWN_SEC 秒不发这个查询；到点自动**半开**（放一次过去），再错就再冷却。
+#
+# 为什么安全（**只会晚、不会丢**）：失败就是失败 —— 游标（`message_fts_v4_*` 的 rowid）
+# 和水位线（`__nonttext_seq__` / `__nonttext_pending__`）都不前进，冷却结束照旧从原地
+# 接着查。熔断只在「已经查不动」时触发，正常时一次都不生效（零代价）。
+#
+# ⚠️ 只给**允许延迟**的那几条路挂：fts 分片查询、`message_0.db` 的非文本补捞。
+# **绝不**挂到 session.db 兜底 / 按会话表那两层上——它们是最后一道防线，
+# 静音它们等于「静默收不到消息」，正是这个项目最不能有的形态。
+SHARD_FAIL_LIMIT = 3            # 连续失败到这里就算「这个分片坏了」
+SHARD_COOLDOWN_SEC = 30.0       # 熔断多久（到点放一次探针 = 半开）
+SHARD_TRIP_LOG_SEC = 300.0      # 「已熔断」提示的打印间隔（同一条不刷屏）
+
+# appmsg（链接/引用/文件）回查原文失败、或被熔断时，**如实**贴在摘要后面的一句。
+# 为什么必须说：这条路上「模型只看到用户打的那几个字」正是「引用消息答非所问」的
+# 根因（见 `_v4_new_messages` 里 appmsg 那段的注释）—— 静默降级只会把排查方向带偏。
+APPMSG_NO_XML_NOTE = "（⚠️ 原始内容这次没取到，只有上面这行摘要——别把摘要当成全文）"
+
+_shard_blocked_until = {}       # 分片名 -> 解封时刻（monotonic）
+_shard_trip_logged_at = {}      # 分片名 -> 上次打印「已熔断」的时刻
+
+
+def shard_blocked(key):
+    """这个分片现在是否在熔断冷却里（到点自动半开，返回 False）。"""
+    return time.monotonic() < _shard_blocked_until.get(key, 0.0)
+
+
+def _note_poll_ok(key):
+    """一次成功：清掉失败计数与熔断状态（恢复要**立刻**生效，不等冷却）。"""
+    _POLL_ERRORS.pop(key, None)
+    _shard_blocked_until.pop(key, None)
+
+
+def reset_shard_breakers():
+    """清空熔断状态（自测用：免得一个用例的失败影响下一个）。"""
+    _shard_blocked_until.clear()
+    _shard_trip_logged_at.clear()
+
+
+def _trip_shard(key, n):
+    """把分片打成熔断（冷却 + 同一分片最多 5 分钟提示一次）。"""
+    _shard_blocked_until[key] = time.monotonic() + SHARD_COOLDOWN_SEC
+    now = time.monotonic()
+    if now - _shard_trip_logged_at.get(key, -1e9) < SHARD_TRIP_LOG_SEC:
+        return
+    _shard_trip_logged_at[key] = now
+    print(f"[live] ⚠️ {key} 连续失败 {n} 次：熔断 {SHARD_COOLDOWN_SEC:g} 秒内不再查它"
+          f"（游标/水位线不前进，恢复后从原地接着查，消息不会丢；"
+          f"目的是别再往已经出错的 hook 上加压）",
+          file=sys.stderr, flush=True)
+
 
 def poll_errors():
     """返回当前轮询失败的分片 {分片名: (错误, 连续次数)}。空 dict 表示正常。"""
@@ -50,13 +106,15 @@ def _note_poll_error(key, exc):
     抽成函数是为了让**每一条**轮询路径都必须留痕：fts 分片和 session.db 兜底
     都是「查不动了就永远收不到消息」的地方，静默只有一种后果——
     日志看起来一切正常，实际一条消息都进不来。
-    只打第 1/10/50 次，避免每 5 秒刷一行。
+    只打第 1/10/50 次，避免每 5 秒刷一行；连错到 `SHARD_FAIL_LIMIT` 次另打一行熔断提示。
     """
     n = _POLL_ERRORS.get(key, ("", 0))[1] + 1
     _POLL_ERRORS[key] = (str(exc), n)
     if n in (1, 10, 50):
         print(f"[live] ⚠️ 轮询 {key} 连续失败 {n} 次：{exc}",
               file=sys.stderr, flush=True)
+    if n >= SHARD_FAIL_LIMIT:
+        _trip_shard(key, n)
     return n
 
 
@@ -95,6 +153,15 @@ POLL_BUDGET_SEC = 20.0       # 一轮轮询的总预算（秒）；<=0 = 不限
 # 就触发一次 `force_rescan`（GetAllDBName = 700MB 进程里的全内存扫描）。那是给微信
 # 上负担，也是把轮询拖慢的头号嫌疑。真要重扫的是 fts 那条权威路（间隔仍 300 秒）。
 MSGDBS_RESCAN_INTERVAL = 600.0
+
+# 一轮里**每个 fts 分片**最多取多少行。原来是 200，等于一轮最多 800 行。
+# 2026-10-05 真机实测（重启后追赶积压）：游标每心跳（30 轮）前进 6000 = 每轮满页
+# 200 行，折算约 **300 行/秒**；而每一行 appmsg（链接/文件/引用）还会再回查一次
+# `message_N.db` 拿原始 XML（句柄坏掉时那是 1.59 秒的慢查询 + HTTP 500）——
+# 也就是**持续把失败查询压在一个已经出错的 hook 上**。
+# 降到 20 是拿压力换追赶速度：每轮行数少一个数量级，追赶慢一些，
+# 但**游标照旧只前进、消息一条不丢**（节奏另由 bot 的 `poll_min_interval` 兜底）。
+POLL_ROWS_PER_SHARD = 20
 
 
 class PollBudgetOut(RuntimeError):
@@ -538,23 +605,61 @@ def render_appmsg(xml, summary=""):
 
 
 def _fetch_message_xml(client, talker, local_id):
-    """按 local_id 回 Msg_ 表取一条消息的明文 XML。取不到返回 ""。"""
+    """按 local_id 回 Msg_ 表取一条消息的明文 XML。取不到返回 ""。
+
+    ⚠️ **熔断 + 留痕 + 清账**（2026-10-05 真机，第二次崩溃当天补的）：
+    这条路原来是**每条 appmsg 各来一趟**，而 `_v4_msg_dbs` 只在探到分片时才缓存
+    （探不到 = 空结果不缓存）→ 句柄坏掉时**每条 appmsg 最多再打 8 次探测查询**。
+    真机现场就是这么把 `⚠️ 慢查询 1.59s db=message_0.db` 和
+    `get database handle which named message_0.db failed` 一行行砸出来的。
+    现在：熔断中直接返回 ""（一个查询都不发）；失败计入 `message_0.db` 的熔断计数；
+    一旦查得动就 `_note_poll_ok` 立刻清账（不留「库坏了」的假告警）。
+    取不到时**调用方必须如实标注**，见 `_appmsg_text`。
+    """
     try:
         lid = int(local_id)
     except (TypeError, ValueError):
         return ""
+    if shard_blocked("message_0.db"):
+        return ""
     table = _v4_table_for(talker)
-    for db in _v4_msg_dbs(client):
+    try:
+        dbs = _v4_msg_dbs(client)
+    except Exception as e:
+        _note_poll_error("message_0.db", e)
+        return ""
+    if not dbs:
+        # 探不到任何 message_N.db：这就是「句柄坏了」本身，必须计入熔断，
+        # 否则这条路永远不会被自己打上熔断（探测失败本来是静默的）。
+        _note_poll_error("message_0.db", "探不到 message_N.db 分片（句柄不可用）")
+        return ""
+    for db in dbs:
         try:
             rows = _query(client, db,
                           f"SELECT message_content FROM {table} "
                           f"WHERE local_id = {lid} LIMIT 1")
-        except Exception:
+        except Exception as e:
+            _note_poll_error("message_0.db", e)
             continue
+        _note_poll_ok("message_0.db")      # 查得动 = 这条库活了，别再留假告警
         for r in rows:
             return decode_msg_content(_pick(r, "message_content", 0))
         break
     return ""
+
+
+def _appmsg_text(client, talker, local_id, summary):
+    """appmsg（链接/引用/文件）→ 一行文本：取到原文就用原文，取不到就**如实标注**。
+
+    抽成一个函数，是因为「取不到」有两种（熔断中 / 这次真失败），而两条调用点
+    （轮询 `_v4_new_messages`、历史检索 `_v4_fts_rows`）必须说**同一句话** ——
+    静默降级正是「引用消息答非所问」的老根因。
+    """
+    if not shard_blocked("message_0.db"):
+        xml = _fetch_message_xml(client, talker, local_id)
+        if xml:
+            return render_appmsg(xml, summary)
+    return f"{summary}{APPMSG_NO_XML_NOTE}"
 
 
 def is_wechat4(client):
@@ -726,6 +831,31 @@ def _note_n2id_miss(db, missing):
     print(f"[live] ⚠️ {db} 的 Name2Id 里查不到这些 real_sender_id：{missing[:5]}"
           f"（这些行拿不到发言人，上层会退回编号；不编名字）",
           file=sys.stderr, flush=True)
+
+
+# 「某个 session_id 在 fts 的 Name2Id 里查不到」的上次打印时间（限流，同上一族）。
+_TALKER_MISS_AT = [0.0]
+_TALKER_MISS_INTERVAL = 60.0
+
+
+def note_talker_miss(missing):
+    """会话名查不到时留一行痕（限流 60 秒）。返回是否真打了。
+
+    为什么**非留不可**：拿不到会话名时上层看到的是 `session_<N>`，而它按「不是我该管的
+    会话」**静默**丢掉 —— 2026-10-05 真机就因此变成「我发消息它不理」且**日志里毫无痕迹**，
+    只能靠翻数据库倒推。留痕之后，一眼就能区分「真的没消息」和「消息被丢了」。
+    """
+    ids = list(missing or [])
+    if not ids:
+        return False
+    now = time.monotonic()
+    if now - _TALKER_MISS_AT[0] < _TALKER_MISS_INTERVAL:
+        return False
+    _TALKER_MISS_AT[0] = now
+    print(f"[live] ⚠️ fts 的 Name2Id 里查不到这些 session_id：{ids[:5]}"
+          f"（这些消息拿不到会话名 → 上层会按「非目标会话」丢掉；已刷新过一次映射仍查不到，"
+          f"别当成「没消息」）", file=sys.stderr, flush=True)
+    return True
 
 
 def _v4_shard_senders(client, db, ids):
@@ -1321,8 +1451,15 @@ def fts_alive(client):
                    "这正是「静默失效」的典型形态")
 
 
-def _v4_fts_session_map(client):
-    """fts 库的 Name2Id：rowid -> 会话名。（缓存 10 分钟，空结果不缓存）"""
+def _v4_fts_session_map(client, refresh=False):
+    """fts 库的 Name2Id：rowid -> 会话名。（缓存 10 分钟，空结果不缓存）
+
+    `refresh=True` = **先扔掉缓存再查一次**。谁需要它（2026-10-05 真机）：`_v4_new_messages`
+    碰到「这个 session_id 查不到名字」的时候。那次启动正好撞在微信**重建索引**的窗口里，
+    映射是重建中途建的 → filehelper 被认成 `session_297` → 上层按「不是我该管的会话」
+    丢掉，而且一行日志都没有（用户看到的只是「我发消息它不理」）。
+    拿 10 分钟的旧映射硬判，等于把一次抖动放大成十分钟的静默。
+    """
     def build():
         out = {}
         try:
@@ -1332,6 +1469,11 @@ def _v4_fts_session_map(client):
         for r in rows:
             out[_as_int(_pick(r, "rowid", 0))] = str(_pick(r, "username", 1) or "")
         return out
+    if refresh:
+        try:
+            delattr(client, "_lh_fts_smap")
+        except Exception:
+            pass
     return _cached_filled(client, "_lh_fts_smap", build)
 
 
@@ -1399,9 +1541,8 @@ def _v4_fts_rows(client, where, limit, smap, self_id, first_hit=False):
         # （以前这里直接 continue，结果「引用」消息在历史里完全看不到）
         if lt != 1:
             if (lt & 0xFFFFFFFF) == 49:
-                text = render_appmsg(
-                    _fetch_message_xml(client, talker, _pick(r, "message_local_id", 5)),
-                    text)
+                # 与轮询那条路同一套（含熔断与「没取到就如实标注」，见 _appmsg_text）
+                text = _appmsg_text(client, talker, _pick(r, "message_local_id", 5), text)
             else:
                 text = _render_nontext(lt, text)
         out.append({
@@ -2303,6 +2444,39 @@ def _v4_fts_cursors(client):
     return out
 
 
+def align_stale_cursors(client, cursors):
+    """把「游标**超过**该分片当前最大 rowid」的 fts 游标对齐到头部。返回 `(游标, 修了哪些)`。
+
+    为什么只做这一半（2026-10-05 真机，用户拍板「b」）：`message_fts_v4_*` 的 rowid 空间在
+    **分片被重建**之后会从头开始（`force_rescan` / 微信自己重建索引）。旧游标比新表头部
+    还大 ⇒ `WHERE rowid > 游标` **永远 0 行**：这条分片此后一条新消息都收不到，而且
+    **不报错、不留痕** —— 正是本项目最怕的那种「静默失效」（用户看到的是「它不理我」）。
+
+    对齐到头部**不可能丢任何东西**：比新头部更大的 rowid 本来就不存在，那条查询一行都取不到。
+    所以这不是「跳过历史」，是把一条**死游标**救活。
+
+    ⚠️ 另一半（游标**落后**头部很多就跳到头部）**故意不做**：那会真少一批旧通知，
+    属于语义变更，必须用户明确点头。
+
+    查不到头部的分片**一律不动**（失败要保守，绝不猜）；第二个返回值只含真动过的分片。
+    """
+    out = dict(cursors or {})
+    fixed = {}
+    try:
+        heads = _v4_fts_cursors(client) or {}
+    except Exception:
+        return out, fixed
+    for tab, head in heads.items():
+        if tab not in out:
+            continue                     # 游标里没有这条：它下一轮本来就从 0 起读，不归这里管
+        head = _as_int(head)
+        cur = _as_int(out.get(tab))
+        if cur > head:
+            out[tab] = head
+            fixed[tab] = (cur, head)
+    return out, fixed
+
+
 def _as_int(v):
     try:
         return int(v or 0)
@@ -2456,6 +2630,10 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
         pending = cursors["__nonttext_pending__"] = {}
 
     # 新鲜度信号：每个会话的**最大 local_id**（一次查询，全部会话）。比水位线大 = 有新行。
+    if shard_blocked("message_0.db"):
+        # 熔断中：**只跳过补捞这一条**（水位线/pending 都不动 ⇒ 下一轮照旧接着扫，只晚不丢）。
+        # ⚠️ 绝不因此影响最后两道防线（session.db 兜底 / 按会话表）——那里必须照查。
+        return []
     try:
         seqs = _v4_msg_seqs(client)
     except Exception as e:
@@ -2512,7 +2690,7 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
     return out
 
 
-def _v4_new_messages(client, cursors, limit=200):
+def _v4_new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
     """按 **rowid 游标**取新消息——纯索引范围扫描，最便宜的一条路。
 
     每条消息都带上 rowid，游标按分片推进。这样每次轮询只读「新增的那几行」，
@@ -2537,7 +2715,13 @@ def _v4_new_messages(client, cursors, limit=200):
     smap = _v4_fts_session_map(client)
     self_id = _v4_fts_self_id(client)
     out = []
+    smap_refreshed = False        # 本轮最多刷新一次映射（见下面「查不到会话名」那段）
+    miss_sids = []
     for tab in tables:
+        if shard_blocked(tab):
+            # 熔断中：这一轮连查都不查（见 SHARD_FAIL_LIMIT 那段）。
+            # 游标不动 ⇒ 冷却结束从原地接着查，**只会晚、不会丢**。
+            continue
         cur = _as_int(cursors.get(tab, 0))
         sql = (
             "SELECT rowid, acontent, session_id, sender_id, create_time, local_type, "
@@ -2546,7 +2730,7 @@ def _v4_new_messages(client, cursors, limit=200):
         )
         try:
             found = _query(client, "message_fts.db", sql)
-            _POLL_ERRORS.pop(tab, None)
+            _note_poll_ok(tab)
         except Exception as e:
             # 只报第 1/10/50 次，避免刷屏；不静默是因为静默会让人以为「只是没消息」
             _note_poll_error(tab, e)
@@ -2563,7 +2747,19 @@ def _v4_new_messages(client, cursors, limit=200):
             text = str(_pick(r, "acontent", 1) or "")
             sid = _as_int(_pick(r, "session_id", 2))
             sender = _as_int(_pick(r, "sender_id", 3))
-            talker = smap.get(sid, f"session_{sid}")
+            talker = smap.get(sid) or ""
+            if not talker:
+                # ⚠️ 查不到会话名 ≠ 这条消息不重要。**先刷新一次映射再判**：那份映射是
+                # 10 分钟缓存，而它可能是在微信**重建索引**的中途建的 —— 2026-10-05 真机，
+                # filehelper 因此被认成 `session_297`，上层把「你好」按「非目标会话」**静默丢掉**
+                # （用户看到的只有「我发消息它不理」）。拿旧缓存把人判死十分钟，代价太大。
+                if not smap_refreshed:
+                    smap = _v4_fts_session_map(client, refresh=True)
+                    smap_refreshed = True
+                    talker = smap.get(sid) or ""
+            if not talker:
+                talker = f"session_{sid}"      # 刷新过还是查不到：退回编号（上层会带这串）
+                miss_sids.append(sid)
             # 非文本**不再丢弃**：渲染成一行文本让下游看得见。
             # 丢掉的后果是「用户发了图/链接，bot 完全没反应」。
             if lt != 1:
@@ -2571,10 +2767,9 @@ def _v4_new_messages(client, cursors, limit=200):
                     # appmsg（链接/引用/文件…）：回查原始 XML。fts 的摘要只
                     # 相当于 <title>，**引用消息被引用的原文在 <refermsg> 里**，
                     # 不查原文的话模型只看到用户打的那几个字，答非所问。
-                    text = render_appmsg(
-                        _fetch_message_xml(client, talker,
-                                           _pick(r, "message_local_id", 6)),
-                        text)
+                    # 取不到时由 _appmsg_text **如实标注**（绝不假装摘要就是全文）。
+                    text = _appmsg_text(client, talker,
+                                        _pick(r, "message_local_id", 6), text)
                 else:
                     text = _render_nontext(lt, text)
             out.append({
@@ -2587,6 +2782,11 @@ def _v4_new_messages(client, cursors, limit=200):
                 # 响应（例如自己刚发出去的图不该再被当成新消息）。
                 "local_type": lt,
             })
+
+    if miss_sids:
+        # 刷新过映射还是拿不到会话名：留一行痕（限流）。上层会按「非目标会话」丢掉它们 ——
+        # 那条路本来不打日志，不在这里留痕就等于「消息凭空消失」。
+        note_talker_miss(miss_sids)
 
     # 补漏：图片之类**不在 fts 里**的消息，靠消息表自己的 local_id 水位线捞回来。
     # 详见 _v4_pickup_nontext 的 docstring（这是「对方发图/语音、bot 没反应」的根治处）。
@@ -2751,7 +2951,7 @@ def _v4_new_messages_tables(client, cursors, limit=200):
     return out, cursors
 
 
-def _v3_new_messages(client, cursors, limit=200):
+def _v3_new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
     out = []
     since = _as_int((cursors or {}).get("__time__", 0))
     for db in _v3_msg_dbs(client):
@@ -2775,7 +2975,7 @@ def _v3_new_messages(client, cursors, limit=200):
     return out, {"__time__": max([m["_ts"] for m in out], default=since)}
 
 
-def new_messages(client, cursors, limit=200):
+def new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
     """按游标取新消息。返回 (消息列表, 新游标)。
 
     游标是 dict（4.x 用 rowid 或时间，3.9.x 用时间）。

@@ -1660,6 +1660,62 @@ def t_clear_command():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_chdir_project_root():
+    sec("工作目录归位：被计划任务/提权从别处拉起也一样（2026-10-05 真机）")
+    # 事故：CWD = C:\WINDOWS\System32 时，config 里的相对路径（./data/status.json）
+    # 被解析到系统目录，每轮写状态失败一次 + 刷屏，状态页读的那份再也不更新。
+    old = os.getcwd()
+    other = tempfile.mkdtemp(prefix="botloop_cwd_")
+    try:
+        os.chdir(other)
+        moved = bot._chdir_project_root()
+        chk(os.path.normcase(os.path.realpath(os.getcwd()))
+            == os.path.normcase(os.path.realpath(HERE)),
+            "★ CWD 归位到项目目录")
+        chk(bool(moved) and os.path.normcase(os.path.realpath(moved))
+            == os.path.normcase(os.path.realpath(other)),
+            "返回原来的目录（好让日志说清是从哪儿被拉起来的）")
+        chk(bot._chdir_project_root() is None, "本来就在项目目录时返回 None（不重复切）")
+    finally:
+        os.chdir(old)
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def t_round_pacing():
+    sec("追赶限速：有消息时也不许满速扫库（2026-10-05 真机）")
+    # 事故：重启后追赶积压，旧实现「有消息就完全不睡」→ 实测约 2 秒/轮、
+    # 每轮 3 个分片各满页 200 行 ≈ 300 行/秒，而每行 appmsg 还回查一次 message_N.db。
+    chk(bot._round_sleep(False, 0.1, 5, 1) == 5,
+        "稳态（没消息）照旧睡 poll_interval，一个字没改")
+    chk(abs(bot._round_sleep(True, 0.2, 5, 1) - 0.8) < 1e-9,
+        "★ 有消息且这轮才花 0.2s → 补到 min_round（1s）")
+    chk(bot._round_sleep(True, 3.0, 5, 1) == 0.0,
+        "★ 有消息但这轮本来就花了 3s → 不再额外睡（不拖慢正常节奏）")
+    chk(bot._round_sleep(True, 0.1, 5, 0) == 0.0,
+        "poll_min_interval=0 = 关掉这个闸")
+    chk(bot._min_round_interval({}) == 1.0, "缺省 1 秒")
+    chk(bot._min_round_interval({"poll_min_interval": "2.5"}) == 2.5,
+        "配置里写字符串也认")
+    chk(bot._min_round_interval({"poll_min_interval": 0}) == 0.0, "0 = 关")
+    chk(bot._min_round_interval({"poll_min_interval": "abc"}) == 1.0,
+        "读不出来 → 回默认 1（不静默变成 0=关）")
+
+
+def t_offtarget_note():
+    sec("丢消息要留痕：只有「拿不到会话名」的那类才算故障（2026-10-05）")
+    bot._OFFTARGET_N[0] = 0
+    bot._OFFTARGET_AT[0] = 0.0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r1 = bot._note_offtarget_skip("98765432109@chatroom")
+        r2 = bot._note_offtarget_skip("session_297")
+        r3 = bot._note_offtarget_skip("session_555")
+    chk(r1 is False, "普通群消息（有名字的会话）不留痕 —— 那是有意丢的")
+    chk(r2 is True and "拿不到会话名" in buf.getvalue(),
+        "★ 拿不到会话名（session_N）才留痕，并说清「这不是没消息」")
+    chk(r3 is False, "★ 留痕有限流（60 秒内不重复刷）")
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1697,6 +1753,9 @@ def main():
     t_clear_command()
     t_help_matches_reality()
     t_help_args_really_work()
+    t_chdir_project_root()
+    t_round_pacing()
+    t_offtarget_note()
 
     print("\n" + "=" * 60)
     if _FAIL:

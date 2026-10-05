@@ -43,6 +43,12 @@ def _warn(msg):
         pass
 
 
+# 同一句告警的最小间隔（秒）。专门给「每轮都会重复失败」的地方用（见 Health._warn_throttled）：
+# 2026-10-05 真机，状态盘写失败时这里**每 5 秒**刷一行，把 bot.log 灌满，
+# 真正的崩溃线索（慢查询 → HTTP 500 → 10054）全被埋在里面。
+WARN_THROTTLE_SEC = 60.0
+
+
 def _num(value, default):
     """把配置里的数字读成 float；读不出来就用默认值（并说明一句）。"""
     if value is None or isinstance(value, bool):
@@ -244,10 +250,22 @@ class Health:
             h.get("alert_cooldown", DEFAULTS["alert_cooldown"]),
             DEFAULTS["alert_cooldown"],
         )
-        status_file = h.get("status_file") or DEFAULTS["status_file"]
-        self.status_file = os.path.abspath(str(status_file))
+        status_file = str(h.get("status_file") or DEFAULTS["status_file"]).strip() \
+            or DEFAULTS["status_file"]
+        if not os.path.isabs(status_file):
+            # ⚠️ 相对路径**按项目根**解析，绝不能交给 os.path.abspath 按进程 CWD 解析。
+            # 2026-10-05 真机：bot 被计划任务/提权方式起时 CWD = C:\WINDOWS\System32，
+            # config.yaml 里的 `./data/status.json` 于是变成
+            # `C:\WINDOWS\System32\data\status.json` —— 建目录被拒（WinError 5）、每轮
+            # 写一次失败一次，刷满 bot.log；而状态页读的 data/status.json 从此再没更新过。
+            # 项目里其它读 config 相对路径的地方（semantic._abs / image_read.cache_path /
+            # file_read.export_dir）都是这个口径，这里补齐。
+            status_file = os.path.join(PROJECT_ROOT, status_file)
+        self.status_file = os.path.normpath(status_file)
         # 通知函数：默认用模块级的 notify。测试里会换成记录用的假函数。
         self.notify_fn = notify_fn if callable(notify_fn) else notify
+        # 告警节流状态：{键: (上次打印时刻, 被折叠的条数)}，见 _warn_throttled
+        self._warn_state = {}
 
         self.started_at = time.time()
         self.started_at_iso = _iso(self.started_at)
@@ -545,6 +563,25 @@ class Health:
         except Exception:
             return None
 
+    def _warn_throttled(self, key, msg, interval=WARN_THROTTLE_SEC):
+        """按 key 节流的 _warn：同一个失败在 interval 秒内只打第一行。
+
+        为什么必须有：**每轮都会碰的失败**（写状态盘就是每轮一次）以前是每 5 秒一行，
+        几小时就把 bot.log 灌成几 MB，把真正的线索埋掉（真机踩过）。
+        绝不静默：被折叠掉的次数会在下一行里如实报出来。
+        节流状态挂在实例上（不是模块级），所以新建一个 Health 就是干净的一份，
+        自测之间不会互相影响。（`note_login` 那条路本来就有 alert_cooldown，不归这里管。）
+        """
+        now = time.monotonic()
+        last, folded = self._warn_state.get(key, (0.0, 0))
+        if last and (now - last) < interval:
+            self._warn_state[key] = (last, folded + 1)
+            return False
+        tail = f"（过去 {interval:g} 秒内同类失败还有 {folded} 次，已折叠）" if folded else ""
+        self._warn_state[key] = (now, 0)
+        _warn(msg + tail)
+        return True
+
     def write_status(self):
         """把 snapshot() 原子写到 status_file（临时文件 + os.replace）。失败返回 False。"""
         try:
@@ -579,7 +616,9 @@ class Health:
             tmp_path = None
             return True
         except Exception as e:
-            _warn(f"write_status: 写 {self.status_file} 失败：{e}")
+            # 这里用节流版：写不进去往往是**持续**的（权限/目录不对），
+            # 而这条路径每轮都会被调一次——不节流就是每 5 秒一行。
+            self._warn_throttled("write_status", f"写 {self.status_file} 失败：{e}")
             return False
         finally:
             if tmp_path:

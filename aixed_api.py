@@ -407,18 +407,26 @@ class AixedClient:
         # 消息 dict 的内部排序键统一叫 _ts（live_history 里都是这个）
         return (m["talker"], m["_ts"], str(m["content"])[:120])
 
-    def poll_messages(self, since=0, seen=None, limit=200, seen_max=2000):
+    def poll_messages(self, since=0, seen=None, limit=None, seen_max=2000):
         """查 create_time >= since 的文本消息。
 
         返回 (Msg 列表, 新游标, seen)。调用方把这三样存下来，下次原样传回。
 
         用 >= 而不是 >，再配合 seen 去重：边界上同一秒到达的消息不会漏，
         重复查到的也不会二次处理。seen 是 dict（当有序集合用），超过 seen_max 淘汰最早的。
+
+        `limit=None` = **别在这里定这个数**，用 `live_history` 的默认
+        （`POLL_ROWS_PER_SHARD`：每分片每轮的行数，2026-10-05 从 200 降到 20 ——
+        「每轮满页」在追赶积压时会把 hook 压垮，理由写在那条常量的注释里）。
+        以前这里写死 200，等于**第二个所有者**，改一处不生效。
         """
         import live_history
         if seen is None:
             seen = {}
-        raw, new_cursor = live_history.new_messages(self, since, limit)
+        if limit is None:
+            raw, new_cursor = live_history.new_messages(self, since)
+        else:
+            raw, new_cursor = live_history.new_messages(self, since, limit)
         out = []
         for m in raw:
             key = self._key(m)

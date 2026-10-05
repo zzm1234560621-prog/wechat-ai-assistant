@@ -96,10 +96,17 @@ def model_name(cfg):
 
 
 def model_dir(cfg):
-    """本地模型目录。放在 `data/models/` 下（`data/` 已被 .gitignore 忽略）。"""
+    """本地模型目录。放在 `data/models/` 下（`data/` 已被 .gitignore 忽略）。
+
+    ⚠️ 配置里的相对路径**按项目目录**解析，不用 `os.path.abspath`（那是按进程 CWD）
+    —— 2026-10-05 真机：bot 被计划任务/提权方式起时 CWD = C:\\WINDOWS\\System32，
+    于是 `./data/...` 这类值会落到系统目录去（建目录被拒 / 找不到模型），
+    而且**不报错**。同口径的还有 `semantic._abs`、`image_read.cache_path`。
+    """
     d = section(cfg).get("model_dir")
     if d:
-        return os.path.abspath(os.path.expanduser(str(d)))
+        d = os.path.expanduser(str(d))
+        return d if os.path.isabs(d) else os.path.join(PROJECT_DIR, d)
     return os.path.join(PROJECT_DIR, "data", "models", f"faster-whisper-{model_name(cfg)}")
 
 

@@ -643,6 +643,9 @@ def main():
     # ---------------------------------------------------------------
     print("\n── fts 主路径的历史字段：非文本要带 local_type ──")
     ok &= _t_fts_history_fields()
+    ok &= _t_appmsg_breaker()
+    ok &= _t_align_stale_cursor()
+    ok &= _t_talker_miss()
 
     print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
     ok &= _t_nonttext_pickup()
@@ -819,6 +822,210 @@ class _PickupMultiStub:
 
     def msg_queries(self):
         return [s for db, s in self.sql_log if "FROM Msg_" in s]
+
+
+def _t_appmsg_breaker():
+    """appmsg 原文回查：坏库时**不许按行砸**，而且取不到要如实说（2026-10-05 真机）。
+
+    真机现场：追赶积压时每条 appmsg 都回查一次 message_N.db，而句柄坏掉时
+    `_v4_msg_dbs` 的空结果**不缓存** → 每条最多再打 8 次探测查询；日志里就是
+    `⚠️ 慢查询 1.59s db=message_0.db` + `get database handle … failed` 一行行刷。
+    """
+    print("\n── appmsg 原文回查：熔断 + 如实标注（2026-10-05 真机）──")
+    ok = True
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+
+    def good_client():
+        c = _FakeClient(lambda db, sql: [{"message_content":
+                                          "<appmsg><title>一条链接</title></appmsg>"}]
+                        if "message_content" in sql else [])
+        c._lh_v4_msgdbs = (time.time(), ["message_0.db"])   # 直接给分片缓存，省掉探测
+        return c
+
+    # ① 正常：取到原文 -> 用原文，**不贴**标注
+    txt = live_history._appmsg_text(good_client(), "filehelper", 7, "摘要")
+    ok &= check("原文取到时用原文（不贴标注）",
+                "一条链接" in txt and live_history.APPMSG_NO_XML_NOTE not in txt, txt)
+    ok &= check("取到原文会清掉这条库的失败记账",
+                "message_0.db" not in live_history.poll_errors(),
+                live_history.poll_errors())
+
+    # ② 熔断中：一个查询都不发，但**如实标注**
+    live_history._shard_blocked_until["message_0.db"] = time.monotonic() + 30
+    bad = _FakeClient(_dead_db)
+    bad._lh_v4_msgdbs = (time.time(), ["message_0.db"])
+    n_before = len(bad.sql_log)
+    txt2 = live_history._appmsg_text(bad, "filehelper", 8, "摘要")
+    ok &= check("★ 熔断中：一个查询都不发（不再按行砸坏库）",
+                len(bad.sql_log) == n_before, bad.sql_log[n_before:])
+    ok &= check("★ 熔断中：如实说「原始内容没取到」，且摘要还在",
+                live_history.APPMSG_NO_XML_NOTE in txt2 and "摘要" in txt2, txt2)
+    live_history.reset_shard_breakers()
+
+    # ③ 回查失败要计入熔断（以前这条路的失败根本不计数，永远打不破）
+    _clear_poll_errors()
+    for i in range(live_history.SHARD_FAIL_LIMIT):
+        c = _FakeClient(_dead_db)
+        c._lh_v4_msgdbs = (time.time(), ["message_0.db"])
+        ok &= check(f"第 {i + 1} 次回查失败会留痕",
+                    live_history._fetch_message_xml(c, "filehelper", 9) == "")
+    ok &= check("★ 连错到阈值就把这条库打成熔断",
+                live_history.shard_blocked("message_0.db"), live_history.poll_errors())
+
+    # ④ 冷却到点（半开）后查得动 -> 立刻解除并清账
+    live_history._shard_blocked_until["message_0.db"] = time.monotonic() - 1
+    live_history._fetch_message_xml(good_client(), "filehelper", 10)
+    ok &= check("★ 查得动就立刻解除熔断 + 清掉告警（不留假故障）",
+                not live_history.shard_blocked("message_0.db")
+                and "message_0.db" not in live_history.poll_errors())
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+    return ok
+
+
+def _t_align_stale_cursor():
+    """分片被重建 → 旧游标比新头部还大 = 这条分片永远读不到新行（静默失效）。
+
+    2026-10-05 用户拍板只做这一半：对齐**不会丢任何东西**（比新头部更大的 rowid 本来
+    就不存在）。另一半（落后很多就跳到头部，会少一批旧通知）故意不做。
+    """
+    print("\n── 死游标对齐：游标 > 头部（分片被重建，2026-10-05）──")
+    ok = True
+    HEADS = {"message_fts_v4_0": 100, "message_fts_v4_1": 900}
+
+    def mk(tabs):
+        state = {"head": dict(HEADS)}      # 用例可以改它，模拟「这张表又长了」
+
+        def router(db, sql):
+            if "MAX(rowid)" in sql:
+                tab = sql.split("FROM ")[-1].strip()
+                return [{"m": state["head"][tab]}] if tab in state["head"] else []
+            if "WHERE rowid >" in sql:
+                tab = sql.split("FROM ")[1].split()[0]
+                bound = int(sql.split("WHERE rowid >")[1].split()[0])
+                if tab not in state["head"] or bound >= state["head"][tab]:
+                    return []          # 一行都取不到（死游标 / 还没新消息）
+                return [{"rowid": state["head"][tab], "acontent": "重建后第一条",
+                         "session_id": 1, "sender_id": 1, "create_time": 1,
+                         "local_type": 1, "message_local_id": 1}]
+            return []
+        c = _FakeClient(router)
+        c._lh_fts_tables = (time.time(), list(tabs))
+        c._lh_fts_smap = (time.time(), {1: "filehelper"})
+        c._lh_fts_selfid = (time.time(), 0)
+        c._align_state = state
+        return c
+
+    # ① 语义：超头部的对齐；只是落后的**一个字都不动**；相等不误报
+    c = mk(["message_fts_v4_0", "message_fts_v4_1"])
+    cur = {"message_fts_v4_0": 200524, "message_fts_v4_1": 500, "__time__": 1}
+    new, fixed = live_history.align_stale_cursors(c, cur)
+    ok &= check("★ 游标超过头部的分片被对齐到头部",
+                new.get("message_fts_v4_0") == 100
+                and fixed.get("message_fts_v4_0") == (200524, 100), (new, fixed))
+    ok &= check("★ 只是落后的分片一个字都不动（那是没做的那一半）",
+                new.get("message_fts_v4_1") == 500 and "message_fts_v4_1" not in fixed, new)
+    ok &= check("★ 游标 == 头部（正常空闲）不误报",
+                live_history.align_stale_cursors(
+                    c, {"message_fts_v4_0": 100, "message_fts_v4_1": 900})[1] == {})
+    ok &= check("只改该改的键，别的原样", set(new) == set(cur), sorted(new))
+
+    # ②③④ 一条死游标分片：对齐前**连新消息都收不到**，对齐后立刻收得到
+    c1 = mk(["message_fts_v4_0"])
+    stale = {"message_fts_v4_0": 200524}
+    msgs_before, _ = live_history._v4_new_messages(c1, dict(stale))
+    ok &= check("★ 对齐前：重建后的新消息一条都收不到（而且不报错 = 静默失效）",
+                msgs_before == [], msgs_before)
+    c1._align_state["head"]["message_fts_v4_0"] = 101      # 模拟「重建后来了第一条新消息」
+    msgs_still, _ = live_history._v4_new_messages(c1, dict(stale))
+    ok &= check("★ 死游标即使来了新消息也照样收不到（这正是不对齐的代价）",
+                msgs_still == [], msgs_still)
+    aligned, _ = live_history.align_stale_cursors(c1, stale)
+    ok &= check("★ 对齐后游标落在**当时**的头部（不是它自己记的旧值）",
+                aligned.get("message_fts_v4_0") == 101, aligned)
+    c1._align_state["head"]["message_fts_v4_0"] = 102      # 又来一条新消息
+    msgs_after, _ = live_history._v4_new_messages(c1, aligned)
+    ok &= check("★ 对齐后：这条分片立刻又能收到新消息",
+                [m["content"] for m in msgs_after] == ["重建后第一条"], msgs_after)
+
+    # ⑤ 头部查不到 -> 保守不动，绝不猜
+    bad = _FakeClient(_dead_db)
+    bad._lh_fts_tables = (time.time(), ["message_fts_v4_0"])
+    new3, fixed3 = live_history.align_stale_cursors(bad, {"message_fts_v4_0": 200524})
+    ok &= check("★ 头部查不到时保守不动（不许猜）",
+                new3 == {"message_fts_v4_0": 200524} and fixed3 == {}, (new3, fixed3))
+    return ok
+
+
+def _t_talker_miss():
+    """会话名查不到：**先刷新一次映射**，刷新还查不到就留痕。
+
+    2026-10-05 真机：映射是微信重建索引的中途建的（10 分钟缓存）→ filehelper 被认成
+    `session_297` → 上层按「非目标会话」**静默丢掉**「你好」，日志里一行都没有。
+    """
+    print("\n── 会话名拿不到：刷新一次 + 如实留痕（2026-10-05 真机）──")
+    ok = True
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+
+    def mk(seen_maps):
+        state = {"n": 0}
+
+        def router(db, sql):
+            if "Name2Id" in sql and "username" in sql:
+                state["n"] += 1
+                seen_maps.append(state["n"])
+                if state["n"] == 1:            # 第一次（旧缓存）：故意缺 297
+                    return [{"rowid": 1, "username": "2598@openim"}]
+                return [{"rowid": 1, "username": "2598@openim"},
+                        {"rowid": 297, "username": "filehelper"}]
+            if "WHERE rowid >" in sql:
+                return [{"rowid": 10, "acontent": "你好", "session_id": 297,
+                         "sender_id": 3, "create_time": 1000, "local_type": 1,
+                         "message_local_id": 5}]
+            return []
+        c = _FakeClient(router)
+        c._lh_fts_tables = (time.time(), ["message_fts_v4_0"])
+        c._lh_fts_selfid = (time.time(), 99)
+        return c
+
+    maps = []
+    msgs, _ = live_history._v4_new_messages(mk(maps), {"message_fts_v4_0": 0})
+    ok &= check("★ 查不到会话名时**先刷新一次映射**（不是拿旧缓存硬判）",
+                len(maps) >= 2, maps)
+    ok &= check("★ 刷新拿到名字 → talker 就是 filehelper（消息不再被当非目标丢掉）",
+                [m["talker"] for m in msgs] == ["filehelper"], msgs)
+
+    def mk_missing():
+        def router(db, sql):
+            if "Name2Id" in sql and "username" in sql:
+                return [{"rowid": 1, "username": "2598@openim"}]
+            if "WHERE rowid >" in sql:
+                return [{"rowid": 11, "acontent": "你好", "session_id": 555,
+                         "sender_id": 3, "create_time": 1001, "local_type": 1,
+                         "message_local_id": 6}]
+            return []
+        c = _FakeClient(router)
+        c._lh_fts_tables = (time.time(), ["message_fts_v4_0"])
+        c._lh_fts_selfid = (time.time(), 99)
+        return c
+
+    live_history._TALKER_MISS_AT[0] = 0.0
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        msgs2, _ = live_history._v4_new_messages(mk_missing(), {"message_fts_v4_0": 0})
+        first_txt = buf.getvalue()
+        live_history._v4_new_messages(mk_missing(), {"message_fts_v4_0": 0})
+        second_txt = buf.getvalue()
+    ok &= check("★ 刷新后仍查不到 → 退回编号，并**留一行痕**",
+                [m["talker"] for m in msgs2] == ["session_555"]
+                and "session_id" in first_txt, (msgs2, first_txt[:90]))
+    ok &= check("★ 留痕有限流（60 秒内不重复刷）",
+                second_txt == first_txt, second_txt[len(first_txt):][:90])
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+    return ok
 
 
 def _t_nonttext_pickup():
