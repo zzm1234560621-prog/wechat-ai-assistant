@@ -1716,6 +1716,15 @@ def t_offtarget_note():
     chk(r3 is False, "★ 留痕有限流（60 秒内不重复刷）")
 
 
+def t_max_catchup():
+    sec("跳头部的阈值：可调、可关，读不出来不许静默关掉（2026-10-05）")
+    chk(bot._max_catchup({}) == bot.live_history.CURSOR_MAX_GAP, "缺省用 live_history 的默认阈值")
+    chk(bot._max_catchup({"poll_max_catchup": 20000}) == 20000, "配置里的值说了算")
+    chk(bot._max_catchup({"poll_max_catchup": 0}) == 0, "★ 0 = 关掉这条闸（用户想慢慢追）")
+    chk(bot._max_catchup({"poll_max_catchup": "abc"}) == bot.live_history.CURSOR_MAX_GAP,
+        "★ 读不出来 → 回默认阈值，而不是静默变成 0（那等于悄悄把闸关了）")
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1756,6 +1765,7 @@ def main():
     t_chdir_project_root()
     t_round_pacing()
     t_offtarget_note()
+    t_max_catchup()
 
     print("\n" + "=" * 60)
     if _FAIL:

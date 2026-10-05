@@ -645,6 +645,7 @@ def main():
     ok &= _t_fts_history_fields()
     ok &= _t_appmsg_breaker()
     ok &= _t_align_stale_cursor()
+    ok &= _t_skip_far_behind()
     ok &= _t_talker_miss()
 
     print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
@@ -1025,6 +1026,60 @@ def _t_talker_miss():
                 second_txt == first_txt, second_txt[len(first_txt):][:90])
     live_history.reset_shard_breakers()
     _clear_poll_errors()
+    return ok
+
+
+def _t_skip_far_behind():
+    """落后太多 → 跳到头部（**会丢那批旧通知**，用户 2026-10-05 明确要，带如实通知）。
+
+    真机：v4_2 从 3400 追到 135421 ≈ 13 万行；按每轮 20 行要追几小时，期间新消息全被压在后面。
+    """
+    print("\n── 落后太多就跳头部（会丢旧通知，阈值可关）──")
+    ok = True
+    HEADS = {"message_fts_v4_0": 100000, "message_fts_v4_1": 500}
+
+    def mk():
+        def router(db, sql):
+            if "MAX(rowid)" in sql:
+                tab = sql.split("FROM ")[-1].strip()
+                return [{"m": HEADS[tab]}] if tab in HEADS else []
+            return []
+        c = _FakeClient(router)
+        c._lh_fts_tables = (time.time(), ["message_fts_v4_0", "message_fts_v4_1"])
+        return c
+
+    # ① 落后在阈值以内 → 一个字都不动（不许为了省事就跳）
+    cur = {"message_fts_v4_0": 99000, "message_fts_v4_1": 100}    # 差 1000 / 400
+    new, jumped = live_history.skip_far_behind(mk(), cur, max_gap=5000)
+    ok &= check("★ 落后在阈值内 → 一个字都不动（继续慢慢追、通知照发）",
+                new == cur and jumped == {}, (new, jumped))
+
+    # ② 落后超过阈值 → 跳到头部，并如实报出「跳了多少行」
+    cur2 = {"message_fts_v4_0": 3400, "message_fts_v4_1": 100}
+    new2, jumped2 = live_history.skip_far_behind(mk(), cur2, max_gap=5000)
+    ok &= check("★ 落后超过阈值 → 该分片跳到头部",
+                new2.get("message_fts_v4_0") == 100000, new2)
+    ok &= check("★ 如实报出跳过的行数（上层要照这个数通知用户）",
+                jumped2.get("message_fts_v4_0") == (3400, 100000, 96600), jumped2)
+    ok &= check("没超阈值的那个分片照样不动",
+                new2.get("message_fts_v4_1") == 100, new2)
+
+    # ③ max_gap=0 = 关掉这条闸（永远慢慢追）
+    new3, jumped3 = live_history.skip_far_behind(mk(), cur2, max_gap=0)
+    ok &= check("★ poll_max_catchup=0 → 关掉这条闸（不跳）",
+                new3 == cur2 and jumped3 == {}, (new3, jumped3))
+
+    # ④ 阈值读不出来 → 回默认，**不许静默变成 0（= 关闸）**
+    new4, jumped4 = live_history.skip_far_behind(mk(), cur2, max_gap="abc")
+    ok &= check("★ 阈值是垃圾值 → 回默认阈值，而不是静默关闸",
+                new4.get("message_fts_v4_0") == 100000, (new4, jumped4))
+
+    # ⑤ 头部查不到 → 保守不动
+    bad = _FakeClient(_dead_db)
+    bad._lh_fts_tables = (time.time(), ["message_fts_v4_0"])
+    new5, jumped5 = live_history.skip_far_behind(bad, {"message_fts_v4_0": 3400})
+    ok &= check("★ 头部查不到时保守不动（不许猜）",
+                new5 == {"message_fts_v4_0": 3400} and jumped5 == {}, (new5, jumped5))
     return ok
 
 

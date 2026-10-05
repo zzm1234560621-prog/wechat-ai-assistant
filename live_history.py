@@ -2447,7 +2447,7 @@ def _v4_fts_cursors(client):
 def align_stale_cursors(client, cursors):
     """把「游标**超过**该分片当前最大 rowid」的 fts 游标对齐到头部。返回 `(游标, 修了哪些)`。
 
-    为什么只做这一半（2026-10-05 真机，用户拍板「b」）：`message_fts_v4_*` 的 rowid 空间在
+    为什么只做这一半（2026-10-05 真机，用户拍板只做不会丢东西的那一半）：`message_fts_v4_*` 的 rowid 空间在
     **分片被重建**之后会从头开始（`force_rescan` / 微信自己重建索引）。旧游标比新表头部
     还大 ⇒ `WHERE rowid > 游标` **永远 0 行**：这条分片此后一条新消息都收不到，而且
     **不报错、不留痕** —— 正是本项目最怕的那种「静默失效」（用户看到的是「它不理我」）。
@@ -2455,8 +2455,9 @@ def align_stale_cursors(client, cursors):
     对齐到头部**不可能丢任何东西**：比新头部更大的 rowid 本来就不存在，那条查询一行都取不到。
     所以这不是「跳过历史」，是把一条**死游标**救活。
 
-    ⚠️ 另一半（游标**落后**头部很多就跳到头部）**故意不做**：那会真少一批旧通知，
-    属于语义变更，必须用户明确点头。
+    ⚠️ 另一半（游标**落后**头部很多就跳到头部）**在这里不做**，单独一个函数
+    `skip_far_behind()`：那会真少一批旧通知，是语义变更。2026-10-05 用户先拍板只做这一半，
+    后来明确要了另一半（带如实通知 + 阈值可调/可关）。
 
     查不到头部的分片**一律不动**（失败要保守，绝不猜）；第二个返回值只含真动过的分片。
     """
@@ -2475,6 +2476,54 @@ def align_stale_cursors(client, cursors):
             out[tab] = head
             fixed[tab] = (cur, head)
     return out, fixed
+
+
+# 「落后太多就跳到头部」的默认阈值：**每个分片**最多忍多少行没读。
+# 为什么有这条闸（2026-10-05，用户明确要）：分片被重建后旧游标可能落在新表很前面
+# （真机见过 v4_2 从 3400 一路追到 135421 ≈ 13 万行）。按每轮 20 行的限速要追几个小时，
+# 而这几小时里**新消息全排在这批历史后面** —— 用户看到的是「发消息半天不回」。
+# 超过阈值就直接跳到头部；代价是**那批旧消息不会再被逐条通知**（会在控制会话如实说明）。
+# 权衡旋钮：调大 = 更愿意慢慢追、通知更全；调小 = 更容易直接跳、回得更快；0 = 关掉这条闸。
+CURSOR_MAX_GAP = 5000
+
+
+def skip_far_behind(client, cursors, max_gap=CURSOR_MAX_GAP):
+    """游标**落后**头部超过 `max_gap` 行时直接跳到头部。返回 `(游标, 跳过哪些)`。
+
+    第二个返回值是 `{分片: (旧游标, 新头部, 跳过的行数)}`。
+
+    ⚠️ **这条闸会丢通知**（那批旧消息不再逐条通知）—— 2026-10-05 用户明确拍板要它，
+    换来的是「不落后、不卡」：落后 13 万行时按限速要追几小时，期间新消息全压在后面。
+    所以规矩是：**触发时必须让上层如实告诉用户**（bot 会打印 + 往控制会话发一条），
+    并且阈值可以由 `poll_max_catchup` 调、`0` 直接关掉。
+
+    与 `align_stale_cursors` 的分工（两条都要，顺序也别反 —— 先对齐死的，再判落后的）：
+      * `游标 > 头部`（分片被重建）→ `align_stale_cursors` 对齐，**不丢任何东西**；
+      * `头部 - 游标 > max_gap`（落后太多）→ 这里跳过，**丢通知**。
+
+    查不到头部的分片**一律不动**；`max_gap <= 0` = 关掉这条闸（永远慢慢追）。
+    """
+    out = dict(cursors or {})
+    jumped = {}
+    try:
+        gap = int(max_gap)
+    except (TypeError, ValueError):
+        gap = CURSOR_MAX_GAP
+    if gap <= 0:
+        return out, jumped
+    try:
+        heads = _v4_fts_cursors(client) or {}
+    except Exception:
+        return out, jumped
+    for tab, head in heads.items():
+        if tab not in out:
+            continue
+        head = _as_int(head)
+        cur = _as_int(out.get(tab))
+        if head - cur > gap:
+            out[tab] = head
+            jumped[tab] = (cur, head, head - cur)
+    return out, jumped
 
 
 def _as_int(v):

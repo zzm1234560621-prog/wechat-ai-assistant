@@ -2489,6 +2489,19 @@ def _note_offtarget_skip(sender):
     return True
 
 
+def _max_catchup(cfg):
+    """落后多少行就**跳到头部**（`poll_max_catchup`；默认用 live_history.CURSOR_MAX_GAP；0 = 关）。
+
+    ⚠️ 这条闸**会丢通知**（那批旧消息不再逐条通知），所以：① 它能被显式关掉（0）；
+    ② 每次触发都必须在控制会话里如实说明（见 iter_aixed_messages 里那段）。
+    配置读不出来时回**默认阈值**，而不是静默变成 0（那等于悄悄把闸关了）。
+    """
+    try:
+        return int((cfg or {}).get("poll_max_catchup", live_history.CURSOR_MAX_GAP))
+    except (TypeError, ValueError):
+        return live_history.CURSOR_MAX_GAP
+
+
 def _min_round_interval(cfg):
     """连续有消息时，两轮之间**至少**隔多少秒（`poll_min_interval`，默认 1；<=0 = 关）。
 
@@ -2550,7 +2563,7 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
         cursor, seen = client.prime()
     # 分片被重建过 → 旧游标比新表头部还大 ⇒ 这条分片**永远**读不到新行，而且静默
     # （不报错、不留痕）。对齐到头部**不会丢任何东西**：比新头部更大的 rowid 本来就不存在。
-    # ⚠️ 「落后很多就跳到头部」那一半故意没做（会少一批旧通知，属语义变更，要用户点头）。
+    # 下一段是**会丢通知**的那一半（落后太多就跳），用户 2026-10-05 明确要，所以带如实通知。
     try:
         cursor, _fixed = live_history.align_stale_cursors(client, cursor)
     except Exception:
@@ -2563,6 +2576,25 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
               f"**不会少收任何消息**（比新头部更大的 rowid 本来就不存在）。")
         push_notice("⚠️ 检测到微信的消息索引分片被重建过，我已把一条「读不到新消息」的游标"
                     "对齐到最新。**不会少收任何消息**，只是修掉一个静默收不到的状态。")
+
+    # 「落后太多就跳到头部」——**会丢那批旧通知**，所以①阈值可配/可关、②每次触发都如实说。
+    # 为什么要它：落后十几万行时按限速要追几小时，而新消息全排在那批历史后面 →
+    # 用户看到的是「发消息半天不回」。跳过去之后新消息立刻就能回。
+    try:
+        cursor, _jumped = live_history.skip_far_behind(client, cursor, _max_catchup(cfg))
+    except Exception:
+        _jumped = {}
+        traceback.print_exc()
+    if _jumped:
+        _rows = sum(v[2] for v in _jumped.values())
+        _jdetail = "、".join(f"{k} {v[0]}→{v[1]}（跳过 {v[2]} 行）"
+                             for k, v in _jumped.items())
+        print(f"[bot] ⚠️ fts 游标落后头部超过阈值（{_max_catchup(cfg)} 行/分片），已**跳到最新**："
+              f"{_jdetail}。合计约 {_rows} 行没读 —— 按限速要追很久，而新消息会被压在后面。"
+              f"⚠️ 这批旧消息**不会再逐条通知**；要看它们请直接说「翻 XX 会话」。")
+        push_notice(f"⚠️ 消息索引落后太多（约 {_rows} 条），我已**跳到最新**："
+                    f"这中间的旧消息**不会再逐条通知**（想看它们直接跟我说「翻 XX 会话」）。"
+                    f"要改成慢慢追就把 config 的 poll_max_catchup 调大或设为 0。")
     print(f"[bot] 轮询模式：游标 = {cursor}，间隔 {interval}s")
     polls = 0
     fails = 0          # 连续轮询失败次数（成功一次就清零）
