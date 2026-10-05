@@ -69,8 +69,12 @@ pypdf>=4.0
 # 收发件人，拿不到附件），再没有就如实说。
 #     .venv\Scripts\python.exe -m pip install extract-msg
 #
-# py7zr / rarfile（.7z / .rar 压缩包）与 extract-msg（Outlook .msg 邮件）见 P3，
-# 用到时按提示单独装；.rar 还需要外部解压器（没有就如实说读不了）。
+# py7zr（.7z 压缩包）/ rarfile（.rar 的**壳**）：
+#     .venv\Scripts\python.exe -m pip install py7zr rarfile
+# ⚠️ 只装 rarfile **不等于 .rar 能读**：真正解压靠**外部程序**（unrar / 7z / bsdtar）。
+#     没有它时代码会如实说读不了——判据只有一份，在 `archive_read.find_rar_tool()`
+#     （它连厂商默认安装位置一起找，所以「不在 PATH」不等于「没装」）。
+#     本机实测（2026-10-05）：PATH 里没有，但 `C:\Program Files\7-Zip\7z.exe` **在**。
 #
 # xlrd：**老 .xls 表格**用它读（纯 Python，比启动 Excel 快也稳）。不装也能读——
 # legacy_office 会自动落到 Office COM / WPS / LibreOffice 那一串。
@@ -83,9 +87,13 @@ pypdf>=4.0
 # sentence-transformers：**本地语义检索**（semantic_search 工具 / semantic.py）用。
 # 不装则那个工具**如实报「没装依赖」并给出安装命令**，其余一切照常——
 # 它**不会**退化成关键词搜索（那是明令禁止的，见 semantic.py 的模块注释）。
-# 它还会拖进 torch，是这个清单里最重的一个，所以**绝不随主程序安装**。
+# 它还会拖进 torch，是这个清单里最重的一个，所以**绝不随主程序安装**；
+# 「可选组件.bat」里它也是唯一**默认不装**（要手打 y）的一项。
 #     .venv\Scripts\python.exe -m pip install sentence-transformers
 # 装完还要显式下一次模型（**只此一条下载路径**，走 hf-mirror 镜像）：
 #     .venv\Scripts\python.exe semantic.py --setup
 # 再建索引（**要先把 bot 停掉**——遍历历史是重活，不能挂在轮询线程上）：
 #     .venv\Scripts\python.exe semantic.py --build --days 90
+# 只看状态 / 纯探针（给脚本和控制台用）：
+#     .venv\Scripts\python.exe semantic.py --status
+#     .venv\Scripts\python.exe semantic.py --ready      # 只回退出码，无输出

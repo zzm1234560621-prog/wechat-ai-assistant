@@ -1,8 +1,10 @@
 # 可选组件（语音转文字 / 网上搜索）——为什么这么装、坑在哪
 
 > 状态：**已落地**（2026-10-05）。它落的是 2026-10-03 用户拍板的那条倡议
-> 「安装包自带 SearXNG + 一键部署全部可选功能（可关闭）」，本轮范围是**两项**：
-> 语音转文字、网上搜索后端。语义检索 / 视频 / 邮件 / 老 Office 那些还没做。
+> 「安装包自带 SearXNG + 一键部署全部可选功能（可关闭）」，本轮范围是**四项**：
+> 语音转文字、网上搜索后端、**文件格式增强包**（视频 / 邮件 / 压缩包 / 老 Office /
+> PDF 内嵌图）、**本地语义检索**。剩下没进菜单的只有 `Pillow` 之外那些**不属于 pip**
+> 的东西（比如 `.rar` 要的外部解压器）——它们只能如实提示，装不了。
 
 ## 1. 要解决的问题不是「功能没写」，是「包发出去了用不了」
 
@@ -38,6 +40,22 @@ installer 还会去拖重包。这条 2026-10-01 踩过，`selftest_audio` 钉�
 |---|---|---|---|
 | 语音转文字 | `envsetup.install_optional("voice")`（pip） | `audio_read.py --setup`（模型到 `data/models/`） | 一键部署第 ③ 步 / `可选组件.bat` |
 | 网上搜索 | `botctl.search_install()`（在它的目录里 `python -m venv` + pip） | 同上（venv 就是它的「模型」） | 同上，另加 [8]→[9]→[4] |
+| 文件格式增强包 | `envsetup.install_optional("formats")`（一条 pip 装七个：av / extract-msg / py7zr / rarfile / xlrd / olefile / Pillow） | 无（都很小，装完立刻能用） | 同上 |
+| 本地语义检索 | `envsetup.install_optional("semantic")`（sentence-transformers，拖进 torch） | `semantic.py --setup` 下模型 + `semantic.py --build --days 90` 建索引 | 同上 |
+
+三条与「重 / 轻」有关的规矩：
+
+- **语义检索是唯一「重」项**（`console._HEAVY` 就它一个）：**一键部署里默认不装**
+  （回车=跳过，要手打 `y`）。它比别的项多两步，其中**建索引必须先停 bot**（遍历历史是重活，
+  挂在轮询线程上会把 hook 拖住）——`_install_semantic` 把「停助手 → 建索引 → 起回来」串成
+  一次确认；用户拒了就**只留命令、不硬来**。
+- **`.rar` 不能只看 `rarfile` 装没装**：它只是个**壳**，真正解压要外部程序（unrar / 7z / bsdtar）。
+  判据只有一份：`archive_read.find_rar_tool()` —— 先看 PATH，再看**厂商默认安装位置**
+  （`%ProgramFiles%\7-Zip\7z.exe` 等）。这条当场纠了一个错判：只看 PATH 的 `7z`/`WinRAR` 时
+  结论是「本机一个都没有」，实际 **7-Zip 装了、只是不在 PATH**。所以「不在 PATH」≠「没装」。
+- **菜单按键不能写死**：开关那一项恒取「项数 + 1」。加到第 4 项时踩过——`[3]` 同时是
+  「格式包」和「自动装开关」，按 3 会去切开关、装不了东西。`selftest_install.T6` 会真跑一遍
+  菜单数按键（只数**可选的**那几行；状态文案里引用的「用 [3] 装」不算）。
 
 - **判据不是 pip 的退出码**：装完**再查一次 import**（语音）/ **再查一次解释器在不在**
   （搜索）。pip 说成功而实际不可用是真会发生的，所以 `install_optional` / `search_install`

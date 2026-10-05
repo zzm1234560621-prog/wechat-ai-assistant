@@ -26,6 +26,31 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE_EXTS = (".zip", ".7z", ".rar")
 ARCHIVE_KINDS = ("zip", "7z", "rar")
 
+# `.rar` 的外部解压器候选：`rarfile` 只是个**壳**，真正解压靠这些外部程序。
+# ⚠️ 这条判据**只有这一份** —— `console.optional_menu` 的状态屏和提示都调
+# `find_rar_tool()`，别在别处再写一遍「找到了没」（见 docs/optional-components-notes.md）。
+_RAR_TOOLS = ("7z", "7za", "7zz", "unrar", "rar", "bsdtar", "WinRAR")
+
+
+def find_rar_tool():
+    """找一个能解 `.rar` 的外部程序；找不到返回 None（**绝不假装有**）。
+
+    先看 PATH，再看**厂商默认安装位置**（7-Zip / WinRAR）。那些是默认路径、换台电脑照样
+    成立，所以不违反「不许写死本机路径」；拼路径只用 `ProgramFiles` 环境变量，不写盘符。
+    """
+    for name in _RAR_TOOLS:
+        p = shutil.which(name)
+        if p:
+            return p
+    for root in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if not root:
+            continue
+        for rel in ("7-Zip\\7z.exe", "WinRAR\\UnRAR.exe", "WinRAR\\WinRAR.exe"):
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                return p
+    return None
+
 
 class _Budget:
     """解压后累计字节的**共享**额度（跨成员、跨嵌套包）。"""

@@ -510,29 +510,34 @@ def main():
         finally:
             console.HOOK_DIR = real_hook
 
-    # ── T6 可选组件（语音转文字 / 网上搜索）的安装入口 ───────────────────
-    # 2026-10-05：这两样**代码在、包里也在**，但依赖和模型都不随包（faster-whisper 在
-    # requirements.txt 里只能写成注释行；SearXNG 的模型/venv 更不能跨机器拷）——
-    # 于是「装完就能用」在别人机器上并不成立，README 却把语音条转文字当卖点。
-    # T6 钉的就是那个**安装入口**，以及它最容易被改坏的两条。
+    # ── T6 可选组件（语音 / 网上搜索 / 格式包 / 语义检索）的安装入口 ──────
+    # 2026-10-05：这些**代码在、包里也在**，但依赖和模型都不随包（它们只能在
+    # requirements.txt 里写成注释行；语音模型、torch、SearXNG 的 venv 更不能跨机器拷）——
+    # 于是「装完就能用」在别人机器上并不成立，而 README 把这些都写在功能卖点里。
+    # T6 钉的就是那个**安装入口**，以及它最容易被改坏的四条。
     print("\n6) T6 可选组件的安装入口")
-    chk("voice" in env.OPTIONAL_PIP, f"注册表里有语音这一项：{list(env.OPTIONAL_PIP)}")
-    comp = env.OPTIONAL_PIP["voice"]
-    chk(comp["specs"] and comp["imports"], "每项都写清「装什么」和「装完 import 什么」")
+    chk(set(env.OPTIONAL_PIP) >= {"voice", "formats", "semantic"},
+        f"注册表里有这几项：{sorted(env.OPTIONAL_PIP)}")
 
     # ★ 最要紧的一条：这些包**绝不能**变成 requirements.txt 的正式行。
     # 写成正式行 → required_pkgs() 要求它们 → 没装的人「装完还是起不来」死循环，
     # installer 还会去拖重包（faster-whisper 真实踩过，selftest_audio 也钉着）。
+    # 每一项都要查——只查 voice 的话，后加的项漏成正式行就没人拦。
     formal = {env.requirement_name(s).lower() for s in env.requirements_specs()}
-    leaked = sorted(p.lower() for p in comp["specs"] if p.lower() in formal)
-    chk(not leaked, f"★ 可选依赖不许出现在 requirements.txt 的正式行里：{leaked}")
+    for name, comp in env.OPTIONAL_PIP.items():
+        chk(comp.get("specs") and comp.get("imports"),
+            f"{name}：写清了「装什么」和「装完 import 什么」")
+        leaked = sorted(p.lower() for p in comp["specs"] if p.lower() in formal)
+        chk(not leaked, f"★ {name} 的依赖不许出现在 requirements.txt 正式行里：{leaked}")
 
     # 没建 venv / 探不动 → 一律当**全缺**（宁可让上层重装一次，也不假装齐全）
     real_py = env.venv_python
     try:
         env.venv_python = lambda: None
-        chk(env.missing_optional("voice") == list(comp["imports"]),
+        chk(env.missing_optional("voice") == list(env.OPTIONAL_PIP["voice"]["imports"]),
             "venv 不可用时 missing_optional 当全缺")
+        chk(env.missing_optional("formats") == list(env.OPTIONAL_PIP["formats"]["imports"]),
+            "格式包也一样（六个都当缺）")
         chk(env.install_optional("voice")[0] is False
             and "虚拟环境" in env.install_optional("voice")[1],
             "venv 没建好时装可选组件 → 如实拒绝，不假装成功")
@@ -543,12 +548,66 @@ def main():
     chk(env.missing_optional("根本没有这一项") == [],
         "未知组件不抛异常（菜单列错了不该把控制台炸掉）")
 
-    # console 那一侧：菜单项必须是**同一个清单**驱动的，不许菜单里有、实现里没有
+    # console 那一侧：菜单项必须是**同一个清单**驱动的，不许菜单里有、实现里没有。
+    # ⚠️ 是**包含**不是相等：`search` 的安装 owner 在 `botctl`（它有自己一份 venv），
+    # 所以它出现在菜单里、但**不在** `envsetup.OPTIONAL_PIP`。别把这条写成相等。
     items = {n for n, _label in console.OPTIONAL_ITEMS}
     chk(items == set(console.OPTIONAL_ACTIONS) == set(console.OPTIONAL_STATE),
-        f"菜单/动作/状态三张表一一对应：{items}")
+        f"菜单 / 动作 / 状态三张表一一对应：{sorted(items)}")
+    chk(set(env.OPTIONAL_PIP) <= items,
+        f"注册表里的每一项菜单里都得有：{sorted(set(env.OPTIONAL_PIP) - items)}")
+    chk("search" in items and "search" not in env.OPTIONAL_PIP,
+        "search 的安装 owner 在 botctl.search_install（不在 OPTIONAL_PIP 里）")
     chk(callable(console.optional_menu) and callable(console._install_optional_all),
         "可选组件菜单与「一键部署第 3 步」都存在")
+    chk(console._HEAVY and console._HEAVY <= items,
+        f"「重」项（一键部署默认不装）都在清单里：{sorted(console._HEAVY)}")
+    chk("semantic" in console._HEAVY,
+        "★ 语义检索必须是「重」项（它要下 torch + 下模型 + 停 bot 建索引，"
+        "不该让人一路回车就装上）")
+
+    # ★ 菜单按键不能撞号：2026-10-05 加到第 4 项时真撞过——`[3]` 同时是「格式包」和
+    #   「自动装开关」，按 3 会去切开关、装不了东西。这里真跑一遍菜单（输入 0 返回）
+    #   然后数按键。开关那一项必须取「项数 + 1」。
+    import builtins
+    buf = io.StringIO()
+    real_input = builtins.input
+    try:
+        builtins.input = lambda *a, **k: "0"
+        with redirect_stdout(buf):
+            console.optional_menu()
+    finally:
+        builtins.input = real_input
+    # ⚠️ 只数**可选的那几个键**：状态文案里也会引用按键（「用 [3] 装」），
+    # 那是提示、不是可选项，用整屏正则会把它们一起数进来、报一个假撞号。
+    key_lines = re.findall(r"^\s+\[(\d+)\] (?:现在装|切换|返回)", buf.getvalue(), re.M)
+    chk(len(key_lines) == len(set(key_lines)),
+        f"★ 可选数字键不许重复（撞号＝按下去做的是另一件事）：{key_lines}")
+    chk(str(len(console.OPTIONAL_ITEMS) + 1) in key_lines,
+        f"「自动装」开关取了项数 + 1 这个键：{len(console.OPTIONAL_ITEMS) + 1}")
+    for _n, _label in console.OPTIONAL_ITEMS:
+        chk(f"[{console._opt_index(_n)}]" in buf.getvalue(), f"{_n} 在菜单里有按键")
+
+    # `.rar`：rarfile 只是壳，判据在 archive_read.find_rar_tool()（唯一一份）。
+    # 这里**不断言找没找到**（换台电脑就不一样），只要求它别抛、别返回假路径。
+    try:
+        import archive_read
+        tool = archive_read.find_rar_tool()
+        chk(tool is None or os.path.isabs(str(tool)),
+            f".rar 外部解压器的判定可用（本机结果：{tool!r}）")
+    except Exception as e:                          # noqa: BLE001
+        chk(False, f"archive_read.find_rar_tool() 不该抛：{type(e).__name__}: {e}")
+
+    # `semantic.py --ready`：给控制台用的**纯探针**，一个字都不打（好让调用方只看退出码）。
+    # 打不出东西这件事本身可验：未识别参数那条路会打印「没认出来」。
+    py = env.venv_python()
+    if py:
+        r = subprocess.run([py, "semantic.py", "--ready"],
+                           capture_output=True, cwd=os.path.dirname(os.path.abspath(__file__)))
+        chk(r.stdout.strip() == b"", f"★ semantic.py --ready 是纯探针（无输出）：{r.stdout[:60]!r}")
+        chk(r.returncode in (0, 1), f"--ready 只回 0/1：{r.returncode}")
+    else:
+        chk(True, "（本机没有 venv，跳过 --ready 实跑）")
 
     # 开关写 settings.json（**不回写带注释的 config.yaml**），且「没写过 = 要装」
     with tempfile.TemporaryDirectory() as td:

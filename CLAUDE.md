@@ -508,11 +508,14 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   「重启补齐」的语义：落盘游标距今在 `state.resume_window`（默认 1800 秒）内就续上；续上来的、比 `state.stale_after`（默认 120 秒）还旧、**且早于本进程启动**的消息 = 停机期间的旧消息，**只通知、不自动回复**（`watch` 命中仍通知），命令和提问也不补。判据按**消息年龄**走，不按「第几轮」，所以积压多少条都不会误判。
 - **加新模块时先看它有没有「绝不查库 / 绝不自己起线程」的要求。** `health` / `status_page` 有（见「运行看护」）；`usage`（只读 `data/usage.jsonl`）、`redact`（纯函数、只改送出去的那份）也**不许**顺手去碰 hook。
 - **不要随手重启微信**：每次重启都会掉登录态，要重新扫码。
-- **可选依赖（语音转文字 / 网上搜索）不许写成 `requirements.txt` 的正式行**：写成正式行，
-  `required_pkgs()` 会要求它们，没装的人「装完还是起不来」死循环。安装入口是
+- **可选依赖（语音 / 网上搜索 / 文件格式包 / 本地语义检索）不许写成 `requirements.txt` 的正式行**：
+  写成正式行，`required_pkgs()` 会要求它们，没装的人「装完还是起不来」死循环。安装入口是
   `envsetup.install_optional` / `botctl.search_install`（一键部署第 ③ 步、**可选组件.bat**），
-  开关写 `settings.json` 的 `optional`。SearXNG 源码随包携带在 `searxng\`，**它的 .venv 与
-  缓存绝不进包**，`botctl.search_home()` 是「用哪一份」的唯一判据（能用的优先）。
+  开关写 `settings.json` 的 `optional`；语义检索在 `console._HEAVY` 里 = 唯一**默认不装**的一项
+  （它要停 bot 建索引）。SearXNG 源码随包携带在 `searxng\`，**它的 .venv 与缓存绝不进包**，
+  `botctl.search_home()` 是「用哪一份」的唯一判据（能用的优先）。`.rar` 到底能不能读的判据在
+  `archive_read.find_rar_tool()`（rarfile 只是壳；**不在 PATH ≠ 没装**，它连默认安装位置一起找）。
+  可选菜单的按键恒取「项数 + 1」（曾写死 `[3]`，加到第 4 项就撞号）。
   两个静默坑与全部规矩见 **`docs/optional-components-notes.md`**（改这块前先读它）。
 - **摘除 hook**：把微信目录的 `version.dll` 改名 `version.dll.disabled` 重启微信即可（脚本 `installers/wechat-4.1.10.27/do_remove_hook.ps1`，装回 `do_restore_hook.ps1`）。
 - **安装脚本必须保持「换台电脑不用改」**（2026-10-02 修）：`installers/wechat-4.1.10.27/` 下的 8 个 `do_*.ps1`

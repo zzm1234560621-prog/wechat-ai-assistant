@@ -528,9 +528,16 @@ if __name__ == "__main__":
         print(status_text(cfg))
         print("\n用法：")
         print("  python semantic.py --status                  看模型/索引状态")
+        print("  python semantic.py --ready                   只回退出码（脚本用，无输出）")
         print("  python semantic.py --setup                   下本地模型（只此一条下载路径）")
         print("  python semantic.py --build [--days 90]       建索引（**bot 要先停**）")
         print("  python semantic.py --search \"关键词\"        试搜一条")
+    elif "--ready" in args:
+        # 给控制台 / 一键部署用的**纯探针**：只回退出码，**一个字都不打**
+        # （别让调用方去解析给用户看的文案；`--status` 是给人看的，而且它恒退 0）。
+        _m_ok, _ = model_ready(cfg)
+        _idx, _ = load_index(cfg)
+        sys.exit(0 if (_m_ok and _idx is not None) else 1)
     elif "--setup" in args:
         print("先装依赖（可选依赖，不随主程序安装）：")
         print("  .venv\\Scripts\\python.exe -m pip install sentence-transformers\n")

@@ -197,6 +197,22 @@ OPTIONAL_PIP = {
         "specs": ["faster-whisper", "pilk"],
         "imports": ["faster_whisper", "pilk"],
     },
+    "formats": {
+        "label": "文件格式增强包（视频 / 邮件 / 压缩包 / 老 Office / PDF 内嵌图）",
+        # 六个都小（最大的 av 几十 MB，wheel 自带 FFmpeg），装完立刻能用，所以合成一项。
+        # ⚠️ `rarfile` 装上**并不等于 .rar 能读**：它只是个壳，真正解压要外部程序
+        # （unrar / 7z / bsdtar）——那件事由 `archive_read.find_rar_tool()` 判定，
+        # 装完必须如实说，不许报成「.rar 能读了」。
+        "specs": ["av", "extract-msg", "py7zr", "rarfile", "xlrd", "olefile", "Pillow"],
+        "imports": ["av", "extract_msg", "py7zr", "rarfile", "xlrd", "olefile", "PIL"],
+    },
+    "semantic": {
+        "label": "本地语义检索（sentence-transformers，会拖进 torch，最重的一项）",
+        # 比其它项多两步：下模型 + **建索引（建之前必须停 bot）**。所以 console 把它
+        # 单列一项，并在「一键部署」里**默认不装**（要手打 y 才装）。
+        "specs": ["sentence-transformers"],
+        "imports": ["sentence_transformers"],
+    },
 }
 
 

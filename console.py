@@ -417,20 +417,29 @@ def act_search_install():
     return ("[√] " if ok else "[!] ") + msg
 
 
-# ── 可选组件：语音转文字 / 网上搜索后端 ─────────────────────────────────
-# 为什么要有这一段（2026-10-05）：这两样**代码都在、包里也都在**，但依赖与模型都不随包
-# （faster-whisper 在 requirements.txt 里只能写成注释行；SearXNG 的 464MB 模型 / 91MB venv
-# 更不能跨机器拷）——于是「装完就能用」在别人机器上并不成立，README 却把语音条转文字
-# 当卖点。这里补的就是那个**安装入口**，并把「这一项要不要装」记进 settings.json
+# ── 可选组件：语音转文字 / 网上搜索 / 文件格式增强包 / 本地语义检索 ───────
+# 为什么要有这一段（2026-10-05）：这些能力**代码都在、包里也都在**，但依赖与模型都不随包
+# （它们在 requirements.txt 里只能写成注释行；语音模型、torch、SearXNG 的 venv 更不能跨机器拷）
+# ——于是「装完就能用」在别人机器上并不成立，而 README 把语音条转文字、压缩包、视频
+# 都写在功能卖点里。这里补的就是那个**安装入口**，并把「这一项要不要装」记进 settings.json
 # （按项目约定：程序绝不回写带注释的 config.yaml）。
 #
 # 每项一个 owner，这里只做菜单与编排，不实现第二份：
 #   * 语音：envsetup.install_optional（pip）+ audio_read.py --setup（下模型）
 #   * 搜索：botctl.search_install（建 venv + pip）
+#   * 格式包：envsetup.install_optional（一条 pip 装齐）+ archive_read.find_rar_tool（.rar 的壳）
+#   * 语义：envsetup.install_optional + semantic.py --setup（下模型）--build（建索引）
 OPTIONAL_ITEMS = (
     ("voice", "语音转文字（装依赖 + 下模型）"),
     ("search", "网上搜索后端（建 venv + 装依赖）"),
+    ("formats", "文件格式增强包（视频 / 邮件 / 压缩包 / 老 Office / PDF 图）"),
+    ("semantic", "本地语义检索（装 torch 系依赖 + 下模型 + 建索引）"),
 )
+
+# 「重」的那几项在「一键部署」里**默认不装**（回车=跳过，要手打 y 才装）。
+# 语义检索要拖进 torch（几百 MB）+ 下模型 + 建索引（还得停一下助手）——一次重量级操作，
+# 不该让人一路回车就装上。其余几项几十 MB、装完立刻能用，默认装。
+_HEAVY = {"semantic"}
 
 
 def _opt_wanted(name):
@@ -498,26 +507,139 @@ def _search_state():
     if not os.path.isdir(home):
         return False, f"没有 SearXNG 目录（{home}）——包不完整，或 search.home 写错了。"
     if not botctl.search_ready(home):
-        return False, f"依赖还没装（{home}）——用 [2] 装。"
+        return False, f"依赖还没装（{home}）——用 [{_opt_index('search')}] 装。"
     pid = botctl.search_owner(port)
     if pid:
         return True, f"依赖已装，服务在跑（pid {pid}，端口 {port}）。"
-    return True, f"依赖已装，但**服务没在跑**（端口 {port}）——用 [1] 启动。"
+    return True, (f"依赖已装，但**服务没在跑**（端口 {port}）——"
+                  f"助手.bat → [8] 更多 → [9] 搜索服务 → [1] 启动。")
+
+
+def _formats_state():
+    """文件格式增强包：六个小依赖装了没 + `.rar` 的外部解压器在不在。
+
+    ⚠️ 两件事**必须分开说**：`rarfile` 只是个壳，`.rar` 真正要的是外部解压器
+    （unrar / 7z / bsdtar）。装完 rarfile 却报「.rar 能读了」就是**假成功**。
+    """
+    left = env.missing_optional("formats")
+    try:
+        import archive_read                       # 纯 stdlib，系统 python 也能导
+        tool = archive_read.find_rar_tool()
+    except Exception as e:                        # noqa: BLE001
+        tool, _err = None, e
+    if left:
+        return False, f"还缺 {len(left)} 个：{', '.join(left)}——用 [{_opt_index('formats')}] 装。"
+    rar = f"有（{tool}）" if tool else "**没有** → .rar 仍读不了（装个 7-Zip 或 WinRAR 就行）"
+    return True, (f"六个依赖都在（视频 / .msg 邮件 / .7z / .rar / 老 Office / PDF 内嵌图）。\n"
+                  f"       `.rar` 的外部解压器：{rar}")
+
+
+def _install_formats():
+    """装文件格式增强包（一条 pip 装齐）。装完**必须**把 .rar 那件事说清楚。"""
+    ok, msg = env.install_optional("formats")
+    print(("[√] " if ok else "[!] ") + msg)
+    if not ok:
+        return "文件格式增强包没装成（上面那段 pip 输出里是原因）。"
+    _st, why = _formats_state()
+    if _st:
+        _set_opt("formats", True)
+    return ("[√] 装好了。\n" if _st else "[!] ") + why
+
+
+def _semantic_state():
+    """本地语义检索现在能不能用——**判据走 `semantic.py --ready`**（纯探针，只回退出码）。
+
+    另外把 `--status` 给人看的那几行也带出来（模型/索引分别什么状态），
+    免得用户只看到一个 ❌ 不知道缺哪一步。
+    """
+    py = env.venv_python()
+    if py is None:
+        return False, "虚拟环境还没建好，语义检索用不了（先装依赖）。"
+    try:
+        r = subprocess.run([py, "semantic.py", "--ready"], cwd=BASE,
+                           capture_output=True, timeout=60)
+        ready = (r.returncode == 0)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"问不动语义检索那一侧（{type(e).__name__}: {e}）"
+    if ready:
+        return True, "模型 + 索引都就位（`semantic.enabled` 还要是 true 才会在聊天里用）。"
+    # 不 ready：把状态里「模型 / 索引」那两行摘出来，用户才知道差哪一步
+    lines = []
+    try:
+        r2 = subprocess.run([py, "semantic.py", "--status"], cwd=BASE,
+                            capture_output=True, timeout=60, text=True,
+                            encoding="utf-8", errors="replace")
+        for ln in (r2.stdout or "").splitlines():
+            if ln.startswith("本地模型：") or ln.startswith("  ") or ln.startswith("索引："):
+                lines.append(ln.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    detail = "；".join(lines[:4]) or "模型/索引还不齐"
+    return False, f"{detail}\n       装它：[{_opt_index('semantic')}]（会下模型并建索引）"
+
+
+def _install_semantic():
+    """装本地语义检索：pip → 下模型 → 建索引（**建索引前先停助手**）。"""
+    ok, msg = env.install_optional("semantic")
+    print(("[√] " if ok else "[!] ") + msg)
+    if not ok:
+        return "语义检索的**依赖**没装成（torch 那套很大，上面是原因），后面两步先不做。"
+
+    print("[可选组件] 下模型（BAAI/bge-small-zh-v1.5，走 hf-mirror 镜像）…")
+    run_venv("semantic.py", ["--setup"])
+
+    print("[可选组件] 最后一步：建索引。它要遍历历史消息，**必须先停掉助手**")
+    print("            （挂在轮询线程上跑会把 hook/微信拖住，项目为这类事崩过）。")
+    if not _confirm("    现在「停助手 → 建索引 → 再把助手起回来」？(y/N) "):
+        return ("模型下好了，**索引还没建**（没有索引 = 聊天里搜不了）。要建的话：\n"
+                "  1) 助手.bat → [4] 停助手\n"
+                "  2) .venv\\Scripts\\python.exe semantic.py --build --days 90\n"
+                "  3) 再把助手启动起来")
+    was_running = botctl.is_running()
+    if was_running:
+        ok_stop, m_stop = botctl.stop()
+        print(("[√] " if ok_stop else "[!] ") + m_stop)
+        if not ok_stop:
+            return "停不掉助手，索引先不建（绝不在它跑着的时候建）。"
+    run_venv("semantic.py", ["--build", "--days", "90"])
+    if was_running:
+        ok_start, m_start = botctl.start()
+        print(("[√] " if ok_start else "[!] ") + m_start)
+    ok2, why2 = _semantic_state()
+    if ok2:
+        _set_opt("semantic", True)
+    return ("[√] " if ok2 else "[!] ") + why2
+
+
+def _opt_index(name):
+    """这一项在菜单里是第几号（提示里要能照着按）。"""
+    for i, (n, _l) in enumerate(OPTIONAL_ITEMS, start=1):
+        if n == name:
+            return i
+    return 0
 
 
 OPTIONAL_ACTIONS = {
     "voice": _install_voice,
     "search": act_search_install,
+    "formats": _install_formats,
+    "semantic": _install_semantic,
 }
 OPTIONAL_STATE = {
     "voice": _voice_state,
     "search": _search_state,
+    "formats": _formats_state,
+    "semantic": _semantic_state,
 }
 
 
 def optional_menu():
     """可选组件：装 / 看 / 决定「一键部署要不要自动装」。"""
     while True:
+        # ⚠️ 开关那一项的按键**不能写死**：项数一多就会和某个组件撞号
+        # （加到 4 项时 `[3]` 同时是「格式包」和「开关」，按 3 会去切开关、装不了）。
+        # 所以它恒取「最后一个数字」= 项数 + 1。
+        toggle_key = str(len(OPTIONAL_ITEMS) + 1)
         print()
         print("=" * 46)
         print("  可选组件（不随主程序装；不装也不影响聊天/发消息/读文件/定时）")
@@ -526,17 +648,18 @@ def optional_menu():
             ok, why = OPTIONAL_STATE[name]()
             mark = "✅" if ok else "❌"
             auto = "开" if _opt_wanted(name) else "关"
-            print(f"   {mark} {name}：{label}")
+            heavy = "（**重**，一键部署默认不装）" if name in _HEAVY else ""
+            print(f"   {mark} {label}{heavy}")
             print(f"       {why}")
             print(f"       一键部署时自动装：**{auto}**")
             print(f"       [{i}] 现在装 / 重装")
-        print("   [3] 切换「一键部署时自动装」的开关")
+        print(f"   [{toggle_key}] 切换「一键部署时自动装」的开关")
         print("   [0] 返回")
         print("=" * 46)
         c = _clean(input("请输入数字选择："))
         if c == "0":
             return None
-        if c == "3":
+        if c == toggle_key:
             _submenu("自动安装开关（写 settings.json）", [
                 (str(i), f"{name}：现在{'关掉' if _opt_wanted(name) else '打开'}",
                  (lambda n=name: _toggle_opt(n)))
@@ -564,26 +687,30 @@ def _toggle_opt(name):
 
 
 def _install_optional_all():
-    """一键部署的第 4 步：把**打开的**那几项一次装齐。返回要补的说明（没有就 None）。
+    """一键部署的第 3 步：把**打开的**那几项一次装齐。返回要补的说明（没有就 None）。
 
-    关掉的那几项**跳过并说明**（不许静默少装）：用户看到「跳过了」，才知道该怎么补。
+    两条规矩：
+      * 关掉的那几项**跳过并说明**（不许静默少装）——用户看到「跳过了」才知道怎么补；
+      * `_HEAVY` 里那几项（语义检索）**默认不装**（回车=跳过，要手打 y）：它要下 torch、
+        下模型、还得停一下助手，不该让人一路回车就装上。
     """
     skipped = []
     failed = []
     for name, label in OPTIONAL_ITEMS:
         if not _opt_wanted(name):
-            skipped.append(name)
+            skipped.append(label)
             continue
         print()
-        print(f"--- {name}：{label} ---")
+        print(f"--- {label} ---")
         print(OPTIONAL_STATE[name]()[1])
-        if not _confirm("    现在装？(Y/n) ", default_no=False):
-            skipped.append(name)
+        if not _confirm("    现在装？" + ("(y/N) " if name in _HEAVY else "(Y/n) "),
+                        default_no=(name in _HEAVY)):
+            skipped.append(label)
             continue
         msg = OPTIONAL_ACTIONS[name]()
         print(msg)
         if not OPTIONAL_STATE[name]()[0]:
-            failed.append(name)
+            failed.append(label)
     if not (skipped or failed):
         return None
     out = []
