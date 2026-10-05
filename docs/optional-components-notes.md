@@ -43,12 +43,21 @@ installer 还会去拖重包。这条 2026-10-01 踩过，`selftest_audio` 钉�
 | 文件格式增强包 | `envsetup.install_optional("formats")`（一条 pip 装七个：av / extract-msg / py7zr / rarfile / xlrd / olefile / Pillow） | 无（都很小，装完立刻能用） | 同上 |
 | 本地语义检索 | `envsetup.install_optional("semantic")`（sentence-transformers，拖进 torch） | `semantic.py --setup` 下模型 + `semantic.py --build --days 90` 建索引 | 同上 |
 
-三条与「重 / 轻」有关的规矩：
+四条与「装完到底能不能用」有关的规矩：
 
-- **语义检索是唯一「重」项**（`console._HEAVY` 就它一个）：**一键部署里默认不装**
-  （回车=跳过，要手打 `y`）。它比别的项多两步，其中**建索引必须先停 bot**（遍历历史是重活，
-  挂在轮询线程上会把 hook 拖住）——`_install_semantic` 把「停助手 → 建索引 → 起回来」串成
-  一次确认；用户拒了就**只留命令、不硬来**。
+- **四项默认都装**（2026-10-05 用户拍板把语义检索从「默认跳过」改成自动装）：`console._HEAVY`
+  机制保留但**现在是空的**——以后再有「重到不该一路回车就装」的项，把名字加进去即可。
+  语义检索比别的项多两步，其中**建索引必须先停 bot**（遍历历史是重活，挂在轮询线程上会把
+  hook 拖住）——`_install_semantic` 把「停助手 → 建索引 → 起回来」串成一次确认；用户拒了就
+  **只留命令、不硬来**（这是它唯一保留的人工确认）。
+- **装成之后必须顺手把开关打开**（2026-10-05 加，`console._enable_runtime_switch`）：搜索与语义
+  检索的判据分别是 `search.enabled` / `semantic.enabled`，**默认都是 false**；装完不打开，
+  用户看到的就是「装了却用不了」（`web_read.enabled()` 要求严格 `is True`，而 `botctl` 连
+  SearXNG 进程都不会为它常驻）。实现写入 **`settings.json`**（读-改-写整段，`settings.effective()`
+  会把它盖在 config.yaml 之上），并且必须**说清改了哪个文件的哪个键**——**绝不回写带注释的
+  config.yaml**（项目铁律：回写会抹掉注释和用户手改的那份）。
+  回归：`selftest_install.T6` 里的「写开关不许冲掉同段别的键」「全程没碰 config.yaml
+  （mtime/大小都没变）」「那句人话要说清改了哪个文件」。
 - **`.rar` 不能只看 `rarfile` 装没装**：它只是个**壳**，真正解压要外部程序（unrar / 7z / bsdtar）。
   判据只有一份：`archive_read.find_rar_tool()` —— 先看 PATH，再看**厂商默认安装位置**
   （`%ProgramFiles%\7-Zip\7z.exe` 等）。这条当场纠了一个错判：只看 PATH 的 `7z`/`WinRAR` 时

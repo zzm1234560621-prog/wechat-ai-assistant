@@ -560,11 +560,12 @@ def main():
         "search 的安装 owner 在 botctl.search_install（不在 OPTIONAL_PIP 里）")
     chk(callable(console.optional_menu) and callable(console._install_optional_all),
         "可选组件菜单与「一键部署第 3 步」都存在")
-    chk(console._HEAVY and console._HEAVY <= items,
-        f"「重」项（一键部署默认不装）都在清单里：{sorted(console._HEAVY)}")
-    chk("semantic" in console._HEAVY,
-        "★ 语义检索必须是「重」项（它要下 torch + 下模型 + 停 bot 建索引，"
-        "不该让人一路回车就装上）")
+    chk(console._HEAVY <= items,
+        f"「默认不装」的项（若有）都必须来自清单：{sorted(console._HEAVY)}")
+    chk("semantic" not in console._HEAVY,
+        "★ 语义检索**不再**默认跳过（2026-10-05 用户拍板：一键配置要装齐四项）")
+    chk(not console._HEAVY,
+        f"★ 现在没有任何一项默认跳过（一键部署一路回车＝四项全装）：{sorted(console._HEAVY)}")
 
     # ★ 菜单按键不能撞号：2026-10-05 加到第 4 项时真撞过——`[3]` 同时是「格式包」和
     #   「自动装开关」，按 3 会去切开关、装不了东西。这里真跑一遍菜单（输入 0 返回）
@@ -624,6 +625,32 @@ def main():
                 "★ 改一项不许把另一项冲掉（读-改-写，不是整段覆盖）")
         finally:
             settings.SETTINGS_PATH = real_settings_path
+
+    # 装成功后**顺手打开运行时开关**（2026-10-05 用户拍板）：写 settings.json，不动 config.yaml。
+    with tempfile.TemporaryDirectory() as td:
+        real_settings_path = settings.SETTINGS_PATH
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        cfg_before = (os.path.getmtime(cfg_path), os.path.getsize(cfg_path)) \
+            if os.path.exists(cfg_path) else None
+        try:
+            settings.SETTINGS_PATH = os.path.join(td, "settings.json")
+            # 先放一个「同段别的键」进去，验证是读-改-写、不是整段覆盖
+            settings.save({"search": {"max_results": 7}, "optional": {"search": True}})
+            msg = console._enable_runtime_switch("search", "网上搜索")
+            saved = settings.load()
+            chk(saved.get("search", {}).get("enabled") is True,
+                "★ 装完把 search.enabled 写进 settings.json（运行时开关）")
+            chk(saved.get("search", {}).get("max_results") == 7,
+                "★ 写开关不许冲掉同段已有的键（读-改-写）")
+            chk(saved.get("optional", {}).get("search") is True, "别的段也不许动")
+            chk("settings.json" in msg and "config.yaml" in msg,
+                f"★ 那句人话要说清改了哪个文件、没动哪个文件：{msg[:60]}")
+            chk("true" in msg, "顺带告诉用户设成了 true")
+        finally:
+            settings.SETTINGS_PATH = real_settings_path
+        if cfg_before is not None:
+            chk((os.path.getmtime(cfg_path), os.path.getsize(cfg_path)) == cfg_before,
+                "★ 全程没碰 config.yaml（mtime/大小都没变）")
 
     # settings.example.json 里要**带上**这个段：包里那份是它拷过去的，少了用户就不知道有开关
     ex_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.example.json")

@@ -403,6 +403,34 @@ def act_search_stop():
     return ("[√] " if ok else "[!] ") + msg
 
 
+def _enable_runtime_switch(section, what):
+    """把某个功能的**运行时开关**（`<section>.enabled`）写进 `settings.json`，返回一句人话。
+
+    为什么走 settings.json 而不是 config.yaml：项目铁律 —— **程序绝不回写带注释的
+    config.yaml**（回写会把注释和用户手改的那份一起抹掉）。而 `settings.effective()`
+    会把 settings.json 里的键**盖在** config.yaml 之上，所以「装完就能用」和
+    「config.yaml 仍是用户的地盘」两件事同时成立。
+
+    ⚠️ 必须**读-改-写**整段：直接 `set_value(section, {"enabled": True})` 会把用户
+    在 settings.json 里已有的同段键（比如 search.max_results）冲掉。
+    ⚠️ 返回的话必须**说清改了哪个文件的哪个键**：静默改用户配置在这个项目里是禁止的。
+    """
+    try:
+        d = settings.load()
+        sec = dict(d.get(section) or {})
+        before = sec.get("enabled")
+        sec["enabled"] = True
+        d[section] = sec
+        settings.save(d)
+    except Exception as e:                        # noqa: BLE001
+        return (f"[!] 开关没写成（{type(e).__name__}: {e}）——手动把 {section}.enabled "
+                f"设成 true 也能用。")
+    was = "" if before is True else (f"（原来是 {before!r}）" if before is not None else "")
+    return (f"[√] 已打开{what}：把 **settings.json** 的 `{section}.enabled` 设成 true{was}；"
+            f"**没有动** config.yaml 里那份带注释的配置（想关回来就删掉 settings.json 这一项，"
+            f"或在 config.yaml 改成 false 之前先删它）。")
+
+
 def act_search_install():
     cfg = botctl.load_cfg()
     home = botctl.search_home(cfg)
@@ -412,9 +440,23 @@ def act_search_install():
     if not _confirm("现在装？(Y/n) ", default_no=False):
         return "已取消。"
     ok, msg = botctl.search_install(cfg=cfg, home=home)
-    if ok:
-        _set_opt("search", True)
-    return ("[√] " if ok else "[!] ") + msg
+    if not ok:
+        return "[!] " + msg
+    _set_opt("search", True)
+    out = ["[√] " + msg,
+           # 装完**顺手打开开关**（2026-10-05 用户拍板）：否则装了也用不了——
+           # `web_read.enabled()` 要求 effective 配置里 search.enabled 严格为 True，
+           # 而它默认是 false；用户只会看到「装了却搜不了」。
+           _enable_runtime_switch("search", "网上搜索")]
+    # 再顺手起一下：装了却要等下次重启助手才生效，同样会被当成「装了没用」。
+    try:
+        cfg2 = botctl.load_cfg()                # 开关刚写进 settings.json，重读一次
+        ok2, m2 = botctl.search_start(cfg=cfg2, home=home, wait=20)
+        out.append(("[√] " if ok2 else "[!] ") + m2)
+    except Exception as e:                      # noqa: BLE001
+        out.append(f"[!] 起搜索服务时出错（{type(e).__name__}: {e}）——"
+                   f"下次启动助手会自动把它带起来。")
+    return "\n".join(out)
 
 
 # ── 可选组件：语音转文字 / 网上搜索 / 文件格式增强包 / 本地语义检索 ───────
@@ -436,10 +478,12 @@ OPTIONAL_ITEMS = (
     ("semantic", "本地语义检索（装 torch 系依赖 + 下模型 + 建索引）"),
 )
 
-# 「重」的那几项在「一键部署」里**默认不装**（回车=跳过，要手打 y 才装）。
-# 语义检索要拖进 torch（几百 MB）+ 下模型 + 建索引（还得停一下助手）——一次重量级操作，
-# 不该让人一路回车就装上。其余几项几十 MB、装完立刻能用，默认装。
-_HEAVY = {"semantic"}
+# 哪些项在「一键部署」里**默认不装**（回车=跳过，要手打 y 才装）。
+# 2026-10-05 用户拍板：**本地语义检索也自动装**（此前它是这里唯一一项）——
+# 他要的就是「一键配置走完、四项全齐」。代价他认了：torch 几百 MB + 下模型；
+# 唯一保留的人工确认是**建索引要停一下助手**（那件事仍在 `_install_semantic` 里单独问）。
+# 机制留着：以后再有「重到不该一路回车就装」的项，把名字加进这个集合即可。
+_HEAVY = set()
 
 
 def _opt_wanted(name):
@@ -608,7 +652,11 @@ def _install_semantic():
     ok2, why2 = _semantic_state()
     if ok2:
         _set_opt("semantic", True)
-    return ("[√] " if ok2 else "[!] ") + why2
+    out = ("[√] " if ok2 else "[!] ") + why2
+    if ok2:
+        # 装齐了就顺手打开开关（同 search 那条理由）：否则「装了却搜不了」。
+        out += "\n" + _enable_runtime_switch("semantic", "本地语义检索")
+    return out
 
 
 def _opt_index(name):

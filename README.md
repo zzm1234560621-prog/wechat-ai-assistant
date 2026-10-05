@@ -92,13 +92,14 @@ cd wechat-ai-assistant
 
 | 组件 | 装什么 | 要下多大 | 装完怎么开 |
 |---|---|---|---|
-| 语音转文字 | `faster-whisper` + `pilk` | 本地模型（大小看 `audio.model`，默认 `small` 约 **464MB**，走 hf-mirror 镜像） | `config.yaml` 的 `audio` 段；`backend: local` 时**音频一个字节不出本机** |
-| 网上搜索 | 包**自带 SearXNG 源码**，在它的目录里建一份专用 venv | 依赖十几 MB | `search.enabled: true`；`search.autostart` 默认开（助手启动时把它带起来） |
+| 语音转文字 | `faster-whisper` + `pilk` | 本地模型（大小看 `audio.model`，默认 `small` 约 **464MB**，走 hf-mirror 镜像） | 装完直接能用；`config.yaml` 的 `audio` 段可调；`backend: local` 时**音频一个字节不出本机** |
+| 网上搜索 | 包**自带 SearXNG 源码**，在它的目录里建一份专用 venv | 依赖十几 MB | **装完自动打开**（把 `search.enabled` 写进 `settings.json`）并把服务起起来；`search.autostart` 默认开（助手启动时也会带起它） |
 | 文件格式增强包 | `av`（视频）、`extract-msg`（.msg 邮件）、`py7zr`/`rarfile`（压缩包）、`xlrd`/`olefile`（老 Office）、`Pillow`（PDF 内嵌图） | 几十 MB，装完**立刻**能用 | 不用开开关——多会读哪一种，缺的时候它会说 |
-| 本地语义检索 | `sentence-transformers`（会拖进 **torch**，本表最重） | 依赖几百 MB + 本地模型 | 还要下模型、**建索引（建之前必须停一下助手）**；`semantic.enabled: true` |
+| 本地语义检索 | `sentence-transformers`（会拖进 **torch**，本表最重） | 依赖几百 MB + 本地模型 | 装完自动打开 `semantic.enabled`；**建索引会先问你「停助手 → 建索引 → 起回来」**（拒了就只留命令） |
 
 入口：`一键部署.bat` 的第 `③` 步，或双击 **`可选组件.bat`**（也能看状态、切换
-「以后还要不要自动装」）。⚠️ **本地语义检索是唯一「默认不装」的一项**（回车=跳过，要手打 `y`）。
+「以后还要不要自动装」）。**四项默认都会装**（2026-10-05 起语义检索也纳入），**一路回车就齐**；
+全程只有两处会停下来问：语义检索的**建索引要停一下助手**，以及你想跳过某一项时按 `n`。
 
 三点值得知道：
 

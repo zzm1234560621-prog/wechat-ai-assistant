@@ -158,21 +158,23 @@ $quickstart = @'
   语义检索会拖进 torch，这些都不能塞进主程序的安装里。所以 `一键部署.bat` 的第 ③ 步
   会**逐项问你**；跳过了也完全不影响聊天、发消息、读文件、定时。
   以后想装/想关：双击 **可选组件.bat**（它也会告诉你每一项现在什么状态）。
+  **四项默认都会装**（一路回车就齐），只有两处会停下来问：语义检索的「建索引要停助手」，
+  以及你想跳过某一项时按 n。
   · 语音转文字：装 faster-whisper + pilk，并下**本地模型**（大小看 config.yaml 的
     `audio.model`，默认 small 约 464MB，走 hf-mirror 镜像）。音频一个字节都不出本机。
   · 网上搜索：包**自带 SearXNG 源码**（searxng\），这一步会在它的目录里建一份
-    **自己专用的 .venv** 并装依赖。装好之后助手启动会把它一起带起来
-    （开关在 config.yaml 的 search.enabled / search.autostart）。
+    **自己专用的 .venv** 并装依赖，**装完自动打开**（把 search.enabled 写进 settings.json）
+    并把服务起起来。装好之后助手启动也会把它一起带起来（config.yaml 的 search.autostart）。
   · 文件格式增强包：一条命令装七个（视频 av、.msg 邮件 extract-msg、压缩包 py7zr/rarfile、
     老 Office xlrd/olefile、PDF 内嵌图 Pillow），几十 MB，装完立刻多会读那几种格式。
     ⚠️ `.rar` 光装 rarfile 还不够——它只是个壳，真正解压要外部程序（unrar / 7-Zip）。
        状态屏会把这两件事分开说，不会把「装了 rarfile」报成「.rar 能读了」。
-  · 本地语义检索：**唯一一项默认不装**（回车=跳过，要手打 y）。它最重（torch 几百 MB +
-    本地模型），而且最后一步「建索引」**要先停一下助手**——装的时候它会问你，
-    同意就自动「停助手 → 建索引 → 起回来」，不同意就只把命令留给你。
+  · 本地语义检索：它最重（torch 几百 MB + 本地模型 + 建索引）。装完**自动打开**
+    （semantic.enabled 写进 settings.json）；最后一步「建索引」**要先停一下助手**——
+    装的时候它会问你，同意就自动「停助手 → 建索引 → 起回来」，不同意就只把命令留给你。
   四项的「以后还要不要自动装」记在 settings.json 的 `optional` 里（关掉 = 不再自动装，
   **已经装好的东西不会动**）。它写 settings.json 而不是 config.yaml，是因为程序
-  从不回写带注释的 config.yaml。
+  从不回写带注释的 config.yaml（装完自动打开的那两个开关同理）。
 
 ■ 装完之后怎么用
   双击 **助手.bat** 就是全部： [3] 启动 / [4] 停止重启 / [5] 看状态 /

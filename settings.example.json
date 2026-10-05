@@ -7,6 +7,8 @@
   },
   "optional": {
     "voice": true,
-    "search": true
+    "search": true,
+    "formats": true,
+    "semantic": true
   }
 }
