@@ -120,6 +120,7 @@ installers/            hook DLL and install scripts (+ the WeChat installer in t
 ## License and disclaimer
 
 This project is open source under the **[MIT License](LICENSE)**, provided **"as is", without warranty of any kind**.
+The risk warnings, acceptable-use rules and third-party attributions live in **[DISCLAIMER.md](DISCLAIMER.md)**.
 
 **Disclaimer** (please read it in full):
 

@@ -116,6 +116,7 @@ installers/            hook DLL 与安装脚本（+ Release 包里那份微信�
 ## 协议与免责声明
 
 本项目以 **[MIT License](LICENSE)** 开源，**按「现状」提供，不附带任何担保**。
+风险声明、使用边界与第三方组件说明都在 **[DISCLAIMER.md](DISCLAIMER.md)**。
 
 **免责声明**（请完整读完）：
 

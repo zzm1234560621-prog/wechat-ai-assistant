@@ -40,8 +40,9 @@ New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 Copy-Item (Join-Path $root '*.py')  $pkg -Force
 Copy-Item (Join-Path $root '*.bat') $pkg -Force
 # `README.zh-CN.md` / `LICENSE` 是 2026-10-06 公开到 GitHub 时加的：README 中英双语，
-# 拿到包的人也拿到同一份协议与免责声明（包里那份 README.md 顶部的语言切换就指向它）。
-foreach ($f in @('README.md', 'README.zh-CN.md', 'LICENSE', 'CLAUDE.md', 'requirements.txt')) {
+# 拿到包的人也拿到同一份协议与免责声明：`LICENSE`（**纯 MIT 全文**，GitHub 才认得出是 MIT）
+# 与 `DISCLAIMER.md`（使用边界 + 第三方组件）——两者分开正是为了让协议识别能过。
+foreach ($f in @('README.md', 'README.zh-CN.md', 'LICENSE', 'DISCLAIMER.md', 'CLAUDE.md', 'requirements.txt')) {
     $p = Join-Path $root $f
     if (Test-Path $p) { Copy-Item $p $pkg -Force } else { Write-Warning "缺少 $f" }
 }
