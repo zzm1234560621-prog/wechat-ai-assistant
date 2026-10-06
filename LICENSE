@@ -1,0 +1,56 @@
+MIT License
+
+Copyright (c) 2026 zzm1234560621-prog
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---------------------------------------------------------------------------
+DISCLAIMER AND ACCEPTABLE USE / 免责声明与使用边界
+
+The MIT License above governs copyright and warranty only. The following
+applies to the use of this project, and is part of the project's terms.
+
+1. This project works by injecting a hook DLL into the WeChat PC client. Doing
+   so violates the WeChat Terms of Service. Using this project may result in
+   your account being restricted or permanently banned, or in loss of or
+   damage to your account data. You assume all risk. The authors accept no
+   liability whatsoever.
+
+2. Use this project only with your OWN account and only on data that you
+   lawfully own. Collecting or analysing other people's chat records is
+   illegal in most jurisdictions.
+
+3. You are responsible for complying with the laws and regulations of your
+   jurisdiction and with Tencent's terms of service. Do not use this project
+   for commercial purposes, for bulk unsolicited messaging, for harassment,
+   or for any unlawful activity.
+
+4. This project is NOT affiliated with, authorised by, or endorsed by Tencent
+   or WeChat in any way.
+
+Third-party components / 第三方组件:
+  - Hook: https://github.com/aixed/WeChat-Hook
+  - Bundled search backend: https://github.com/searxng/searxng (AGPL-3.0;
+    its source is shipped inside this repository under searxng/, together with
+    its own upstream LICENSE)
+  - See also WeChatFerry (https://github.com/lich0821/WeChatFerry) and
+    PyWxDump (https://github.com/xaoyaoo/PyWxDump).
+
+All third-party components remain the property of their respective authors
+and are governed by their own licenses.
