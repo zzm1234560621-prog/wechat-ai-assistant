@@ -43,14 +43,13 @@ import executor
 import image_cache
 import tempdir          # 临时目录/导出目录的统一入口（可用 PROJ_TMP 改道）
 import archive_read      # 压缩包递归（它只在函数里 import 本模块，所以这里没有循环导入）
-import video_read        # 视频抽音轨/抽帧（同上，只在函数里 import 本模块）
-import mail_read         # .eml / .msg 邮件（附件递归）
-import db_read           # .sqlite/.db（**只读**打开）
+import video_read
+import mail_read
+import db_read
 
 # 项目根目录（和 usage.py / executor.py 同一个算法：相对路径按它解析，不按 CWD）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 允许抽文本的后缀
 SUPPORTED = {".pdf", ".docx", ".xlsx", ".pptx",
              ".txt", ".md", ".csv", ".json", ".log", ".xml", ".html", ".htm"}
 
@@ -297,7 +296,6 @@ def _xml_bytes(raw, what="这段 XML"):
     """
     for pat in _XML_ENTITY_MARKERS:
         # 整份都扫：XML 声明前面允许有注释/空白，DOCTYPE 不一定在开头。
-        # 两个定长子串查找，代价可忽略。
         if pat in raw:
             raise ValueError(f"{what}里有 XML 文档类型/实体声明（<!DOCTYPE / <!ENTITY），"
                              f"可能有实体膨胀攻击，出于安全不解析这个文件。")
@@ -447,7 +445,6 @@ def pick(name, limit=8):
 
 
 # ---------------- 内容嗅探（不看后缀，看内容）----------------
-#
 # **为什么要它**：用户要的是「任何文件都能读」。按后缀白名单永远会漏——`README`、
 # `.srt`、`.ini`、`.py`、无后缀的日志全是文本；反过来 `.dat` 却不是。所以先按魔数
 # 认容器/二进制，认不出再判「能不能当文本解」。**拿不准就说读不了**——宁可少读，
@@ -456,7 +453,7 @@ def pick(name, limit=8):
 # 顺序有意义：先特殊后通用（`PK` 也是 docx/xlsx/pptx/jar/apk/whl 的魔数）。
 _MAGIC = (
     (b"%PDF-", "pdf"),
-    (b"PK\x03\x04", "zip"),                              # zip / docx / xlsx / pptx / whl / apk
+    (b"PK\x03\x04", "zip"),
     (b"PK\x05\x06", "zip"),                              # 空压缩包
     (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "ole2"),       # 老 Office（.doc/.xls/.ppt）/ .msg
     (b"{\\rtf", "rtf"),
@@ -536,8 +533,6 @@ def _unreadable(kind, why=""):
             f".m4a/.mp3/.wav/.amr 这类（音频转文字）。"
             f"请如实告诉用户读不了，**不要编内容**。")
 
-
-# ---------------- 各格式抽文本 ----------------
 
 def _xml_text(xml):
     """把所有 <xxx:t> 里的文字抽出来（docx/pptx 都用这个）。"""
@@ -685,7 +680,6 @@ def _xlsx(path, cfg=None, collect=None):
                            "xl/sharedStrings.xml").encode("utf-8"))).getroot()
             for si in root.findall(f"{NS}si"):
                 shared.append("".join(t.text or "" for t in si.iter(f"{NS}t")))
-        # sheet 名 -> 文件
         book = {}
         if "xl/workbook.xml" in names:
             wb = ET.parse(io.BytesIO(
@@ -762,7 +756,7 @@ def _append_text(path, text, cfg=None):
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        with open(path, "a", encoding="utf-8", newline="") as f:   # 追加到既有导出后
+        with open(path, "a", encoding="utf-8", newline="") as f:
             f.write(("\n\n" if os.path.getsize(path) else "") + open(tmp, encoding="utf-8").read())
             f.flush()
             os.fsync(f.fileno())
@@ -1231,7 +1225,7 @@ def extract(path, cfg=None, full=False, on_image=None):
     if max_bytes and size > max_bytes:      # 0 = 不限（见 _opt_int）
         return None, f"文件太大（{size/1048576:.1f}MB），我不读这么大的。"
     if not max_bytes:
-        max_bytes = size                    # 0 = 不限：把实际大小当成"上限"往下传
+        max_bytes = size
 
     ext = os.path.splitext(path)[1].lower()
     # 音频（语音输入）走 audio_read 转写：它有自己的上限、隐私（默认不出本机）

@@ -43,8 +43,6 @@ def chk(cond, msg):
         raise SystemExit(1)
 
 
-# ---------------- 假环境 ----------------
-
 class TempSettings:
     """把 settings.SETTINGS_PATH 指到临时文件。
 
@@ -1447,7 +1445,6 @@ def t18_address_without_membership():
             def listed():
                 return {str(r.get("wxid")) for r in auto_reply.chat_list(cfg())}
 
-            # ① 设：名单外的人（李四只在联系人表里）
             out, changed = run("address 李四 阿四")
             chk(changed and auto_reply.address_of(cfg(), "wxid_l") == "阿四",
                 f"名单外的人也能设称呼（实际 {out[:50]!r}）")
@@ -1455,19 +1452,16 @@ def t18_address_without_membership():
             chk((settings.load().get("addresses") or {}).get("wxid_l", {}).get("name")
                 == "李四", "称呼表里记了显示名（别名和状态显示要用）")
 
-            # ② 看
             out, changed = run("address 李四")
             chk((not changed) and "阿四" in out,
                 f"能查看名单外那个人的称呼（实际 {out[:50]!r}）")
 
-            # ③ 学：只学称呼、不动人设、不加人
             llm = _LearnLLM('{"address": "四哥", "persona": "这段人设一个字都不该被写进去"}')
             out, changed = run("address 李四 学习", llm_factory=lambda: llm)
             chk(changed and auto_reply.address_of(cfg(), "wxid_l") == "四哥",
                 f"名单外的人也能从历史学称呼（实际 {out[:60]!r}）")
             chk("wxid_l" not in listed(), "学完也没有把他加进名单")
 
-            # ④ 清
             run("address 李四 清空")
             chk(auto_reply.address_of(cfg(), "wxid_l") == "", "名单外的人也能清称呼")
             chk("wxid_l" not in listed(), "清称呼**不会**动人名单")

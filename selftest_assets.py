@@ -129,8 +129,6 @@ def _write(path, data=b"\x89PNG\r\n\x1a\n0123"):
     return path
 
 
-# ------------------------------------------------------- 1. media_kind
-
 def test_media_kind():
     print("\n── media_kind：认得能转发的媒体，不认转发不了的 ──")
     check("图片 local_type=3", live_history.media_kind(3) == "图片")
@@ -144,8 +142,6 @@ def test_media_kind():
     check("appmsg 文件 (6<<32)|49 不收", live_history.media_kind((6 << 32) | 49) == "")
     check("appmsg 链接/引用不收", live_history.media_kind((57 << 32) | 49) == "")
 
-
-# ---------------------------------------------------- 2. latest_media
 
 def test_latest_media():
     print("\n── latest_media：只读 Msg_ 表、倒序挑媒体、标出 is_self ──")
@@ -187,8 +183,6 @@ def test_latest_media():
     check("3.9.x（没有 contact.db）返回空，由调用方如实报错",
           live_history.latest_media(v3, CHAT) == [])
 
-
-# --------------------------------------------------------- 3. 暂存区
 
 def test_store(tmp):
     print("\n── 暂存区：落盘 / 容量 / 去重 / 按序号取 ──")
@@ -286,8 +280,6 @@ def test_store(tmp):
     check("entry_from_media 记住来源（会话+local_id）",
           e["talker"] == CHAT and e["local_id"] == "5" and e["ts"] == 999.0)
 
-
-# ---------------------------------------------------- 4. send_asset
 
 def _contacts():
     return [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三", "alias": ""},

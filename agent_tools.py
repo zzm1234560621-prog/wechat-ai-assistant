@@ -205,7 +205,7 @@ def digest_of(msgs, names, per=DIGEST_PER_SESSION, top=DIGEST_SESSIONS,
         k = max(1, min(int(per), n))
         if n <= k:
             idx = list(range(n))
-        else:                      # 等距抽 + 首尾各留一条
+        else:
             idx = sorted({0, n - 1} | {round(i * (n - 1) / (k - 1))
                                        for i in range(k)})
         name = names.get(talker) or ""
@@ -320,7 +320,6 @@ def parse_time_arg(v):
     return None
 
 
-# ---------- 「某天 / 某月 / 某一段」→ 时间区间 ----------
 #
 # 用户说的原话（「9月30号那天」「上个月」「9月」）会被模型原样抄进 when，
 # 所以这里要把中文/简写的日期说法解析成 (since, until)。**纯函数**，好在自测里穷举。
@@ -3161,8 +3160,6 @@ class ToolBox:
         # 会话是不是群。`roomid` 的形态就是 `xxx@chatroom`，由 chat 直接推得，
         # 不额外查库（查库要走 hook，能省一次就省一次）。
         self.is_group = "@chatroom" in self.chat
-        # 插件工具与生命周期事件共用的只读上下文。
-        # 见 plugins.py 的契约与 docs/plugin-contract-spec.md 2.1。
 
     def ctx(self):
         """工具处理器 / 事件用的只读上下文（形状见 `docs/plugin-contract-spec.md` 2.1）。
@@ -3229,7 +3226,6 @@ class ToolBox:
                     f"（要发别处的，得**用户自己**去 config.yaml 的 "
                     f"agent.send_image_dirs 加目录——你不要改配置绕过。）")
 
-    # 一次取多少张图给缓存用
     _IMG_FETCH = 50
     _FILE_FETCH = 30
 
@@ -3253,8 +3249,6 @@ class ToolBox:
                 self.client, wxid, limit=self._FILE_FETCH)
         rows = self._file_cache[wxid]
         return rows[-limit:] if limit else rows
-
-    # ---------- 工具实现 ----------
 
     def _image_collector(self, label):
         """`image.mode=inline` 时收下「要交给模型看的原图」。
@@ -3516,7 +3510,6 @@ class ToolBox:
     def t_read_history(self, args):
         contact = str(args.get("contact") or "").strip()
 
-        # ---- 时间说法：`when`（某天/某月/某一段）或 `days`（最近 N 天），二选一 ----
         # `when` 就是「那天发生了什么」这条路的入口：`days` 只能表达「最近 N 天」，
         # 锚点在**现在**，所以「9 月 30 号那天」它根本表达不出来。
         when_label = None
@@ -3859,7 +3852,6 @@ class ToolBox:
         if not self.budget.take():
             return "本轮查库次数已用完，请基于已有信息回答。"
 
-        # 只看某一个人 → 就抽他自己
         raw_contact = args.get("contact")
         if raw_contact not in (None, ""):
             cand, err = self._one(str(raw_contact).strip())
@@ -4160,7 +4152,6 @@ class ToolBox:
         name = str(args.get("name") or "").strip()
         limit = int(args.get("limit") or 10)
         limit = max(1, min(limit, 30))
-        # 时间筛：when（某天/某段）或 days（最近 N 天）——和 read_history 一套说法
         since = until = None
         label = ""
         raw_when = args.get("when")
@@ -4798,7 +4789,7 @@ class ToolBox:
         if top.get("is_self") != 1:
             return items, ""
         if newest is not None and str(newest.get("local_id")) == str(top.get("local_id")):
-            return items, ""        # 最新的这张已经在暂存区里了
+            return items, ""
         if is_own_image(self.chat, top.get("_ts")):
             # 这条是**我自己刚发出去的**回显（发图/转发都会记这笔）：不是用户新发的，
             # 别把它当成「最新的素材」——否则会把机器人自己发的图再发一遍。

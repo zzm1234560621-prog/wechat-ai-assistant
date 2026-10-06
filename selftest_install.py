@@ -193,7 +193,6 @@ def main():
     chk(env.backend_from_config() in ("aixed", "wcferry"),
         f"能从 config.yaml 读出 backend：{env.backend_from_config()}")
 
-    # ── T1b installer 的依赖清单 ──────────────────────────────────────
     print("\n2) T1b installer.py 读 requirements.txt 来装（不执行安装）")
     inst = load_installer()
     wcfer = "39.5.2"
@@ -220,7 +219,6 @@ def main():
     finally:
         env.REQUIREMENTS_TXT = real_req
 
-    # ── T1c 启动助手.bat 模板 ────────────────────────────────────────
     print("\n3) T1c installer 生成的 启动助手.bat 自检清单含全部依赖")
     text = inst.launcher_text()
     chk("{pkg_repr}" not in text, "模板占位符已被替换")
@@ -248,7 +246,6 @@ def main():
                                                              bat, re.M),
         "★ install.bat 里没有第二份依赖清单（没有 pip install、没有包名行）")
 
-    # ── T2 console.py 提权命令 ────────────────────────────────────────
     print("\n4) T2 console.py 管理员分支的命令拼接")
     line = console.build_admin_command("downgrade.py", None)
     chk("-ArgumentList" not in line or "-ArgumentList ''" not in line,
@@ -364,7 +361,6 @@ def main():
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 
-    # ── T3 bypass_update ──────────────────────────────────────────────
     print("\n5) T3 bypass_update.py：4.x 路径 / 非零退出码 / 只对当前用户")
     cands = bypass_update.candidate_paths()
     chk(any("xwechat" in p for p in cands), "★ 候选路径含 Tencent\\xwechat\\Weixin.exe（微信 4.x 实际路径）")
@@ -420,7 +416,6 @@ def main():
         "注释里写明只写 HKCU、不动 HKLM")
     chk("只对当前用户生效" in src, "输出/注释里说清「只对当前用户生效」")
 
-    # ── T4 wechat_version 取文件版本 ──────────────────────────────────
     print("\n6) T4 wechat_version.py：不拼字符串、路径含空格/单引号都能用")
     p_plain = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
     p_quote = r"C:\Program Files\Wei'xin\Weixin.exe"
@@ -804,7 +799,6 @@ def main():
     chk(aixed_api.detect_self_wxid(object()) == "",
         "不支持的客户端给空串（不抛异常、不猜一个 id）")
 
-    # ── 汇总 ──────────────────────────────────────────────────────────
     print()
     if _FAIL:
         print(f"失败 {len(_FAIL)} 项 ❌")

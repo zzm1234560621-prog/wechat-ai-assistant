@@ -73,7 +73,7 @@ class ExecResult:
         self.timed_out = bool(timed_out)
         self.truncated = bool(truncated)
         self.elapsed = float(elapsed or 0.0)
-        self.error = error                # None 或一段人话
+        self.error = error
         # 非 None = 这份输出是"猜"出来的一种编码；值就是那个编码名。
         # 只用于**如实提示可能乱码**，绝不据此假装内容是对的。
         self.encoding_guess = encoding_guess
@@ -430,8 +430,6 @@ def format_result(result, max_chars=None):
     # 以前只在失败分支带 error，导致「成功 + 乱码」这条路上用户和模型
     # 都看不到任何提示，会以为输出本来就这么怪 —— 那是静默误导。
     if r.error and not (r.exit_code is None):
-        # exit_code is None 的两种失败（空命令/目录不存在/启动失败）在 head 里
-        # 已经说过一次了，不重复；剩下的是"跑完了但有话要说"（乱码警告等）
         lines.append(f"⚠️ {r.error}")
 
     out = r.output

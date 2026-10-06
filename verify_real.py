@@ -110,7 +110,6 @@ def main():
     base = cfg.get("aixed_base_url", "http://127.0.0.1:30001")
     print(f"\n后端: {backend}   接口: {base}   模型: {cfg.get('model')}")
 
-    # ---------- 1. hook 与登录态 ----------
     sec("1. hook 连接与登录态")
     if backend != "aixed":
         line("warn", f"后端是 {backend}，本脚本只对 aixed 主线做完整检查")
@@ -143,7 +142,6 @@ def main():
     else:
         line("bad", "IsLogin: 0 —— 微信停在登录界面（要在微信里扫码；force_rescan 没用）")
 
-    # ---------- 2. 库结构 / 游标 / 分片 ----------
     sec("2. 库结构与轮询游标（这一步会发几次查库）")
     wxid, wxid_from, wxid_used, wxid_note = resolve_self_wxid(cfg, client, backend)
     QUERY_BUDGET_NOTE.extend(wxid_used)
@@ -205,7 +203,6 @@ def main():
     else:
         line("ok", "没有分片报错记录")
 
-    # ---------- 3. 联系人 ----------
     sec("3. 联系人（按人名查历史依赖它）")
     QUERY_BUDGET_NOTE.append("all_contacts")
     try:
@@ -283,7 +280,6 @@ def main():
     else:
         line("warn", "本地没抽到可用的缩略图（没缓存过图就正常）—— 这条只能等你真发一张图来验")
 
-    # ---------- 5. 落盘状态与账本 ----------
     sec("5. 落盘状态与账本")
     state_path = os.path.join(HERE, "data", "state.json")
     if os.path.isfile(state_path):
@@ -335,7 +331,6 @@ def main():
         rots = sorted(f for f in os.listdir(HERE) if f.startswith("bot.log."))
         line("ok", f"bot.log {size // 1024}KB" + (f"，已轮转出 {len(rots)} 份备份" if rots else "（还没到轮转阈值）"))
 
-    # ---------- 收尾 ----------
     print("\n" + "=" * 66)
     print(f"查询次数：约 {len(QUERY_BUDGET_NOTE)} 次（{ '、'.join(QUERY_BUDGET_NOTE) }）")
     print("还有三件只能你本人做的：")

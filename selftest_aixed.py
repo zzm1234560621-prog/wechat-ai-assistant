@@ -24,7 +24,7 @@ import bot
 import live_history
 import voice_mem          # 跨模块契约用例（见语音那段：length_bytes 必须传下去）
 
-SENT = []          # 记录发出去的消息，供断言
+SENT = []
 SELF_WXID = "wxid_self_0001"
 NOW = 1_700_000_000
 

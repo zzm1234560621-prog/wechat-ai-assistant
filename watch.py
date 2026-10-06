@@ -48,8 +48,6 @@ _USAGE = (
 )
 
 
-# ---------------- 读取 ----------------
-
 def section(cfg):
     return dict((cfg or {}).get("watch") or {})
 
@@ -71,8 +69,6 @@ def enabled(cfg):
     # 默认开：名单本来就是空的，开着也不会怎样；用户加人就是想让它生效
     return bool(section(cfg).get("enabled", True))
 
-
-# ---------------- 关键词监听 ----------------
 
 def keywords(cfg):
     """已有关键词条目 `[{"pattern": ..., "raw": ...}]`（按值返回，改完再 _save）。"""
@@ -144,8 +140,6 @@ def _save(**changes):
     settings.set_value("watch", {k: v for k, v in data.items() if k in MANAGED})
 
 
-# ---------------- 触发 ----------------
-
 def format_hit(rec, text, limit=200):
     """通知文案。太长的话截断——通知是让我知道「他说话了」，不是全文转播。"""
     name = str((rec or {}).get("name") or (rec or {}).get("wxid") or "某人")
@@ -154,8 +148,6 @@ def format_hit(rec, text, limit=200):
         body = body[:limit] + "…"
     return f"👀 {name}：{body}"
 
-
-# ---------------- 展示 ----------------
 
 def status_text(cfg):
     recs = chat_list(cfg)
@@ -188,8 +180,6 @@ def summary_line(cfg):
     more = "" if len(recs) <= 6 else f" 等 {len(recs)} 个"
     return f"盯着 {'开' if enabled(cfg) else '关'}着：{who}{more}"
 
-
-# ---------------- 命令 / 工具 ----------------
 
 def build_arg(action, who=""):
     """把 agent 工具的结构化参数拼成 /盯着 的子命令串（和命令走同一条实现）。"""

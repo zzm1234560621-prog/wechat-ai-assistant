@@ -154,8 +154,6 @@ def _make_dir(p):
     return p
 
 
-# ---------------- T1 可用性：缺依赖 / 缺模型 / 缺 key ----------------
-
 def t1_availability(tmp):
     sec("缺依赖 / 缺模型 / 缺 key：都要给能照做的指引，不许静默当成功")
     cfg = _cfg(tmp)
@@ -224,8 +222,6 @@ def t1_availability(tmp):
     check("cloud 配好了 → 可用，且明说会上传", ok is True and "上传" in why, why)
 
 
-# ---------------- T2 硬上限 ----------------
-
 def t2_caps(tmp):
     sec("硬上限：超字节 / 超秒数 → 如实拒绝，绝不静默截断")
     _FakeWhisper(["早"]).install()
@@ -270,8 +266,6 @@ def t2_caps(tmp):
     check("拿不到时长时只按体积卡（不因读不到时长就拒绝）", ok is True, why)
 
 
-# ---------------- T3 local：真转写 + 零网络（隐私底线） ----------------
-
 def t3_local_and_privacy(tmp):
     sec("local 转写：出文本，且**零网络调用**（隐私底线）")
     fw = _FakeWhisper(["大家好", "，我是测试。"]).install()
@@ -313,8 +307,6 @@ def t3_local_and_privacy(tmp):
           "zh" in err and "3.0" in err, err)
     _ = fw2
 
-
-# ---------------- T4 分派：文档老行为不变 ----------------
 
 def t4_dispatch(tmp):
     sec("分派：音频走转写，文档/不支持的后缀各自照旧")
@@ -378,8 +370,6 @@ def t4_dispatch(tmp):
     check("read_file 这条路上 file.max_bytes 仍然生效",
           text is None and "文件太大" in (note or ""), (text, note))
 
-
-# ---------------- T5 cloud：multipart 编码 + 上传留痕 ----------------
 
 class _Handler(BaseHTTPRequestHandler):
     seen = []

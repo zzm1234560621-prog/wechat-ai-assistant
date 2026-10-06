@@ -246,7 +246,6 @@ class AixedClient:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
 
-    # ---------- 底层 HTTP ----------
 
     def _request(self, method, path, payload=None, timeout=None):
         url = self.base_url + path
@@ -331,7 +330,6 @@ class AixedClient:
                     raise AixedError(f"{what}失败：{detail}")
         return resp
 
-    # ---------- 与 wcferry 对齐的接口 ----------
 
     def query_sql(self, db, sql, timeout=None):
         """执行 SQL，返回行列表（dict 或 list 均可）。`timeout` 给轮询那条路压短用。"""
@@ -412,7 +410,6 @@ class AixedClient:
         return self._request("POST", send_file_via(cfg),
                              {"wxidorgid": wxid, "path": path})
 
-    # ---------------- 打电话（/CallVoip）----------------
 
     def call_voip(self, wxid, self_wxid=None, *, msg_type=None, body=None):
         """发起一通微信语音通话。

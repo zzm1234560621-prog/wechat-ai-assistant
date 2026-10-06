@@ -29,6 +29,16 @@ searxng/sxng_cache_*
 installers/*-log.txt
 installers/**/*-log.txt
 
+# ---- 两个微信官方安装程序：只随 Release 包发，不进 git ----
+# 2026-10-06 公开到 GitHub 时定的：它们走 Git LFS（285MB + 239MB），而 GitHub 免费额度是
+# 1GB 存储 / 1GB 月流量 —— 约两次 clone 就见底，之后别人 clone 会拉到坏文件。
+# 可 **clone 的人并不需要它们**：普通用户下载 Release 里那个 zip（包里自带），
+# 开发者自己准备微信 4.1.10.27 即可。
+# ⚠️ 它们仍必须**留在磁盘上**：`tools\build_package.ps1` 要把它们拷进发布包。
+# （`.gitattributes` 里那条 `*.exe filter=lfs` 保留着，以后要加别的 exe 仍走 LFS。）
+/installers/WeChatSetup-3.9.12.51.exe
+/installers/wechat-4.1.10.27/WeChatWin_4.1.10.27.exe
+
 # ---- 自测用的图片（从微信缓存里拷的，是私人内容，别提交）----
 test_images/
 

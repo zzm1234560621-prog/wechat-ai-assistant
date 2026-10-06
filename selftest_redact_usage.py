@@ -61,7 +61,6 @@ def sec(title):
 ON = {"privacy": {"redact": True}}
 
 
-# ==========================================================================
 sec("【0】先用一眼能看懂的样例跑一遍（人工可核对的输出）")
 
 _sample = ("张三 手机13812341234 身份证110101199001011234 "
@@ -72,7 +71,6 @@ print("    脱敏：" + _masked)
 chk(_hits == 5, f"5 处敏感信息全部命中（实际 {_hits}）")
 
 
-# ==========================================================================
 sec("【1】redact.enabled —— 严格按 is True，坏配置一律当关闭")
 
 chk(redact.enabled(ON) is True, 'privacy.redact = True → 开')
@@ -92,7 +90,6 @@ chk(redact.enabled({"privacy": {"redact": True, "x": 1}}) is True,
     "多写了别的键不影响判定")
 
 
-# ==========================================================================
 sec("【2】redact.redact —— 关闭时一个字符都不许动")
 
 chk(redact.redact(_sample) == (_sample, 0), "cfg=None → 原样返回、命中 0")
@@ -104,7 +101,6 @@ chk(redact.redact(None, ON) == (None, 0), "None 原样返回、不抛")
 chk(redact.redact(12345, ON) == (12345, 0), "非字符串原样返回、不抛")
 
 
-# ==========================================================================
 sec("【3】redact —— 各类敏感信息的格式（保留可读性）")
 
 _m, _n = redact.redact("我手机13812341234，另一个 15900001111。", ON)
@@ -141,7 +137,6 @@ _m3, _n3 = redact.redact(_masked, ON)
 chk(_n3 == 0 and _m3 == _masked, f"幂等：脱敏结果再脱敏不变（命中 {_n3}）")
 
 
-# ==========================================================================
 sec("【4】redact 反例 —— 这些**绝不能**被打码（打码就毁可读性）")
 
 _cases = [
@@ -191,7 +186,6 @@ chk(_cnt == 1 and "Python 3.11.9 连 1.2.*.*" in _out,
     f"版本号放过、同句真 IP 仍码：{_out!r}")
 
 
-# ==========================================================================
 sec("【5】redact 性能 —— 大段「全是反例」的文本不许卡住")
 
 _t0 = time.time()
@@ -203,7 +197,6 @@ chk(_cnt == 0, f"{len(_bulk)} 字符的反例文本零命中（实际 {_cnt}）"
 chk(_dt < 1.0, f"跑得快、没有灾难性回溯（{_dt:.3f}s）")
 
 
-# ==========================================================================
 sec("【6】usage.record → summary —— 落到临时目录，绝不碰仓库 data/usage.jsonl")
 
 # 记住仓库那个账本的状态，结尾用它证明"没污染"
@@ -291,7 +284,6 @@ finally:
     shutil.rmtree(_tmpdir, ignore_errors=True)
 
 
-# ==========================================================================
 sec("【7】坏行不让 summary 崩（半截 JSON / 缺字段 / 非 dict / 空行）")
 
 _tmpdir = tempfile.mkdtemp(prefix="selftest_usage_bad_")
@@ -378,7 +370,6 @@ finally:
     shutil.rmtree(_tmpdir, ignore_errors=True)
 
 
-# ==========================================================================
 sec("【8】价目表：未知模型返回 None；summarize 明说「没有价目表」")
 
 chk(usage.price_of("deepseek-chat") == (2.0, 8.0), "deepseek-chat 有价目表")
@@ -439,7 +430,6 @@ finally:
     shutil.rmtree(_tmpdir, ignore_errors=True)
 
 
-# ==========================================================================
 sec("【9】从各家响应里取 usage")
 
 chk(usage.extract_openai_usage(
@@ -477,7 +467,6 @@ chk(usage.extract_anthropic_usage(_EmptyResp()) == (0, 0), "没有 usage 属性 
 chk(usage.extract_anthropic_usage(None) == (0, 0), "None → (0,0)，不抛")
 
 
-# ==========================================================================
 sec("【10】redact.patterns 的结构约定")
 
 _pats = redact.patterns()
@@ -490,7 +479,6 @@ chk(_names.index("身份证") < _names.index("银行卡"),
     "身份证规则排在银行卡之前（18 位别被银行卡规则先吃掉）")
 
 
-# ==========================================================================
 sec("【11】消费预算闸（/预算）——到上限拒绝调用，算不准就说不准")
 
 _budget_dir = tempfile.mkdtemp(prefix="selftest_usage_budget_")
@@ -570,7 +558,6 @@ usage.USAGE_PATH = _repo_path
 shutil.rmtree(_budget_dir, ignore_errors=True)
 
 
-# ==========================================================================
 sec("【12】没污染仓库的 data/usage.jsonl")
 
 _new_stat = None
@@ -584,7 +571,6 @@ chk(_new_stat == _repo_stat,
 chk(usage.USAGE_PATH == _repo_path, "USAGE_PATH 已还原成仓库路径")
 
 
-# ==========================================================================
 print()
 print(f"通过 {_pass} 项，失败 {len(_fail)} 项。")
 if _fail:

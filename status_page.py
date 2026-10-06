@@ -40,8 +40,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    # ------------------------------------------------------------ 响应工具
-
     def _send(self, code, body, ctype):
         try:
             data = body.encode("utf-8")
@@ -72,8 +70,6 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             return {"error": f"snapshot_fn() 返回的不是 dict，而是 {type(data).__name__}"}
         return data
-
-    # ------------------------------------------------------------ 路由
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -215,9 +211,6 @@ def stop(server):
             t.join(timeout=2.0)
     except Exception:
         pass
-
-
-# ------------------------------------------------------------------ HTML 渲染
 
 
 def render_html(snap):

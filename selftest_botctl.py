@@ -340,7 +340,6 @@ def t7_search_service():
         check("找不到后端解释器 → **不拉进程**，并给两条可照着做的路",
               (not ok) and spawned == [] and "start.bat" in msg and "search.home" in msg, msg)
 
-        # ── 正常拉起：命令行/工作目录/环境变量 ──
         botctl.search_probe = lambda cfg=None, timeout=8: (True, "能查（探针拿到 3 条）")
         spawned.clear()
         ok, msg = botctl.search_start(cfg=None, home=HOME, wait=10)

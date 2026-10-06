@@ -243,14 +243,12 @@ def main():
         print("    若你确实要用 wcferry 后端，请先降级微信到 3.9.12.17 或 3.9.12.51"
               "（双击「降级.bat」），再重跑本安装。")
 
-    # 2) 虚拟环境
     print("\n[2/4] 准备 Python 虚拟环境 ...")
     if not ensure_venv():
         print("\n[!] 虚拟环境不可用，安装中止。")
         input("按回车退出 ...")
         return 1
 
-    # 3) 依赖
     print("\n[3/4] 安装依赖 ...")
     if not install_deps(wcfer):
         print("\n[!] 依赖安装失败。常见原因：网络不通，或当前 Python 版本太新。")
@@ -258,7 +256,6 @@ def main():
         input("按回车退出 ...")
         return 1
 
-    # 4) 启动脚本
     print("\n[4/4] 生成启动脚本 ...")
     write_launcher()
 

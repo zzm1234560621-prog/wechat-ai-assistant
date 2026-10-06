@@ -45,7 +45,6 @@ LOCK_PORT = 39001
 STATUS_JSON = os.path.join(env.BASE, "data", "status.json")
 LOG_PATH = os.path.join(env.BASE, "bot.log")
 
-# ── 配套服务：本机搜索后端（SearXNG）────────────────────────────────────
 # 它和 bot 是**两个进程**：bot 只通过 HTTP 问它（web_read.py），从不 import 它。
 # 「助手起来了、搜索却用不了」因此是一种很容易发生的残疾状态——这一节就是为它准备的：
 # 启 / 停 / 看 / 随助手起 的唯一实现在这里，`console.py` 只显示菜单，`bot.py` 启动时也调这里。
@@ -69,7 +68,6 @@ SEARCH_PID_TTL = 600
 _SEARCH_PROBE_Q = "ping"
 
 
-# ── 纯函数（可测，不碰真实进程）──────────────────────────────────────────
 
 def parse_netstat(text, port=LOCK_PORT):
     """从 `netstat -ano` 的输出里找出**监听** `port` 的进程号。找不到返回 None。
@@ -145,7 +143,6 @@ def fmt_health(snap, extra=None):
     return "\n".join(lines)
 
 
-# ── 真实系统（薄壳）────────────────────────────────────────────────────
 
 def _run(cmd, timeout=25):
     try:
@@ -330,7 +327,6 @@ def follow():
             time.sleep(1)
 
 
-# ── 配套服务：网上搜索后端（SearXNG）──────────────────────────────────
 # 判据**只走 web_read**（enabled / base_url / build_url / parse_json）——它才是「能不能搜」
 # 的权威；这里只补它没有的东西（进程、目录、日志、启停）。懒导入是**必须的**：
 # `console.py` 拿系统 python 跑、顶层只许导入标准库 + envsetup，而本模块是被它顶层导入的。

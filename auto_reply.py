@@ -160,7 +160,6 @@ def build_transcript(msgs, names, limit=20, unknown_note=None):
             disp = str(m.get("sender_name") or m.get("last_sender_display_name")
                        or "").strip()
             if not disp or _is_wxid(disp):     # 显示名缺失，或字段里塞的是原始 id
-                # 没有显示名：先看能不能用 sender 去联系人表换一个显示名
                 disp = str(names.get(str(m.get("sender") or "")) or "").strip()
             if not disp or _is_wxid(disp):
                 unknown += 1
@@ -185,7 +184,7 @@ def sanitize(text, max_chars=200):
         return ""
     t = _FENCE.sub(lambda m: m.group(1), t)      # 去代码围栏，保留围栏里的字
     t = _LEAD.sub("", t.strip())
-    t = t.replace("\r", " ").replace("\n", " ")   # 一条微信消息里不塞换行
+    t = t.replace("\r", " ").replace("\n", " ")
     t = _MD.sub("", t)
     t = t.strip().strip('"').strip("'").strip("“”").strip("「」")
     t = re.sub(r"\s+", " ", t).strip()
@@ -389,9 +388,7 @@ def address_rule(addr):
     return _ADDRESS_RULE.format(addr=addr)
 
 
-# ============================================================
-#  称呼的独立存储（2026-10-04：和自动回复名单解绑）
-# ============================================================
+# 称呼的独立存储（2026-10-04：和自动回复名单解绑）
 #
 # 用户 2026-10-04 拍的：**称呼和自动回复必须分开**。
 # 以前称呼借住在 `auto_reply.chats[].address` 里，而 `chats` 就是「自动回复名单」，
@@ -504,7 +501,7 @@ def address_aliases(cfg):
     for r in chat_list(cfg):
         wxid = str(r.get("wxid") or "")
         if wxid in book:
-            continue                  # 称呼表里已经有一份更新的
+            continue
         add(address_for(r), wxid, r.get("name"))
     return out
 
@@ -540,9 +537,7 @@ def make_reply(llm, rec, msgs, names, cfg, group=False):
     return sanitize(picked, auto_cfg.get("max_reply_chars", 200))
 
 
-# ============================================================
-#  配置读写（/auto 命令）
-# ============================================================
+# 配置读写（/auto 命令）
 
 def section(cfg):
     return dict(cfg.get("auto_reply") or {})
@@ -789,9 +784,7 @@ def _persona_learn(text):
     return t in {c.lower() for c in _PERSONA_LEARN}
 
 
-# ============================================================
-#  从历史对话里学语气
-# ============================================================
+# 从历史对话里学语气
 
 def _is_text_msg(m):
     """这条历史是不是一条**文本**消息。

@@ -1,6 +1,4 @@
-"""可选的大模型服务商预设。setup_llm.py（.bat 向导）和 bot.py（微信命令）共用这一份，
-避免两边各写一份导致不一致。
-"""
+"""可选的大模型服务商预设。setup_llm.py（.bat 向导）与 bot.py（微信 /provider）共用。"""
 
 PROVIDER_PRESETS = [
     {
@@ -11,7 +9,7 @@ PROVIDER_PRESETS = [
         "model": "deepseek-flash",
         "models": ["deepseek-flash", "deepseek-v4-pro"],
         "key_url": "https://platform.deepseek.com",
-        "note": "便宜、中文好，**deepseek-flash 支持图像理解**（收图）；key 形如 sk- 加 32 位字符",
+        "note": "便宜、中文好，**收图**；key 形如 sk- 加 32 位字符",
     },
     {
         "short": "Claude 官方",
@@ -51,9 +49,8 @@ PROVIDER_PRESETS = [
         "model": "glm-4-flash-250414",
         "models": ["glm-4-flash-250414", "glm-4.7-flash"],
         "key_url": "https://open.bigmodel.cn",
-        "note": "**这两个都免费**（官方定价页标「免费」，2026-10-04 核）。默认 250414：实测连打 6 次全成功、"
-                "0.2~0.5s、工具调用正常。glm-4.7-flash 更聪明但**限流严重**（实测 6 次里 4 次 429），"
-                "且默认开思考会把输出预算吃光。⚠️ 都**只收文本、不收图**",
+        "note": "**两个都免费**（官方定价页标「免费」）。默认 250414：快（0.2~0.5s）、工具调用正常；"
+                "glm-4.7-flash 更聪明但**限流严重**（常 429）。⚠️ 都**只收文本、不收图**",
     },
     {
         "short": "OpenAI",
@@ -76,7 +73,7 @@ PROVIDER_PRESETS = [
         "note": "需先装 Ollama 并 ollama pull 一个模型",
     },
     {
-        # 追加在**末尾**：中间的编号动了，已经记住「/provider 6 = OpenAI」的手就会配错。
+        # 只能追加在末尾：中间编号一动，记住「/provider 6 = OpenAI」的人就会配错。
         "short": "OpenRouter",
         "name": "OpenRouter（聚合，含免费档）",
         "provider": "openai",
@@ -87,12 +84,9 @@ PROVIDER_PRESETS = [
                    "openrouter/free"],
         "key_url": "https://openrouter.ai/settings/keys",
         "note": "一个 key 通吃多家模型（key 形如 sk-or-v1-）。"
-                "⚠️ 免费档（id 以 :free 结尾）：**20 次/分、50 次/天**"
-                "（账号历史累计充值 ≥10 刀才放宽到 1000/天）；"
-                "免费上游多数会**拿提示词去训练**，而本助手每次请求里装的都是用户真实聊天记录"
-                "——要用免费档，先在 OpenRouter 账号里关掉训练授权，并建议打开 privacy.redact。"
-                "模型页把路由切成「highest tool-calling accuracy」：本助手全靠模型自己调工具，"
-                "路由太图便宜会把功能静默省没（自测判据：bot.log 里有没有 `[bot] 工具 …`）。",
+                "⚠️ 免费档（id 以 :free 结尾）：**20 次/分、50 次/天**（累计充值 ≥10 刀才放宽）；"
+                "上游多数会**拿提示词去训练**，而本助手发的是真实聊天记录 —— 用前先在账号里关掉训练授权。"
+                "模型页路由选「highest tool-calling accuracy」，太图便宜会让功能被静默省掉。",
     },
 ]
 

@@ -106,7 +106,6 @@ def main():
     dupes = sorted({n for n in names if names.count(n) > 1})
     check("TOOLS 里没有重名", not dupes, f"重名：{dupes}")
 
-    # ── 2 · 每个工具的 schema 完整 ────────────────────────────────────────
     print("── 2 · 工具的 description / parameters 完整 ──")
     no_desc = [t["name"] for t in agent_tools.TOOLS
                if not (t.get("description") or "").strip()]

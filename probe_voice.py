@@ -324,7 +324,6 @@ def main(argv):
             print("--tag 只认 before / after")
             return 2
 
-    # ---- 1) 盘面 ----
     print("\n【1】盘面快照（msg\\ + cache\\ 下**所有**文件，不限后缀）")
     now = disk_snapshot()
     recs = rec_dirs()

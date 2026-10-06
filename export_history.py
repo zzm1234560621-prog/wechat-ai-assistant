@@ -56,7 +56,6 @@ def find_wechat_dirs():
         for p in root.glob("*"):
             if p.is_dir() and ((p / "Msg").exists() or (p / "msg").exists()):
                 hits.append(p)
-    # 去重
     return list(dict.fromkeys(hits))
 
 

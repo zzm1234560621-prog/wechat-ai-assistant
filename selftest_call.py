@@ -56,7 +56,6 @@ def reset_ledger():
         os.remove(callgate.CALL_LOG_PATH)
 
 
-# ---------------------------------------------------------------- 能力闸
 sec("1. 能力闸：默认关，严格 is True")
 chk(callgate.enabled({}) is False, "没配 -> 关")
 chk(callgate.enabled({"agent": {}}) is False, "空 agent -> 关")
@@ -69,7 +68,6 @@ chk(callgate.enabled({"agent": {"call_voip": True}}) is True, "True -> 开")
 ok, why = callgate.check({})
 chk(ok is False and "没开启" in why, "关着时 check 直接拒绝，且说清是没开启", why)
 
-# ---------------------------------------------------------------- 免打扰
 sec("2. 免打扰：跨零点 / 空串 / 多段")
 cfg_q = {"agent": {"call_voip": True, "call_quiet_hours": "23:00-07:00"}}
 for hh, mm, want in ((23, 30, True), (0, 10, True), (6, 59, True),
@@ -89,7 +87,6 @@ cfg_bad = {"agent": {"call_voip": True, "call_quiet_hours": "乱七八糟"}}
 chk(callgate.quiet_windows(cfg_bad) == [],
     "时段写坏了 -> 那一段丢掉（不崩、也不整段失效）", callgate.quiet_windows(cfg_bad))
 
-# ---------------------------------------------------------------- 频率
 sec("3. 每天上限：滑动 24 小时")
 reset_ledger()
 cap_cfg = {"agent": {"call_voip": True, "call_quiet_hours": "",
@@ -117,7 +114,6 @@ chk(callgate.cap({"agent": {"call_max_per_day": 0}}) == callgate.DEFAULT_CAP,
 chk(callgate.cap({"agent": {"call_max_per_day": "abc"}}) == callgate.DEFAULT_CAP,
     "配成非数字 -> 回退默认值")
 
-# ---------------------------------------------------------------- 工具
 sec("4. call 工具：只登记、被挡不留痕")
 reset_ledger()
 CONTACTS = [{"wxid": "wxid_zhang", "name": "张三", "remark": "张三"},
@@ -196,7 +192,6 @@ try:
 finally:
     bot.STATE_PATH, bot._STATE = _old_path, _old_state
 
-# ---------------------------------------------------------------- 契约
 sec("5. aixed_api.call_voip：请求形状是 {wxid}（+ 可选 type/body）")
 c = aixed_api.AixedClient("http://127.0.0.1:1")
 seen = {}
@@ -223,7 +218,6 @@ c.call_voip("wxid_zhang", msg_type=1, body="hello")
 chk(seen["payload"] == {"wxid": "wxid_zhang", "type": 1, "body": "hello"},
     "msg_type / body 会进请求（真机试验靠它）", seen["payload"])
 
-# ---------------------------------------------------------------- 定时
 sec("6. 定时任务 action=call：照样判闸，绝不降级成发文本")
 reset_ledger()
 sent_text = []
@@ -281,7 +275,6 @@ chk(sent_text == [], "没给 call 回调时也绝不发文本", sent_text)
 chk(any("没打通" in t or "打不出去" in t for t in notified),
     "没给回调时如实报「打不出去」", notified)
 
-# ---------------------------------------------------------------- 收尾
 print("\n" + "=" * 62)
 if _fails:
     print(f"FAILED {len(_fails)}/{_n}: " + "；".join(_fails[:6]))

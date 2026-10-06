@@ -49,7 +49,7 @@ if HERE not in sys.path:
 
 MAGIC = b"#!SILK_V3"
 WINDOW = 64 * 1024          # 每个 magic 往后最多看多少
-MATCH_TOL_MS = 150          # 时长匹配的默认容忍度
+MATCH_TOL_MS = 150
 MAX_CANDIDATES = 8
 FRAME_MS = 20               # 微信 SILK 每帧 20 毫秒（用来按帧数估时长，省掉解码探测）
 

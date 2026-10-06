@@ -158,10 +158,6 @@ def record(provider, model, prompt_tokens=0, completion_tokens=0, kind="chat"):
         print(f"⚠️ 用量记录写入失败（不影响本次回答）：{type(e).__name__}: {e}")
 
 
-# ============================================================
-#  统计
-# ============================================================
-
 def summary(days=7):
     """读本地账本，按模型聚合成 dict。坏行跳过并计数，**不崩**。
 
@@ -247,7 +243,6 @@ def summary(days=7):
             unpriced.append(model)      # 没有价目表 → 只报 token
             continue
         priced.append(model)
-        # 单价是「元/百万 token」，所以除 1e6。
         cost = (m["prompt_tokens"] * p[0] + m["completion_tokens"] * p[1]) / 1e6
         m["est_cost"] = cost
         total_cost += cost

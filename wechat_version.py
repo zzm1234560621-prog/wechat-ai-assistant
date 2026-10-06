@@ -49,7 +49,6 @@ WX_TO_WCFER = {
     # "3.9.2.23": "39.0.14",  # 此对应关系未核实，先注释掉
 }
 
-# 常见安装路径（兜底用）
 COMMON_PATHS = [
     r"C:\Program Files\Tencent\WeChat\WeChat.exe",
     r"C:\Program Files (x86)\Tencent\WeChat\WeChat.exe",

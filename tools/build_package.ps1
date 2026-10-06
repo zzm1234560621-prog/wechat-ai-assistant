@@ -39,10 +39,17 @@ New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 # ── 1 · 根目录的源码与入口 ────────────────────────────────────────────
 Copy-Item (Join-Path $root '*.py')  $pkg -Force
 Copy-Item (Join-Path $root '*.bat') $pkg -Force
-foreach ($f in @('README.md', 'CLAUDE.md', 'requirements.txt')) {
+# `README.en.md` / `LICENSE` 是 2026-10-06 公开到 GitHub 时加的：README 中英双语，
+# 拿到包的人也拿到同一份协议与免责声明（包里那份 README.md 顶部的语言切换就指向它）。
+foreach ($f in @('README.md', 'README.en.md', 'LICENSE', 'CLAUDE.md', 'requirements.txt')) {
     $p = Join-Path $root $f
     if (Test-Path $p) { Copy-Item $p $pkg -Force } else { Write-Warning "缺少 $f" }
 }
+
+# ⚠️ 两个微信官方安装程序（WeChatWin_4.1.10.27.exe / WeChatSetup-3.9.12.51.exe）
+# **2026-10-06 起不进 git**（走 LFS 会烧掉免费额度，约两次克隆就见底），
+# 但它们**必须进这个包** —— 普通用户就是靠包里那份 `⓪` 一键装的。
+# 所以：git 里没有是正常的，这里没有才是问题（下面 step 4 会 Write-Warning）。
 
 # ── 2 · 示例配置改名成实配（包里的 key 一定是空的）────────────────────
 Copy-Item (Join-Path $root 'config.example.yaml')   (Join-Path $pkg 'config.yaml')   -Force
@@ -210,7 +217,8 @@ $quickstart = @'
        是 **519168** 就是旧的（新版 **527360**）。修法：助手.bat → [8] → [7] → [4]
        只替换 version.dll，然后**完全退出微信再打开、扫码登录**。
        详细判据见 README 的「助手一直刷…怎么办」一节。
-  · README.md 的「排错」一节（最常见的问题都在那儿）
+  · README.md 的「助手一直刷「hook 已加载，但数据库打不开」怎么办」一节
+     （最常见的问题都在那儿；英文版是 README.en.md）
   · 助手没反应 → 先看 bot.log（或 助手.bat → [6]）
   · 想自测（不需要真微信、不碰 hook）：助手.bat → [8] → 跑全部自测
 

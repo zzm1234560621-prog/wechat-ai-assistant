@@ -113,8 +113,6 @@ def _make_junction(link, target):
         return False
 
 
-# ---------------------------------------------------------------- 1. 队列
-
 def test_queue():
     print("\n── 待确认队列：可枚举 + 按编号取（混合 kind 不会执行错的那条）──")
     ok = True
@@ -177,8 +175,6 @@ def test_queue():
     _reset_pending()
     return ok
 
-
-# ------------------------------------------------- 2. describe_pending
 
 def test_describe():
     print("\n── describe_pending：五类待确认项都说人话，且不含 wxid/roomid ──")
@@ -251,8 +247,6 @@ def test_describe():
                 and bool(agent_tools.describe_pending("x")))
     return ok
 
-
-# ---------------------------------------------------- 3. 发图白名单
 
 def test_whitelist():
     print("\n── 发图白名单：目录内放行 / .. 逃逸 / 目录外 / 链接逃逸 / 后缀 ──")
@@ -438,7 +432,6 @@ def test_image_cache_root():
         ok &= check("告警说明了放宽到什么范围",
                     "xwechat_files" in warn, warn.strip())
 
-        # 告警只打一次，不要刷屏
         err2 = io.StringIO()
         with contextlib.redirect_stderr(err2):
             agent_tools.allowed_image_dirs({})
@@ -459,8 +452,6 @@ def test_image_cache_root():
     return ok
 
 
-# ------------------------------------------- 4. 发送时二次校验
-
 def test_send_pending_guard():
     print("\n── send_pending：发送时二次校验（不许「先发几张再说」）──")
     ok = True
@@ -472,7 +463,6 @@ def test_send_pending_guard():
         inside_img = _write(os.path.join(okdir, "a.png"))
         outside_img = _write(os.path.join(outside, "b.png"))
 
-        # 目录外：一条都不发
         rec = _Rec()
         n, err = agent_tools.send_pending(
             rec, {"to_wxid": "w", "image": outside_img}, 0.0, allowed_dirs=[okdir])
@@ -489,7 +479,6 @@ def test_send_pending_guard():
                     rec.calls)
         ok &= check("混合路径：错误里点出是哪一张", err and outside_img in str(err), err)
 
-        # 目录内：正常发
         rec = _Rec()
         n, err = agent_tools.send_pending(
             rec, {"to_wxid": "w", "image": inside_img}, 0.0, allowed_dirs=[okdir])
@@ -503,14 +492,12 @@ def test_send_pending_guard():
             rec, {"to_wxid": "w", "image": inside_img}, 0.0, allowed_dirs=[])
         ok &= check("空白名单：不发送并如实报错", n == 0 and rec.calls == [] and err, (n, err))
 
-        # allowed_dirs=None（默认）= **保持原有行为**
         rec = _Rec()
         n, err = agent_tools.send_pending(
             rec, {"to_wxid": "w", "image": outside_img}, 0.0)
         ok &= check("allowed_dirs=None 时行为不变（照发）",
                     n == 1 and rec.calls == [("image", "w", outside_img)], rec.calls)
 
-        # 文本不受这个参数影响
         rec = _Rec()
         n, err = agent_tools.send_pending(
             rec, {"to_wxid": "w", "text": "hi", "count": 2}, 0.0, allowed_dirs=[okdir])
@@ -596,8 +583,6 @@ def test_partial_send_report():
     return ok
 
 
-# ------------------------------------------- 6. 查询预算硬夹
-
 def test_budget_clamp():
     print("\n── agent.max_queries：越界钳制 + 告警（不许出现「不设上限」）──")
     ok = True
@@ -644,8 +629,6 @@ def test_budget_clamp():
                     b.max_queries)
     return ok
 
-
-# ---------------- 群发（一道意图 -> 多个人，各按自己的人设/称呼） ----------------
 
 _BC_CONTACTS = [
     {"wxid": "wxid_a", "name": "张三", "remark": "张三"},

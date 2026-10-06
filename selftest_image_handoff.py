@@ -40,7 +40,6 @@ def check(label, cond, extra=""):
     return bool(cond)
 
 
-# ---------------- 一个假的「视觉模型」HTTP 服务 ----------------
 class _VisionHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)

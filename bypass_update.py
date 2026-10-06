@@ -21,7 +21,6 @@ import winreg
 COMPAT_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
 COMPAT_VALUE = "~ ARM64WOWONAMD64"
 
-# 常见安装路径（按 3.9.x 的 WeChat.exe 和 4.x 的 Weixin.exe 两种命名）
 COMMON_PATHS = [
     # 3.9.x
     r"C:\Program Files\Tencent\WeChat\WeChat.exe",

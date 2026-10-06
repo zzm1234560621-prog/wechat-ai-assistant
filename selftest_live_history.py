@@ -29,8 +29,6 @@ from selftest_aixed import (SELF_WXID, V4_SESSION_SUMMARY, V4_SESSION_TS,
 NOW = 1_700_000_000
 
 
-# ---------- 进程内假客户端 ----------
-
 class _FakeClient:
     """把每条 (库名, SQL) 交给路由函数的假客户端。
 
@@ -278,8 +276,6 @@ def _raw_id_fields(rows):
     return bad
 
 
-# ---------- 小工具 ----------
-
 def _clear_poll_errors():
     """每段用例都从「没有任何轮询失败」开始，断言才精确。
 
@@ -311,7 +307,6 @@ def main():
     ok = True
     live_history.set_self_wxid(SELF_WXID)
 
-    # ---------------------------------------------------------------
     print("── T3：appmsg 标签不再是内部数字 ──")
     ok &= check("先钉住成因：_type_label(4|(49<<0)) 就是「类型53」",
                 live_history._type_label(4 | (49 << 0)) == "类型53")
@@ -321,7 +316,6 @@ def main():
     ok &= check("按 _type_label 的约定传 49 会落到「消息」",
                 live_history._type_label(49) == "消息")
 
-    # ---------------------------------------------------------------
     print("\n── T5：只有 <des> 的消息不能白读 ──")
     out = live_history.render_appmsg("<appmsg><des>只有描述</des></appmsg>", "无用的摘要")
     ok &= check("<des> 能单独成词，且保住 [标签] 风格（摘要不许顶掉它）",
@@ -343,7 +337,6 @@ def main():
                 live_history.render_appmsg(ref) == "[引用 张三：被引用的原文] 我打的字",
                 live_history.render_appmsg(ref))
 
-    # ---------------------------------------------------------------
     print("\n── T4：LIKE 通配符按字面匹配（真 SQLite 验语义）──")
     vals = ["进度50%完成", "进度5012完成", "50%", "5012"]
     hit = _like_hits(live_history._like("v", "50%"), vals)
@@ -360,7 +353,6 @@ def main():
     hit4 = _like_hits(live_history._like("v", "o'b"), ["o'b", "oxb", "ob"])
     ok &= check("单引号照旧转义，值没被拆坏", hit4 == ["o'b"], hit4)
 
-    # ---------------------------------------------------------------
     print("\n── T4：每个 LIKE 调用点都带 ESCAPE（看真发出去的 SQL）──")
 
     def likes(sqls):
@@ -406,7 +398,6 @@ def main():
     ok &= check("精确相等仍走 _q（引号加倍、没有 LIKE 转义、没有 ESCAPE）",
                 "= 'o''brien'" in s and "ESCAPE" not in s and "\\" not in s, s)
 
-    # ---------------------------------------------------------------
     print("\n── T1（前半）：fts 分片自己失败时也要留痕（键是分片名）──")
     _clear_poll_errors()
     shard = _FakeClient(_fts_shard_dead)
@@ -421,7 +412,6 @@ def main():
                 and "failed" in errf.getvalue(), repr(errf.getvalue()))
     ok &= check("分片失败时不返回消息", msgs_f == [], msgs_f)
 
-    # ---------------------------------------------------------------
     print("\n── T1：fts / Msg_ / session.db 三层全废，必须报错不许静默 ──")
     _clear_poll_errors()
     dead = _FakeClient(_three_layers_dead)
@@ -558,7 +548,6 @@ def main():
                 bool(msgs_m) and "session.db" not in live_history.poll_errors(),
                 (msgs_m, live_history.poll_errors()))
 
-    # ---------------------------------------------------------------
     print("\n── 复用 selftest_aixed 的 _V4StaleFtsStub：真兜底路径不许误报 ──")
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _V4StaleFtsStub)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -580,7 +569,6 @@ def main():
         live_history.set_rescan_interval(300)
         srv.shutdown()
 
-    # ---------------------------------------------------------------
     print("\n── Msg_ 兜底路：同一群里两个发言人必须能区分 ──")
 
     def _fresh_v4():
@@ -627,7 +615,6 @@ def main():
     ok &= check("自己那行的 sender 也是 wxid（和 fts 那条路保持一致）",
                 mine and mine[0]["sender"] == SELF_WXID, mine)
 
-    # ---------------------------------------------------------------
     print("\n── Msg_ 兜底路：解析不出时不许编名字 ──")
     _fresh_v4()
     err_u = io.StringIO()
@@ -651,7 +638,6 @@ def main():
     ok &= check("退到编号渲染，文本里没有裸 wxid、也没有那个数字 id",
                 "wxid" not in text_u and "42" not in text_u, text_u)
 
-    # ---------------------------------------------------------------
     print("\n── Msg_ 兜底路：Name2Id 查不动要留痕，恢复后要自己清掉 ──")
     _fresh_v4()
     err_d = io.StringIO()
@@ -690,7 +676,6 @@ def main():
                 and "Name2Id" not in err_z.getvalue(),
                 (live_history.poll_errors(), repr(err_z.getvalue())))
 
-    # ---------------------------------------------------------------
     print("\n── Msg_ 兜底路：绝不能用 fts 的 Name2Id 解本分片的 id ──")
     _fresh_v4()
     sent_sql = _FakeClient(_msg_two_speakers)
@@ -704,7 +689,6 @@ def main():
     ok &= check("带选择性过滤（rowid IN）、不做排序",
                 all("rowid IN" in s and "ORDER BY" not in s for _, s in mapped), mapped)
 
-    # ---------------------------------------------------------------
     print("\n── fts 主路径的历史字段：非文本要带 local_type ──")
     ok &= _t_fts_history_fields()
     ok &= _t_appmsg_breaker()

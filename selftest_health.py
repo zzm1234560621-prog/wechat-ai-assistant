@@ -66,9 +66,6 @@ def _http_get(url, timeout=5):
         return r.status, r.read().decode("utf-8", "replace")
 
 
-# ---------------------------------------------------------------- rotate_log
-
-
 def test_rotate_log():
     print("\n── rotate_log：轮转 / keep / 不存在的文件 / 失败不抛异常 ──")
     ok = True
@@ -156,9 +153,6 @@ def test_rotate_log():
     except Exception as e:
         ok &= check("参数是垃圾值时返回 False 不抛异常", False, e)
     return ok
-
-
-# ---------------------------------------------------------------- Health
 
 
 def test_health_login_alerts():
@@ -427,9 +421,6 @@ def test_notes_and_status_file():
     except Exception as e:
         ok &= check("通知函数抛异常时 alert 不抛", False, e)
     return ok
-
-
-# ---------------------------------------------------------------- status_page
 
 
 # status_page 测试用的假快照：**故意**塞了 XSS 载荷和一个敏感键。

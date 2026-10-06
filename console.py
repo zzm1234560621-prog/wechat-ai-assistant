@@ -420,7 +420,7 @@ def act_status_page():
     return None
 
 
-# ── 配套服务：网上搜索后端（SearXNG）────────────────────────────────────
+# 配套服务：网上搜索后端（SearXNG）
 # 「启/停/看」的实现在 botctl.py（和 bot 自己的启停同一个所有者），这里只显示菜单、调它。
 # config 由 botctl.load_cfg() 读（它已经处理了「yaml 延迟导入 + 读不出来不抛」）。
 
@@ -502,7 +502,7 @@ def act_search_install():
     return "\n".join(out)
 
 
-# ── 可选组件：语音转文字 / 网上搜索 / 文件格式增强包 / 本地语义检索 ───────
+# 可选组件：语音转文字 / 网上搜索 / 文件格式增强包 / 本地语义检索
 # 为什么要有这一段（2026-10-05）：这些能力**代码都在、包里也都在**，但依赖与模型都不随包
 # （它们在 requirements.txt 里只能写成注释行；语音模型、torch、SearXNG 的 venv 更不能跨机器拷）
 # ——于是「装完就能用」在别人机器上并不成立，而 README 把语音条转文字、压缩包、视频
@@ -650,7 +650,6 @@ def _semantic_state():
         return False, f"问不动语义检索那一侧（{type(e).__name__}: {e}）"
     if ready:
         return True, "模型 + 索引都就位（`semantic.enabled` 还要是 true 才会在聊天里用）。"
-    # 不 ready：把状态里「模型 / 索引」那两行摘出来，用户才知道差哪一步
     lines = []
     try:
         r2 = subprocess.run([py, "semantic.py", "--status"], cwd=BASE,
@@ -812,7 +811,7 @@ def _install_optional_all():
     return "\n".join(out)
 
 
-# ── 装 hook 之前的版本闸（微信版本 = 整件事的前置条件）──────────────────
+# 装 hook 之前的版本闸（微信版本 = 整件事的前置条件）
 # 为什么要有这一段（2026-10-04 真机）：另一台电脑上微信是 4.1.15.13，用户按 [9] 一键配置
 # 走完一遍——version.dll 放进了微信目录、hook-install-log.txt 写着「已放置，SHA256 = …」，
 # 看起来全部成功，可 30001 从来没有被监听，bot 就一直重试「连不上 30001」。
@@ -1123,7 +1122,6 @@ def first_run():
     print("     winget install -e --id Python.Python.3.11")
     print()
 
-    # ── 0 · 微信版本 ──
     # 为什么放在最前面：hook 只支持 4.1.10.27，版本不对时**装 hook 会"成功"但永不生效**
     # （DLL 被正常加载、挂钩失败、30001 一直没人监听），用户只看到 bot 反复「连不上 30001」。
     # 2026-10-04 真机：另一台电脑微信是 4.1.15.13，[9] 走完一遍日志全绿、端口从没通。

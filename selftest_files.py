@@ -52,8 +52,6 @@ def _mk(path, text="x"):
     return path
 
 
-# ─────────────────────────────────────────────── 1. 路径准入（安全边界）
-
 def test_path_model():
     print("\n── 1 · 路径准入：全盘 / deny / .. 与符号链接绕过 ──")
     ok = True
@@ -131,8 +129,6 @@ def test_path_model():
         ok &= check("全盘时说「全盘」", "全盘" in files.describe_scope({}))
     return ok
 
-
-# ─────────────────────────────────────────────── 2. 读类动作
 
 def _run(args, cfg, chat=None, from_self=True):
     """跑一次 `computer_files`。
@@ -242,8 +238,6 @@ def test_reextract_kernel():
         file_read.extract_page = orig_page
     return ok
 
-
-# ─────────────────────────────────────────────── 4. 开关 / 契约注册 / 分界线
 
 def test_switch_and_contract():
     print("\n── 4 · 开关、契约注册、以及「不执行程序」这条分界线 ──")

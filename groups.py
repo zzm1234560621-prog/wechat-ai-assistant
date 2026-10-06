@@ -50,8 +50,6 @@ def is_labels_arg(sub):
     return sub in ("标签", "微信标签", "labels", "label", "tags", "tag")
 
 
-# ---------------- 读取 ----------------
-
 def all_groups(cfg):
     """`{组名: [{"wxid","name"}, ...]}`。条目按引用返回，命令里改完再 _save。
 
@@ -94,8 +92,6 @@ def _save(groups):
     """只写自己那一个顶层键。基准取磁盘现值由调用方负责（见 handle_command）。"""
     settings.set_value(_KEY, dict(groups or {}))
 
-
-# ---------------- 展示 ----------------
 
 def status_text(cfg):
     gs = all_groups(cfg)
@@ -160,8 +156,6 @@ def labels_text(client):
     lines.append("⚠️ 标签在微信那边改；这里只能看。要自己攒一份名单就用 /groups add。")
     return "\n".join(lines)
 
-
-# ---------------- 命令 / 工具 ----------------
 
 def build_arg(action, group="", who=""):
     """把 agent 工具的结构化参数拼成 /分组 的子命令串。

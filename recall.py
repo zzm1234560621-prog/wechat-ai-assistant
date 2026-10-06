@@ -80,8 +80,6 @@ def buffer_max(cfg):
     return _opt_int(section(cfg), "buffer_max", 300, MAX_MIN, MAX_MAX)
 
 
-# ---------------- 判据 ----------------
-
 def is_recall(local_type, content):
     """这条消息是不是「撤回」系统提示。**两道判据缺一不可**（见文件头注释）。"""
     try:
@@ -109,8 +107,6 @@ def note_system(content):
     _system_seen.append(body)
     return True
 
-
-# ---------------- 缓冲 ----------------
 
 class Ring:
     """最近见过的消息的小环形缓冲。**纯内存**：不查库、不落盘、不起线程。"""
@@ -173,8 +169,6 @@ class Ring:
                 return it
         return newest
 
-
-# ---------------- 文案 ----------------
 
 def format_echo(who, original, limit=300):
     """回显文案。**捞不到原文时如实说捞不到**，绝不拿别的消息顶上。"""

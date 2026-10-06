@@ -78,8 +78,6 @@ def _good_plugin_spec(name, **over):
     return spec
 
 
-# ─────────────────────────────────────────────── 1. 零行为变化
-
 def test_zero_behavior_change():
     print("\n── 1 · 零行为变化：注册表的内置视图 == agent_tools.TOOLS ──")
     ok = True
@@ -184,8 +182,6 @@ def test_load_failures():
     return ok
 
 
-# ─────────────────────────────────────────────── 3. 派发
-
 def test_dispatch():
     print("\n── 3 · 派发：只有注册表这一条路 ──")
     ok = True
@@ -239,8 +235,6 @@ def test_dispatch():
     return ok
 
 
-# ─────────────────────────────────────────────── 4. 真 ToolBox 端到端
-
 def test_real_toolbox():
     print("\n── 4 · 真 ToolBox.run：认内置工具、未知名字照旧 ──")
     ok = True
@@ -269,8 +263,6 @@ def test_real_toolbox():
                                         cfg_provider=lambda: cfg).ctx()["is_group"] is True)
     return ok
 
-
-# ─────────────────────────────────────────────── 5. 依赖方向
 
 def test_dependency_direction():
     print("\n── 5 · 依赖方向：注册表谁也不 import（不许反过来）──")

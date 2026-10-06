@@ -57,10 +57,6 @@ def check(label, cond, extra=""):
     return bool(cond)
 
 
-# ============================================================
-#  T1：Office 解压体积上限（zip 炸弹）+ XML 实体膨胀
-# ============================================================
-
 BIG_LIMIT = 64 * 1024 * 1024            # file.max_bytes：64MB
 UNPACK_CAP = BIG_LIMIT * 3              # file_read 的解压上限 = min(200MB, max_bytes*3) = 192MB
 FILLER_MID = 200 * 1024 * 1024          # 单个成员 200MB：超过解压上限，用来测第二道防线
@@ -231,10 +227,6 @@ def t1_zip_bomb():
     check("预算对象从 0 起算（另一次调用各算各的）", used_before == 0, used_before)
 
 
-# ============================================================
-#  T2：pypdf 缺失时的报错要可操作
-# ============================================================
-
 def t2_pdf_message():
     print("\n── T2 · pypdf 缺失时的报错可操作性 ──")
     real_get = sys.modules.get("pypdf")
@@ -256,10 +248,6 @@ def t2_pdf_message():
     check("300 字上限内安装指引没被截断（旧代码 [:120] 会把后半句切掉）",
           err is not None and err.rstrip().endswith("）"), err[-40:] if err else err)
 
-
-# ============================================================
-#  T3：locate() 的真实路径归属校验（软链/联接）
-# ============================================================
 
 def _link_dir(target, link):
     """建一个目录链接（Windows 优先目录联接，免得要管理员权限）。"""
@@ -327,10 +315,6 @@ def t3_locate_realpath():
     finally:
         sys.modules["image_cache"].account_dirs = lambda: []
 
-
-# ============================================================
-#  T4：编码回退 + 双解区提示
-# ============================================================
 
 def t4_encoding():
     print("\n── T4 · 文本编码 ──")
@@ -405,10 +389,6 @@ def t4_encoding():
           file_read._looks_garbled("Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼Ŀ¼") is True)
 
 
-# ============================================================
-#  T5：按协议选环境变量
-# ============================================================
-
 def t5_api_key_env():
     print("\n── T5 · provider 与环境变量必须对应 ──")
     keys = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
@@ -452,10 +432,6 @@ def t5_api_key_env():
             else:
                 os.environ[k] = v
 
-
-# ============================================================
-#  T6 / T7：temperature 重试不对称 + 截断事实
-# ============================================================
 
 class _FakeResp:
     def __init__(self, text="你好", stop_reason="end_turn"):
@@ -747,7 +723,6 @@ def t9_image_and_pick():
     finally:
         image_read.handoff = real_handoff
 
-    # ---- pick()：只按文件名找（纯磁盘，不查库）----
     root = os.path.join(TMP, "pickroot")
     os.makedirs(os.path.join(root, "2026-10"), exist_ok=True)
     for fn in ("报告(1).pdf", "发票A.pdf", "发票B.pdf", "笔记.docx"):

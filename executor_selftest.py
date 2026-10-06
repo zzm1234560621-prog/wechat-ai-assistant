@@ -76,9 +76,7 @@ def raw_bytes_cmd(expr):
     return f'"{PY}" -c {code}'
 
 
-# --------------------------------------------------------------------------
 sec("【1】执行 / 退出码 / 合并输出 / env")
-# --------------------------------------------------------------------------
 r = ex.run_command("echo hello")
 chk(r.ok and r.exit_code == 0, f"echo hello 成功且退出码 0（exit={r.exit_code}）")
 chk(r.output == "hello", f"输出正好是 hello（实际 {r.output!r}）")
@@ -115,9 +113,7 @@ chk(ex.run_command("echo %EXEC_SELFTEST_UNDEFINED%").output == "%EXEC_SELFTEST_U
     "没传的变量原样回显（说明上一条不是 cmd 的默认行为撑起来的）")
 
 
-# --------------------------------------------------------------------------
 sec("【2】命令原文一字不差（用户审的就是要跑的那条）")
-# --------------------------------------------------------------------------
 tricky = 'echo 中文 & echo "带 引号" & echo C:\\Windows\\System32'
 r = ex.run_command(tricky)
 chk(r.command == tricky, "ExecResult.command 与给的原文完全相等（中文/引号/反斜杠都在）")
@@ -170,9 +166,7 @@ finally:
     shutil.rmtree(_tmp, ignore_errors=True)
 
 
-# --------------------------------------------------------------------------
 sec("【3】工作目录")
-# --------------------------------------------------------------------------
 r = ex.run_command("cd", cwd=PARENT)
 chk(r.ok and os.path.normcase(PARENT) in os.path.normcase(r.output),
     f"显式 cwd 生效（{r.output.strip()}）")
@@ -207,9 +201,7 @@ chk(os.path.normcase(PROJ) not in os.path.normcase(r.error or ""),
 chk(r.output == "" and r.exit_code is None, "没跑起来就没有输出、也没有退出码")
 
 
-# --------------------------------------------------------------------------
 sec("【4】空命令 / 配置读取与夹取")
-# --------------------------------------------------------------------------
 for _c in ("", "   ", "\t", None):
     r = ex.run_command(_c)
     chk((not r.ok) and "空" in (r.error or "") and r.cwd == "" and r.exit_code is None,
@@ -274,9 +266,7 @@ chk(ex.run_command("echo fallback-ok", cfg={"shell": {"timeout": "abc"}}).ok,
     "配置里 timeout 是坏值也回退默认")
 
 
-# --------------------------------------------------------------------------
 sec("【5】超时：1 秒极小值、及时返回、配置夹取")
-# --------------------------------------------------------------------------
 _PING = "ping -n 6 127.0.0.1 > nul"
 
 t0 = time.time()
@@ -308,9 +298,7 @@ chk(_cz.timed_out and _wall_cz < 4.0,
 chk("超过 1 秒" in (_cz.error or ""), "夹取后的秒数如实写进文案，不是原始配置值")
 
 
-# --------------------------------------------------------------------------
 sec("【6】输出上限与截断边界（恰好 / 多 1 / 少 1 / 按字符不按字节）")
-# --------------------------------------------------------------------------
 _LONG = "for /L %i in (1,1,40) do @echo 0123456789"
 _base = ex.run_command(_LONG)
 chk(_base.ok and not _base.truncated, "参照输出本身没被默认上限截掉")
@@ -367,9 +355,7 @@ else:
     warn(f"本机 sys.executable 路径里含双引号（{PY}），跳过「按字符不按字节」的端到端用例")
 
 
-# --------------------------------------------------------------------------
 sec("【7】编码：utf-8 / gbk 回退 / ascii / 解不开的字节")
-# --------------------------------------------------------------------------
 chk(ex._decode("中文".encode("utf-8")) == "中文", "utf-8 中文原样解出")
 chk(ex._decode("中文".encode("gbk")) == "中文",
     "gbk 中文：utf-8 抛异常 → 回退 gbk，结果必须是中文而不是乱码")
@@ -418,9 +404,7 @@ else:
     warn(f"本机 sys.executable 路径里含双引号（{PY}），跳过真子进程吐字节的端到端编码用例")
 
 
-# --------------------------------------------------------------------------
 sec("【8】format_result：发给微信的体量、状态、裁了要明说")
-# --------------------------------------------------------------------------
 _long_cmd = "for /L %i in (1,1,400) do @echo 0123456789"
 _lres = ex.run_command(_long_cmd)
 chk(_lres.ok and len(_lres.output) == 4399, f"长参照输出 4399 字（实际 {len(_lres.output)}）")
@@ -478,9 +462,7 @@ chk("状态：没有执行" in _bad_txt and "状态：完成" not in _bad_txt,
 chk("命令：echo x" in _bad_txt, "没跑起来也要带着命令原文，用户才知道是哪条")
 
 
-# --------------------------------------------------------------------------
 sec("【9】summarize_for_model：给模型的摘要")
-# --------------------------------------------------------------------------
 _mtxt = ex.summarize_for_model(_lres)
 chk(len(_mtxt) > len(_txt), f"给模型的比给用户的多（{len(_mtxt)} > {len(_txt)}）")
 chk("本地执行结果：" in _mtxt, "摘要写明这是本地执行结果")
@@ -502,9 +484,7 @@ chk("（空）" in ex.summarize_for_model(ex.ExecResult("c", "D", ok=True, outpu
     "摘要里空输出写「（空）」")
 
 
-# --------------------------------------------------------------------------
 sec("【10】run_command_text 便捷封装")
-# --------------------------------------------------------------------------
 _ok, _t = ex.run_command_text("echo wrapped")
 chk(_ok is True and "wrapped" in _t, "run_command_text 成功路径返回 (True, 文本)")
 chk("命令：echo wrapped" in _t, "便捷封装的文本同样带命令原文")
@@ -513,9 +493,7 @@ chk(_ok is False and "失败（退出码 7" in _t and "状态：完成" not in _
     "run_command_text 失败路径返回 (False, 写清失败的文本)")
 
 
-# --------------------------------------------------------------------------
 sec("【附】歧义编码改判（正式断言）与已知残留（warn）")
-# --------------------------------------------------------------------------
 # 背景：utf-8 解码是**可逆**的，所以 _decode 里「encode 回去比对原始字节」那条校验
 # 对 utf-8 永远自洽 —— 挡不住「GBK 正文被当成 utf-8」这一类。先独立枚举印证这一点，
 # 再验证 run_command 那一层的改判（_decode_printable_trap）真的生效。
@@ -604,7 +582,6 @@ else:
          f"（encoding_guess={_omega.encoding_guess!r}）；已按 docstring 的约定带 ⚠️ 提示")
 
 
-# --------------------------------------------------------------------------
 print()
 print(f"通过 {_pass} 项，失败 {len(_fail)} 项，已知残留提示 {len(_warn)} 条。")
 if _warn:

@@ -338,8 +338,8 @@ class Health:
             h.get("hook_slow_round_sec", DEFAULTS["hook_slow_round_sec"]),
             DEFAULTS["hook_slow_round_sec"],
         )
-        self.hook_stress_rounds = 0        # 当前连续多少轮不健康
-        self.max_hook_stress_rounds = 0    # 本次运行以来的最长连续（诊断用）
+        self.hook_stress_rounds = 0
+        self.max_hook_stress_rounds = 0
         self.db_age_seconds = None         # 核心库最后被写距今（None = 拿不到 = 未知）
         self._db_age_missing_noted = False # 「拿不到库龄」只告警一次（静态条件，别刷屏）
         self.db_probed_at = None           # 最近一次权威探针的时刻

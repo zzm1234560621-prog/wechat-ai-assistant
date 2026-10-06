@@ -51,9 +51,7 @@ def sec(title):
     print(f"\n── {title} ──")
 
 
-# ============================================================
 #  1) pending_index_of：只认「整句就是选号」
-# ============================================================
 def t_index_of():
     sec("待确认选号解析（绝不在句子里乱认数字）")
     f = bot.pending_index_of
@@ -67,9 +65,7 @@ def t_index_of():
     chk(f("0") == 0, "「0」解析出 0（越界判断交给调用方，不在解析层吞掉）")
 
 
-# ============================================================
 #  2) 确认词表：agent 宽 / auto·shell 严
-# ============================================================
 def t_confirm_words():
     sec("确认词表边界（本地执行只认严格词）")
     for w in ("确认", "确定", "确认发送", "可以发", "发吧", "发送", "ok", "yes", "y"):
@@ -83,9 +79,7 @@ def t_confirm_words():
     chk(not bot.is_cancel("ok"), "「ok」不是取消词")
 
 
-# ============================================================
 #  3) _probe_login：分诊掉登录
-# ============================================================
 class _LoginStub:
     def __init__(self, val=None, boom=False):
         self.val, self.boom = val, boom
@@ -108,9 +102,7 @@ def t_probe_login():
         "说成掉登录会把排查方向带偏（2026-10-05 真机）")
 
 
-# ============================================================
 #  4) 落盘状态：原子写 / 坏文件容错 / 往返
-# ============================================================
 def t_state(tmp):
     sec("落盘状态（原子写、坏文件不挡住启动）")
     old_path, old_state = bot.STATE_PATH, bot._STATE
@@ -135,9 +127,7 @@ def t_state(tmp):
         bot.STATE_PATH, bot._STATE = old_path, old_state
 
 
-# ============================================================
 #  5) 待确认队列落盘 / 恢复
-# ============================================================
 def t_pending_persist(tmp):
     sec("待确认队列落盘与恢复（重启后回「确认」不再白等）")
     old_path, old_state = bot.STATE_PATH, bot._STATE
@@ -229,9 +219,7 @@ def t_pending_persist(tmp):
             agent_tools._PENDING[chat] = saved_pending
 
 
-# ============================================================
 #  6) build_user_prompt 的脱敏接线
-# ============================================================
 class _HistStub:
     def search(self, query, k=8):
         return [{"time": "2026-10-01 12:00", "sender": "张三",
@@ -259,9 +247,7 @@ def t_redact_wiring():
     chk("13812345678" in nod, "配置里没有 privacy 段：按关闭处理（fail-safe）")
 
 
-# ============================================================
 #  6.5) 预取的历史窗口必须自曝范围
-# ============================================================
 _HIST_WIN_CONTACTS = [{"wxid": "wxid_zhangsan", "name": "张三", "remark": "张三"}]
 
 
@@ -305,9 +291,7 @@ def t_history_window_label():
         "结尾钉了「问时间范围必须调 read_history 并带 days」")
 
 
-# ============================================================
 #  7) /用量 命令
-# ============================================================
 def t_usage_cmd():
     sec("/用量 命令")
     reply, changed = bot.handle_command("/用量", None, {}, False, [])
@@ -350,7 +334,6 @@ def t_speaker_no_id_leak():
         {"wxid_a": "wxid_a"}, "群", True)
     chk(bool(lines2) and all("wxid" not in ln for ln in lines2),
         "names 表里存的是 wxid 时也不外泄（渲染统一出口再挡一道）")
-    # contact_names 不拿 wxid 顶名字
     nm = auto_reply.contact_names([{"wxid": "wxid_noname"}, {"wxid": "wxid_ok", "name": "张三"}])
     chk("wxid_noname" not in nm, "contact_names 不给无名字的联系人塞 wxid")
     chk(nm.get("wxid_ok") == "张三", "contact_names 照常给出真显示名")

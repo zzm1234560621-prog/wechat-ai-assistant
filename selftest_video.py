@@ -52,7 +52,6 @@ def skip(label):
     print(f"  ⏭️  {label}")
 
 
-# ---------------- 造样本 ----------------
 def _text_png(path, text="体检报告 2026 年 10 月", w=480, h=220):
     """用系统 System.Drawing 画一张**有字**的图（不装 Pillow）。"""
     ps = (

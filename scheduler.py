@@ -56,7 +56,6 @@ _USAGE = (
 )
 
 
-# ---------------- 读取 ----------------
 
 def section(cfg):
     return (cfg or {}).get("schedule") or {}
@@ -117,7 +116,6 @@ def _retire_id(tid):
             del _RETIRED_IDS[0]
 
 
-# ---------------- 时间解析 ----------------
 
 def _norm(s):
     """全角冒号/空格归一，省得用户输入法不同就解析不了。"""
@@ -188,7 +186,6 @@ def parse_when(when, now=None):
         raise ValueError("要写时间。例：明天9:00 / 9:00 / 每天8:00 / 每周一 9:00 / "
                          "10分钟后 / 每30分钟")
 
-    # 每周X [HH:MM]
     m = re.match(r"^(?:每周|每星期)\s*([一二三四五六日天1-7])\s*(.*)$", s)
     if m:
         h, mi = _hhmm(m.group(2).strip() or "9:00")
@@ -230,7 +227,6 @@ def parse_when(when, now=None):
         d = (now + timedelta(days=delta)).date()
         return {"repeat": "once", "date": d.isoformat(), "at": f"{h:02d}:{mi:02d}"}
 
-    # 每天 [HH:MM]
     m = re.match(r"^(每天|每日)\s*(.*)$", s)
     if m:
         hm = m.group(2).strip()
@@ -310,7 +306,6 @@ def _next_after(spec, after):
     return cand.timestamp()
 
 
-# ---------------- 展示 ----------------
 
 def describe(t):
     rep = t.get("repeat")
@@ -365,7 +360,6 @@ def summary_line(cfg):
     return f"定时：{n}/{len(recs)} 个开启" + ("" if enabled(cfg) else "（总开关关着）")
 
 
-# ---------------- 执行 ----------------
 
 def run_due(cfg, now, send_text, notify=None, call=None, ask=None):
     """跑一遍到点的任务。**在主循环那次 tick 里调用**（单线程）。
@@ -520,7 +514,6 @@ def _merge_save(touched):
     _save(tasks=on_disk)
 
 
-# ---------------- 命令 / 工具 ----------------
 
 # 「提醒我」的几种自称。出现在 `<对象>` 位置上时，目标是**控制会话**（自己），
 # 不是一个叫「我」的联系人 —— 去查联系人只会得到一句「没找到「我」」。

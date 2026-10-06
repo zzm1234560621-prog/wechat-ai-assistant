@@ -175,7 +175,6 @@ class Registry:
             raise PluginError(f"[{source}] 工具「{name}」的 handler 不是可调用的")
 
         # 「模型指导文本」随定义走。
-        #
         # 内置工具**可以留空**：它们的指导在两份 config 的 system_prompt 里，
         # 那是既有设计（而且用户可以自己改措辞），由 selftest_tool_registry.py 守着。
         # 插件工具**必填**：第三方插件的名字不可能预先写在 config.example.yaml 里，
@@ -300,7 +299,6 @@ class Registry:
         return gone
 
     # ------------------------------------------------------------ 事件
-    #
     # 五条硬规矩（规格 3.1），每条都有原因：
     #   1. 事件抛异常**绝不打断消息循环** —— 插件炸了不能把收微信带下去；
     #   2. 插件跑在轮询线程上，它自己的线程**绝不许碰 hook**（契约层面约束，
@@ -503,9 +501,7 @@ def load_builtin_tools(tools, register_source="builtin"):
     return out
 
 
-# ────────────────────────────────────────────────────────────────────────
 # 插件加载（规格 2.3）
-# ────────────────────────────────────────────────────────────────────────
 
 PLUGIN_ENTRY = "setup"
 PLUGINS_DIRNAME = "plugins"

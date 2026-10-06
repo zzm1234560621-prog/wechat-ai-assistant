@@ -757,9 +757,7 @@ def is_wechat4(client):
         lambda: _probe_heal(client, "contact.db", "SELECT 1 FROM contact LIMIT 1"))
 
 
-# ============================================================
 #  微信 3.9.x
-# ============================================================
 
 def _v3_msg_dbs(client):
     """3.9.x 的消息分片库（MSG0.db ...）。探测式，不用 GetAllDBName。"""
@@ -847,9 +845,7 @@ def _v3_search(client, keyword, limit=30):
     return rows[-limit:]
 
 
-# ============================================================
 #  微信 4.x
-# ============================================================
 
 def _v4_msg_dbs(client, max_probe=8):
     """4.x 的消息分片库（message_0.db ...）。
@@ -1477,8 +1473,6 @@ def v4_files(client, talker, limit=20, scan=_V4_FILE_SCAN):
     return out[-limit:]
 
 
-# ---------- 微信 4.x 全文检索（message_fts.db） ----------
-#
 # 微信自己给消息建了 fts5 全文索引，用它的自研分词器 MMFtsTokenizer：
 #   fts5(tokenize='MMFtsTokenizer disable_pinyin',
 #        acontent, message_local_id, session_id, sender_id, create_time, local_type ...)
@@ -1692,8 +1686,6 @@ def _v4_fts_rows(client, where, limit, smap, self_id, first_hit=False):
     return out[-limit:]
 
 
-# ---------- 中文问句的关键词抽取 ----------
-
 # 疑问词/助词/常见动词，抽关键词时先去掉
 _STOPWORDS = (
     "我们", "你们", "他们", "她们", "这个", "那个", "最近", "之前", "上次", "上个月",
@@ -1848,9 +1840,7 @@ def _v4_search_by_scan(client, keyword, limit=30, max_tables=40):
     return rows[-limit:]
 
 
-# ============================================================
 #  对外接口（自动按微信版本分派）
-# ============================================================
 
 def all_contacts(client, limit=20000):
     """全部联系人 [{wxid, name, remark, alias}]。
@@ -2212,8 +2202,6 @@ def collect_contact_history(client, talker, page=200, max_items=0, since=None,
     return out, meta
 
 
-# ---------- 「这段时间里有多少条」 ----------
-#
 # 只为「如实告诉模型规模」存在：用户问「9 月我们都聊了什么」时，光给最新的 50 条
 # 而不给总数，模型就不知道自己手里是 50/1400——那正是「静默失效」的同一族。
 # 纯 COUNT/MIN/MAX，带会话过滤、不排序，所以不碰 hook 铁律第 2 条。
@@ -2316,8 +2304,6 @@ def count_history(client, talker, since=None, until=None, keyword=None):
     return _v3_history_count(client, talker, since, until, keyword)
 
 
-# ---------- 「那天所有聊天」：跨会话按时间取 ----------
-#
 # 这两条是**没有 session_id 过滤**的按时间查询——CLAUDE.md 铁律第 2 条最警惕的形状。
 # 2026-10-01 真机实测（停 bot、只读）之后才敢加：
 #   `WHERE create_time >= ? AND create_time <= ?` 的 COUNT / GROUP BY，每个分片
@@ -2522,9 +2508,7 @@ def search_history(client, keyword, limit=30):
     return _v3_search(client, keyword, limit)
 
 
-# ============================================================
 #  轮询收消息（aixed 后端没有收消息回调，只能轮询）
-# ============================================================
 
 def latest_cursor(client):
     """轮询起点。

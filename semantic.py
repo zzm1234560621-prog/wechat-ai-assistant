@@ -100,8 +100,6 @@ def _clamp_int(v, lo, hi, default):
     return n, False
 
 
-# ── 后端（本地模型）──────────────────────────────────────────────────────
-
 class _Backend:
     """本地嵌入后端。`encode(list[str]) -> list[list[float]]`。"""
 
