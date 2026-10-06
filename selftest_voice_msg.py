@@ -682,6 +682,36 @@ def t11_memory_access_message():
          voice_mem.available, voice_mem.weixin_main_process) = _saved
 
 
+def t12_no_text_reason():
+    """转不出文字时**必须说已知原因**，不许换成"可能是没人声"（2026-10-06 另一台电脑真机）。
+
+    现场：那台机器**本地模型没下**，`transcribe_scored` 每次都回一句
+    「本地转写模型还没下载…跑 audio_read.py --setup」，而 `voice_mem.read` 把 `err`
+    丢进 `continue`，用户看到的只有「找到 1 条时长接近的语音，但一条都没转出文字
+    （可能是没人声/太短）」——**自己的语音被说成没人声，而且可照做的原因被藏了**。
+    """
+    print("\n── 转不出文字时要说**已知原因**，不许拿猜测顶上（2026-10-06）──")
+    r0 = voice_mem.no_text_reason(1, [])
+    check("真的一条 err 都没有 → 才退回那句猜测", "可能是没人声" in r0, r0[:60])
+    check("两句都要保留「没有文本，别编」（那是给模型看的）",
+          "别编" in r0)
+
+    install = ("本地转写模型还没下载（不联网自动下，得用户显式执行）：\n"
+               "  .venv\\Scripts\\python.exe audio_read.py --setup\n"
+               "会下到 …\\models（走 hf-mirror 镜像）。")
+    r1 = voice_mem.no_text_reason(1, [install])
+    check("★ 有 err → 报 err 本身（含可照做的命令）",
+          "转写全部失败" in r1 and "audio_read.py --setup" in r1, r1[:90])
+    check("★ 这时**不许**再说「可能是没人声」（那是未经验证的猜测）",
+          "可能是没人声" not in r1, r1[:90])
+    check("压平换行（这句话会进聊天消息）", "\n" not in r1, repr(r1[:90]))
+
+    r2 = voice_mem.no_text_reason(3, [install, install, "TypeError: boom"])
+    check("同一条 err 去重", r2.count("模型还没下载") == 1, r2[:90])
+    check("不同原因的取前两条", "TypeError: boom" in r2, r2[:120])
+    return True
+
+
 def main():
     print("=" * 60)
     print("语音条逆向工具 voice_msg 回归自测（不联网、不需真实语音、不碰微信）")
@@ -699,6 +729,7 @@ def main():
         t9_frame_estimate_gate(tmp)
         t10_length_fingerprint(tmp)
         t11_memory_access_message()
+        t12_no_text_reason()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 60)

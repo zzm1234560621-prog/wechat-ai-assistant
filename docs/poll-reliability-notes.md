@@ -330,6 +330,31 @@ SELECT * FROM (SELECT 'message_fts_v4_1' AS shard, … ) …
 ⇒ 合并后的 SQL 在真实 hook 上可用，**收消息主链路没退化**。以后改这条 SQL 的形状要照这个
 三条一起验（游标推进 / 无失败行 / 真发一条能回）。
 
+### 14 · 新机器的起步冷却太长了：默认已从 25 分钟收短到约 3 分钟（2026-10-06 真机）
+
+现场：另一台电脑按包里的默认部署，用户报「**回消息变慢了啊**」。实测那台机器的 `data/status.json`：
+
+```
+uptime_seconds = 598      poll_count = 31      → 平均 19.3 秒/轮（正常 5 秒）
+hook_stress_rounds = 0    poll_errors = {}     db_age_seconds = 8.5    healthy = true
+```
+
+⇒ **轮询慢 100% 来自起步冷却**（`poll_ramp`），与运行期让路（本机那次一次都没触发）、fts 分片都无关。
+
+⇒ 默认值收短：`startup_delay 60→20`、`early_sec 300→60`（`early_interval 30→10`）、
+`mid_sec 600→120`（`mid_interval 10→5`）、`final_sec 600→0`，即 **20 秒静置 + 1 分钟@10 秒 + 2 分钟@5 秒**。
+依据：崩溃窗口实测就是**刚登录/刚重启的那 1~3 分钟**（见 `docs/hook-login-gate-notes.md`），
+25 分钟的慢挡保护不了多出来的 22 分钟，却让每台新机器一启动就像坏了。
+要退回老默认（更保守）：`early_sec: 300` / `early_interval: 30` / `mid_sec: 600` / `mid_interval: 10` / `final_sec: 600`。
+
+⚠️ 只改了 **`config.example.yaml`**（包里那份）。本机 `config.yaml` 仍是 `enabled: false`（10-05 用户否掉的），
+**别去把它打开**——本机不打这个补丁。
+
+**怎么一眼看出是它**（下次照这个查，别猜）：`uptime_seconds ÷ poll_count` = 平均每轮秒数
+（>8 秒就怀疑它）；同时 `hook_stress_rounds` 一直 0、`poll_errors` 空 ⇒ 不是让路、不是分片。
+⚠️ PowerShell 读 `status.json` **必须 `-Encoding UTF8`**：PS 5.1 按 ANSI 读会把中文弄乱，
+`ConvertFrom-Json` 直接报「传入的对象无效」（2026-10-06 真机踩过，一度以为文件坏了）。
+
 ## 回归
 
 - `selftest_aixed.py`：新增一段「轮询的总时限 / 按次超时 / 重扫限流」——

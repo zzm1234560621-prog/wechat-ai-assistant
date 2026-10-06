@@ -2034,7 +2034,8 @@ def t_poll_backoff():
     ## 这一条钉什么
 
     * **正常路径零变化**：不让路时 `next_interval(base)` 原样返回 base —— 这是它和
-      `poll_ramp` 的关键区别（那个是**每次启动**都慢 25 分钟，用户 10-05 否掉的就是它）；
+      `poll_ramp` 的关键区别（那个是**每次启动**都无差别放慢，用户 10-05 否掉的就是它；
+      包里那份示例 2026-10-06 已从 25 分钟收短到约 3 分钟）；
     * 进/出都有**滞回**（连续 3 轮不正常才进、连续 3 轮正常才出），坏一轮好一轮不许进
       ——否则间隔会忽长忽短；
     * `sleep_sec: 0` = 关掉；配置读不出来**回默认值，不许静默变成 0**（那等于悄悄关闸）；
@@ -2070,11 +2071,24 @@ def t_poll_backoff():
         "★ 读不出来 → 回默认，不许静默变成 0（那等于悄悄关闸）")
     chk(bot._slow_round_sec({}) == 3.0, "「慢」的阈值真源是 health.DEFAULTS（3 秒）")
 
+    # 「这一轮健不健康」只认**权威读路径**（2026-10-06：另一台机器回消息变慢的嫌疑之一）
+    U = bot.round_unhealthy
+    chk(U({}, spent=0.5, slow_sec=3) is False, "干净的一轮 → 健康")
+    chk(U({"message_fts_v4_0": ("boom", 1)}, 0.5, 3) is True, "fts 分片失败 → 不健康")
+    chk(U({"session.db": ("boom", 1)}, 0.5, 3) is True, "session 兜底路失败 → 不健康")
+    chk(U({"message_0.db": ("get database handle … failed", 3)}, 0.5, 3) is False,
+        "★ best-effort 补捞路（message_N.db）长期失败**不算** stress"
+        "（否则让路永远关不掉，代价是回消息慢 6 倍）")
+    chk(U({"hook": ("连不上", 3)}, 0.5, 3) is False, "hook 连不上归登录探针，不算 stress")
+    chk(U({}, spent=5, slow_sec=3) is True, "一轮超过阈值 → 不健康")
+    chk(U({}, spent=0.5, slow_sec=3, tripped=True) is True, "被总时限截断 → 不健康")
+    chk(U({}, None, None) is False, "没给耗时 → 不因为耗时判不健康")
+
     src = inspect.getsource(bot.iter_aixed_messages)
     chk("backoff.note_round(" in src and "backoff.next_interval(" in src,
         "★ 轮询循环真的接了这条（记状态 + 决定睡多久）")
-    chk(src.count("_unhealthy = (") == 1 and "h.note_round(_unhealthy" in src,
-        "★ 「这一轮健不健康」只算一次，喂给让路 + health 两个消费者")
+    chk("_unhealthy = round_unhealthy(" in src and "h.note_round(_unhealthy" in src,
+        "★ 「健不健康」只算一次（判据在 round_unhealthy），喂给让路 + health 两个消费者")
 
 
 def main():

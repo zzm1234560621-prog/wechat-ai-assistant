@@ -2744,8 +2744,9 @@ def _round_sleep(had_msgs, spent, interval, min_round):
 # 这条把「慢」接到动作上：连续几轮不健康就放慢，恢复正常立刻回落。
 #
 # ⚠️ 它和 `poll_ramp`（起步冷却）是**两件事**，别合并：
-#   * `poll_ramp`：**每次启动**的头 25 分钟无差别放慢 —— 10-05 用户否掉了它
+#   * `poll_ramp`：**每次启动**都无差别放慢 —— 10-05 用户否掉了它
 #     （「连发两条消息隔半分钟才回第一条，用起来像坏了」），本机现在是关的；
+#     包里那份示例 2026-10-06 也从「25 分钟」收短成「约 3 分钟」（见 config.example.yaml）；
 #   * 这条：只在**已经出问题**时让路，正常路径一个字节都不变。
 POLL_BACKOFF_DFLT = {"slow_rounds": 3, "sleep_sec": 30.0, "recover_rounds": 3}
 
@@ -2777,6 +2778,38 @@ def _slow_round_sec(cfg=None):
     if health is not None:
         dflt = _as_float(getattr(health, "DEFAULTS", {}).get("hook_slow_round_sec"), 3.0)
     return _as_float(((cfg or {}).get("health") or {}).get("hook_slow_round_sec"), dflt)
+
+
+def round_unhealthy(errors, spent=None, slow_sec=None, tripped=False):
+    """这一轮算不算「不健康」—— 让路（B）与「库查不动」看护（C）的**唯一判据**。纯函数。
+
+    ## 只认**权威读路径**的失败
+
+    * `message_fts*`（收消息的主路）→ 算；
+    * `session.db`（fts 全掉时的兜底路）→ 算；
+    * `hook`（整个连不上）→ **不算**：那条路归三态登录探针，它有自己的告警；
+    * `message_N.db`（`_v4_pickup_nontext` 补捞图片/文件那条 **best-effort** 路）→ **不算**。
+
+    ⚠️ 最后那条是 2026-10-06 抓出来的判据缺口：`message_N.db` 实测**长期解析不出句柄**
+    （CLAUDE.md 记着这条，本机也真的每 30 秒熔断一次），拿它当 stress 会让让路**永远关不掉**
+    ——而让路的代价是「回消息慢 6 倍」，用户当天就报上来了（另一台机器上）。
+    best-effort 路的失败仍然照旧**如实记录、如实打日志**（`_POLL_ERRORS` / 心跳里看得见），
+    只是不再有资格把整条收消息链路拖慢。
+
+    另外两条与错误无关的事实：本轮被总时限截断、本轮耗时超过阈值。
+    """
+    if tripped:
+        return True
+    try:
+        if spent is not None and slow_sec and float(spent) > float(slow_sec):
+            return True
+    except (TypeError, ValueError):
+        pass
+    for key in (errors or {}):
+        k = str(key)
+        if k.startswith("message_fts") or k == "session.db":
+            return True
+    return False
 
 
 class StressBackoff:
@@ -2946,17 +2979,15 @@ def iter_aixed_messages(client, interval, tick=None, cfg=None):
                 traceback.print_exc()
 
         # ── 这一轮健不健康：**事实只算一次**，喂两个消费者（2026-10-06）──
-        # 来源：分片错误 / 本轮被总时限截断 / 本轮耗时超标。
-        #   ⚠️ 「hook 整个连不上」**不算**在这里——那条路归三态登录探针（它有自己的告警）。
+        # 判据本体在 `round_unhealthy`（纯函数，那儿写了为什么只认权威读路径）。
         # 消费者：① 让路（连续 3 轮 → 放慢到 30 秒，见 StressBackoff）；
         #         ② health 的「库查不动」看护（连续 10 轮 + 核心库 600 秒没被写 → 探一次库）。
         # **阈值与目的都不同，事实只算一次**；库龄那一路是纯 stat，不碰 hook。
         try:
             _errs_now = live_history.poll_errors()
-            _shard_errs = {k: v for k, v in _errs_now.items() if k != "hook"}
             _spent_round = time.monotonic() - round_started
-            _unhealthy = (bool(_shard_errs) or live_history.round_tripped()
-                          or _spent_round > _slow_round_sec(cfg))
+            _unhealthy = round_unhealthy(_errs_now, _spent_round, _slow_round_sec(cfg),
+                                         live_history.round_tripped())
         except Exception:
             traceback.print_exc()
             _unhealthy = False

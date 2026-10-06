@@ -545,6 +545,30 @@ def _similar(a, b, threshold=0.5):
     return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
 
 
+def no_text_reason(n_cands, errs):
+    """候选一条文字都没转出来时，**如实说原因**（纯函数，自测直接钉）。
+
+    ⚠️ 2026-10-06 另一台电脑真机踩到：转写每一次都被拒（那台是**本地模型没下**），
+    而用户看到的是「可能是没人声/太短」——**把自己发的语音说成"没人声"，还把已知原因
+    换成了猜测**。原因本来就在 `audio_read.transcribe_scored` 返回的 `err` 里（含
+    「跑 `.venv\\Scripts\\python.exe audio_read.py --setup`」这种**可照做**的指令），
+    以前被 `continue` 一起丢掉了。
+
+    规矩：**有 `err` 就报 `err`**（去重、压平空白、最多两条）；真的一条 `err` 都没有
+    （纯空结果那种）才退回那句猜测。两句都保留「没有文本，别编」——那是给模型看的。
+    """
+    uniq = []
+    for e in (errs or []):
+        t = " ".join(str(e).split())
+        if t and t not in uniq:
+            uniq.append(t)
+    if uniq:
+        return (f"找到 {int(n_cands)} 条时长接近的语音，但**转写全部失败**："
+                f"{'；'.join(uniq[:2])}。**没有文本**，别编。")
+    return (f"找到 {int(n_cands)} 条时长接近的语音，但一条都没转出文字"
+            f"（可能是没人声/太短）。**没有文本**，别编。")
+
+
 def read(duration_ms, out_dir=None, tol_ms=MATCH_TOL_MS, transcribe=True, cfg=None,
          max_try=3, ambiguous_limit=6, scan_seconds=None, target_bytes=None):
     """按**时长**（＋消息自带的 `length` 指纹）找那条语音并转文字。
@@ -666,6 +690,7 @@ def read(duration_ms, out_dir=None, tol_ms=MATCH_TOL_MS, transcribe=True, cfg=No
                     f"没有文本 —— 别猜，也别拿别的语音顶上。")
 
     scored = []
+    errs = []
     for c in cands[:max(1, int(max_try))]:
         # 到这一步才落 WAV（`candidates()` 故意不解码，见那边的注释）
         wav = c.get("wav") or ""
@@ -673,6 +698,8 @@ def read(duration_ms, out_dir=None, tol_ms=MATCH_TOL_MS, transcribe=True, cfg=No
             wav = os.path.join(out_dir, f"{c.get('digest', 'cand')}_{c['ms']:.0f}.wav")
             secs, _rate, derr = silk_to_wav(c["silk"], wav)
             if derr or secs <= 0:
+                if derr:
+                    errs.append(derr)
                 continue
             c["wav"] = wav
         try:
@@ -680,12 +707,13 @@ def read(duration_ms, out_dir=None, tol_ms=MATCH_TOL_MS, transcribe=True, cfg=No
         except Exception as e:
             txt, score, err = "", None, f"{type(e).__name__}: {e}"
         if err or not txt:
+            if err:
+                errs.append(err)
             continue
         scored.append({"text": txt, "score": score, "ms": c["ms"],
                        "silk": c["silk_len"]})
     if not scored:
-        return [], (f"找到 {len(cands)} 条时长接近的语音，但一条都没转出文字"
-                    f"（可能是没人声/太短）。**没有文本**，别编。")
+        return [], no_text_reason(len(cands), errs)
 
     # 云端转写拿不到置信度：多条候选时**没有依据可挑** → 拒绝，不赌
     if scored[0]["score"] is None:
