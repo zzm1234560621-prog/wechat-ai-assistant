@@ -49,6 +49,10 @@ the whole conversation happens in the native WeChat window — no second client 
 2. Unzip it anywhere (keep Chinese characters and spaces out of the path, to save yourself trouble)
 3. **Double-click `一键部署.bat` and just keep pressing Enter**, about 15 minutes (same as `助手.bat` → `[9]`)
 4. Day to day, use **`助手.bat`**: `[3]` start / `[4]` stop / `[5]` status / `[6]` logs
+5. **Then use it in WeChat**: open **File Transfer Helper** (文件传输助手) and just talk to the assistant —
+   questions, file requests and commands (`/help` for the full list, `/lang en` for English) all happen in that chat.
+   (Commands go in the chats where you talk to the assistant — File Transfer Helper by default; if you change
+   `target_chats`, they go wherever you point it.)
 
 This package **ships with**: the official WeChat 4.1.10.27 installer, the compiled hook DLL, a hook source snapshot,
 the bundled SearXNG (search backend), all the documentation and the self-test scripts.
