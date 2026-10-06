@@ -230,6 +230,43 @@ def _has(mod):
         return False
 
 
+def av_conflict():
+    """PyAV 与 faster-whisper 不兼容时，回一句**能照做**的话；否则 `None`。
+
+    为什么要有它（2026-10-06 另一台电脑真机）：
+    `pip install faster-whisper` 会顺手装上**最新的 PyAV**，而 faster-whisper 内部是
+    `av.open(input_file, mode="r", metadata_errors="ignore")` —— **PyAV 19 把这个参数删了**
+    （18.1.0 还接受）。于是**每一条转写都抛 `TypeError`**：语音条和音频文件**一起**读不出来，
+    用户看到的只有「解析失败 / 没读出来」，没人知道该做什么。
+    真机对照：那台 `av 19.0.1` → 全读不出来；本机 `av 18.1.0` → 同一条语音转出「你好 你好」。
+
+    **判据是"问函数本身"，不是猜版本号**：拿一个空流去调
+    `av.open(..., metadata_errors="ignore")` ——
+      * 抛 `TypeError` 且提到这个参数名 ⇒ 不支持；
+      * 抛别的异常（空数据不是合法容器）⇒ 参数被接受了 ⇒ 支持。
+    （本机 av 18 实测：文档里有 `metadata_errors`，空流抛的是 InvalidDataError。）
+    """
+    try:
+        import av
+    except ImportError:
+        return None            # 没装 av：那是依赖清单的事，别在这儿冒充
+    try:
+        import io as _io
+        av.open(_io.BytesIO(b""), metadata_errors="ignore")
+    except TypeError as e:
+        if "metadata_errors" in str(e):
+            return ("PyAV（`av`）版本太新，和 faster-whisper 不兼容：faster-whisper 内部调 "
+                    "`av.open(..., metadata_errors=…)`，而这个参数在 **PyAV 19** 里被删掉了 "
+                    "⇒ **每一条转写都会失败**（语音条和音频文件都读不出来）。\n"
+                    "修法就一条命令：\n"
+                    "  .venv\\Scripts\\python.exe -m pip install \"av<19\"\n"
+                    "（可选组件那条安装线已经改成直接装 `av<19`；把语音组件重装一遍也一样。）")
+        return None
+    except Exception:
+        return None            # 空流不合法之类的错 = 参数被接受了
+    return None
+
+
 def available(cfg):
     """返回 `(能不能用, 说明)`。说明里**必须**写清缺什么、怎么补。
 
@@ -247,6 +284,9 @@ def available(cfg):
         return False, ("本地转写要装 faster-whisper（还没装）。让用户执行：\n"
                        "  .venv\\Scripts\\python.exe -m pip install faster-whisper\n"
                        "（装完还要下一次模型，见下一条）")
+    conflict = av_conflict()
+    if conflict:
+        return False, conflict
     if not os.path.isdir(model_dir(cfg)):
         return False, ("本地转写模型还没下载（不联网自动下，得用户显式执行）：\n"
                        f"  .venv\\Scripts\\python.exe audio_read.py --setup\n"

@@ -540,6 +540,15 @@ def main():
         leaked = sorted(p.lower() for p in comp["specs"] if p.lower() in formal)
         chk(not leaked, f"★ {name} 的依赖不许出现在 requirements.txt 正式行里：{leaked}")
 
+    # ★ 语音那条线必须钉住 `av<19`（2026-10-06 另一台电脑真机）：不钉的话新机器
+    # `pip install faster-whisper` 会拿到 PyAV 19，而 faster-whisper 内部还在传
+    # `metadata_errors` ⇒ **每一条转写都失败**（语音条 + 音频文件一起废）。
+    # 判据与用户可见的提示在 `audio_read.av_conflict()`（回归在 selftest_audio）。
+    chk("av<19" in env.OPTIONAL_PIP["voice"]["specs"],
+        "★ 语音组件钉住 av<19（PyAV 19 删了 metadata_errors）")
+    chk("av<19" in env.OPTIONAL_PIP["formats"]["specs"],
+        "★ 格式包也钉住（否则先装语音、后装格式包会把 av 升到 19，悄悄再弄坏一次）")
+
     # 没建 venv / 探不动 → 一律当**全缺**（宁可让上层重装一次，也不假装齐全）
     real_py = env.venv_python
     try:

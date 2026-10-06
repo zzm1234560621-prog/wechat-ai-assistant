@@ -194,7 +194,12 @@ def check_interpreter():
 OPTIONAL_PIP = {
     "voice": {
         "label": "语音转文字（本地 faster-whisper，音频一个字节不出本机）",
-        "specs": ["faster-whisper", "pilk"],
+        # ⚠️ `av<19` 是**必须**的（2026-10-06 另一台电脑真机）：faster-whisper 内部调
+        # `av.open(..., metadata_errors="ignore")`，而这个参数在 **PyAV 19** 里被删了
+        # ⇒ 装了最新 av 的机器上**每一条转写都抛 TypeError**（语音条和音频文件一起读不出来，
+        # 用户只看到「解析失败」）。本机 av 18.1.0 正常、那台 av 19.0.1 全废。
+        # 判据与用户可见的提示在 `audio_read.av_conflict()`（`--status` 会直接报出来）。
+        "specs": ["faster-whisper", "pilk", "av<19"],
         "imports": ["faster_whisper", "pilk"],
     },
     "formats": {
@@ -203,7 +208,9 @@ OPTIONAL_PIP = {
         # ⚠️ `rarfile` 装上**并不等于 .rar 能读**：它只是个壳，真正解压要外部程序
         # （unrar / 7z / bsdtar）——那件事由 `archive_read.find_rar_tool()` 判定，
         # 装完必须如实说，不许报成「.rar 能读了」。
-        "specs": ["av", "extract-msg", "py7zr", "rarfile", "xlrd", "olefile", "Pillow"],
+        # ⚠️ 这里的 `av<19` 和上面语音那条**同一个理由**（`audio_read.av_conflict()` 的注释）：
+        # 不钉住的话，先装语音、后装格式包会把 av 升到 19，**悄悄**再把语音弄坏一次。
+        "specs": ["av<19", "extract-msg", "py7zr", "rarfile", "xlrd", "olefile", "Pillow"],
         "imports": ["av", "extract_msg", "py7zr", "rarfile", "xlrd", "olefile", "PIL"],
     },
     "semantic": {

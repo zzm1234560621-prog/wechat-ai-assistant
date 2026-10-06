@@ -56,7 +56,12 @@ zstandard>=0.22
 #    installer 也会去装这个重包。下面 pywxdump 一直是注释，就是这个道理。
 #
 # faster-whisper：语音输入（把音频文件转成文字）用。用到时按提示单独装：
-#     .venv\Scripts\python.exe -m pip install faster-whisper
+#     .venv\Scripts\python.exe -m pip install faster-whisper "av<19"
+# ⚠️ `av<19` **不能省**（2026-10-06 另一台电脑真机）：faster-whisper 内部调
+#     `av.open(..., metadata_errors="ignore")`，而 PyAV **19 把这个参数删了** ⇒ 装了最新 av
+#     的机器上**每一条转写都抛 TypeError**（语音条、音频文件一起读不出来，用户只看到
+#     「解析失败」）。本机 av 18.1.0 正常、那台 av 19.0.1 全废。判据与提示见
+#     `audio_read.av_conflict()`（`audio_read.py --status` 会直接把该跑的命令打出来）。
 # 装完还要下一次模型（显式执行 `python audio_read.py --setup`，绝不从聊天路径触发下载）。
 # 走云端转写（audio.backend: cloud）则完全不需要它。见 docs/voice-input-spec.md。
 #

@@ -49,6 +49,21 @@
    每种都要一句能直接照做的话，**不许返回空字符串假装成功**，不许降级到别的后端。
 5. **`faster-whisper` 不随主程序安装**（`requirements.txt` 可选段）：
    不装也能起 bot，用到时才提示怎么装。
+6. **`av<19` 是硬约束**（2026-10-06 另一台电脑真机换来的，**别去掉**）：
+   `faster-whisper 1.2.1` 内部是 `av.open(input_file, mode="r", metadata_errors="ignore")`，
+   而 **PyAV 19 把这个参数删了**（18.1.0 还接受）⇒ 装了「最新 av」的机器上
+   **每一条转写都抛 `TypeError: open() got an unexpected keyword argument 'metadata_errors'`**，
+   **语音条和音频文件一起读不出来**，用户只看到「解析失败 / 没读出来」。
+   真机对照：那台 `av 19.0.1` → 全废；本机 `av 18.1.0` → 同一条语音转出「你好 你好」。
+   - 安装线：`envsetup.OPTIONAL_PIP` 的 voice 与 formats 两项都写 `av<19`
+     （formats 也钉，否则「先装语音、后装格式包」会把 av 升到 19，**悄悄**再弄坏一次）；
+     `requirements.txt` 的注释段同样写明这条命令。
+   - 判据（**不许猜版本号**）：`audio_read.av_conflict()` 拿一个空流去调
+     `av.open(..., metadata_errors="ignore")`——抛 `TypeError` 且提到这个参数名 = 不支持；
+     抛别的异常（空数据不是合法容器）= 参数被接受了。它接在 `available()` 里，
+     所以 `audio_read.py --status` 会**直接把该跑的命令打出来**。
+   - 回归：`selftest_audio`（把 `av.open` 换成"像 PyAV 19 那样拒收"的桩）、
+     `selftest_install`（两项 specs 都钉 `av<19`）。
 
 ## 四、配置
 

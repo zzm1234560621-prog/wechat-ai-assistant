@@ -188,6 +188,31 @@ def t1_availability(tmp):
     check("模型就位 → 可用", ok is True, why)
     check("……并说明音频不出本机", "不出本机" in why, why)
 
+    # ★ PyAV 19 与 faster-whisper 1.2.1 不兼容（2026-10-06 另一台电脑真机，全靠这条抓出来）：
+    # 那台 `av 19.0.1` 上**每一条转写都抛** `TypeError: open() got an unexpected keyword
+    # argument 'metadata_errors'`（faster-whisper 内部在传它，而 PyAV 19 删了这个参数）
+    # ⇒ 语音条和音频文件**一起**读不出来，用户只看到「解析失败」。
+    # 这里把 `av.open` 换成一个"像 PyAV 19 那样拒收这个参数"的桩，钉两件事：
+    #   ① 判据本身能认出来（`av_conflict()` 不是猜版本号，是拿空流问函数）；
+    #   ② 文案里必须带**能照做**的那条命令（否则用户和我们都只能看到 TypeError）。
+    import av as _av
+    _real_av_open = _av.open
+    try:
+        def _av19_open(*a, **kw):
+            raise TypeError("open() got an unexpected keyword argument 'metadata_errors'")
+        _av.open = _av19_open
+        msg = audio_read.av_conflict() or ""
+        check("★ 像 PyAV 19 那样拒收 metadata_errors → 判成冲突（不是静默 N/A）",
+              bool(msg), msg[:80])
+        check("★ 冲突文案里有能照做的命令", 'av<19' in msg, msg[:80])
+        ok19, why19 = audio_read.available(cfg)
+        check("★ available() 也报这条（--status / 聊天里都看得见）",
+              ok19 is False and "av<19" in why19, why19[:80])
+    finally:
+        _av.open = _real_av_open
+    check("本机（av 18，参数还在）→ 没有这条冲突",
+          audio_read.av_conflict() is None, audio_read.av_conflict())
+
     cloud = _cfg(tmp, backend="cloud", cloud={"api_key": ""})
     ok, why = audio_read.available(cloud)
     check("cloud 没 key → 不可用", ok is False, why)
