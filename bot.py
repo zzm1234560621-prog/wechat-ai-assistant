@@ -144,6 +144,76 @@ _GATE_HEAL_INTERVAL = 300.0
 # 所以卡死的 hook 下实际会更久——**这里不写死「几分钟」**，只说次数。
 _GATE_HARD_FAIL_LIMIT = 30
 
+# ── 「微信刚回来」时允许**绕开限流补一次重扫**（2026-10-06 真机，用户原话「恢复时间久确实搞人心态」）──
+# 现场：用户重登微信后，助手先前那次重扫是在"微信还没活"时做的（必然失败），之后每 10 秒都被
+# 300 秒限流挡回 ⇒ **干等约 4 分钟**，我手工 `force_rescan` **1.8 秒**修好。
+# 判据用「微信自己的库现在写不写」（`hook_check.core_db_age_sec`，纯 stat、不碰 hook）：
+# 库刚被写过 ⇒ 打不开句柄不是"微信死了"，而是句柄表陈旧 ⇒ 此刻扫几乎一定成功。
+_GATE_HEAL_FRESH_SEC = 60.0        # 「库刚被写过」的窗口
+_GATE_HEAL_BYPASS_INTERVAL = 60.0  # 绕开限流补扫之间至少隔这么久（GetAllDBName 是全内存扫描）
+_GATE_HEAL_AT = [0.0]              # 上次真扫的时刻（monotonic）
+_GATE_HEAL_BYPASS_AT = [0.0]       # 上次绕开限流补扫的时刻
+_GATE_LOG_INTERVAL = 60.0          # 闸门日志限流：以前每 10 秒两行，一晚能把日志刷穿
+_GATE_NOTIFY_AFTER = 30            # 卡这么多轮（×10 秒 ≈ 5 分钟）就主动弹一次本地通知
+_GATE_NOTIFY_INTERVAL = 600.0      # 通知之间的最小间隔
+
+
+def gate_heal_decision(last_rescan_age, rescan_interval, db_age,
+                       last_bypass_age=None,
+                       bypass_interval=_GATE_HEAL_BYPASS_INTERVAL,
+                       fresh_sec=_GATE_HEAL_FRESH_SEC):
+    """闸门这条路「现在该不该重扫」——**纯函数**（自测直接钉，不碰真微信）。
+
+    返回 `"scan"` / `"bypass"` / `"wait"`：
+
+    * `scan`  ：距上次重扫已超过 `rescan_interval`（常规节奏）；
+    * `bypass`：限流还没到，但**微信的库又开始写了**（`db_age` 很新）⇒ 补一次
+      （2026-10-06 真机：就是这条把"恢复要等 4 分钟"变成"几秒"）；
+    * `wait`  ：其余情况，继续等 —— GetAllDBName 是 700MB 进程里的全内存扫描，
+      **绝不为了"快点"去刷它**。
+
+    ⚠️ 两个保守处：`db_age is None`（拿不到库龄，纯 stat 失败）**一律不当新鲜**；
+    两次 bypass 之间由 `last_bypass_age` 兜住。
+    """
+    fresh = (db_age is not None and fresh_sec is not None
+             and 0 <= float(db_age) <= float(fresh_sec))
+    young = last_rescan_age is not None and rescan_interval is not None \
+        and float(last_rescan_age) < float(rescan_interval)
+    if not young:
+        return "scan"                      # 常规到点（含"从没扫过"）
+    if not fresh:
+        return "wait"                      # 微信没在写库 → 扫了也白扫
+    if last_bypass_age is not None and bypass_interval is not None \
+            and float(last_bypass_age) < float(bypass_interval):
+        return "wait"                      # 刚补过，别再补
+    return "bypass"
+
+
+def _gate_selfheal(client):
+    """启动闸门里的自愈：常规按限流，必要时「微信刚回来」补一次。返回要打的那行话。"""
+    now = time.monotonic()
+    last = _GATE_HEAL_AT[0]
+    bypass = _GATE_HEAL_BYPASS_AT[0]
+    try:
+        db_age = hook_check.core_db_age_sec()
+    except Exception:
+        db_age = None
+    decision = gate_heal_decision(
+        None if not last else now - last, _GATE_HEAL_INTERVAL, db_age,
+        None if not bypass else now - bypass)
+    if decision == "wait":
+        # 让 `_try_selfheal` 去说「限流中」那句实话（秒数跟真正传下去的间隔一致）
+        return _try_selfheal(client, min_interval=_GATE_HEAL_INTERVAL)
+    note = _try_selfheal(client, min_interval=0.0 if decision == "bypass"
+                         else _GATE_HEAL_INTERVAL)
+    _GATE_HEAL_AT[0] = now
+    if decision == "bypass":
+        _GATE_HEAL_BYPASS_AT[0] = now
+        note = (f"微信的库刚刚又在写了（{db_age:.0f} 秒前，说明是句柄表陈旧、"
+                f"不是微信没登录）——我绕开限流补一次重扫。" + note)
+    return note
+
+
 
 def _gate_retry_step(client, hard_fails):
     """启动闸门里「这一次 ping 失败之后」要做什么。返回 `(hard_fails, 要打的一行字)`。
@@ -159,7 +229,7 @@ def _gate_retry_step(client, hard_fails):
     """
     state, _why = _probe_login(client)      # 只读探针，不碰句柄表；失败原因用 ping() 那句更全的
     if state is True:
-        return hard_fails, _try_selfheal(client, min_interval=_GATE_HEAL_INTERVAL)
+        return hard_fails, _gate_selfheal(client)
     if state is None:
         return hard_fails + 1, ""
     return hard_fails, ""
@@ -2299,17 +2369,45 @@ def connect_aixed(base_url):
     print(f"[bot] 正在连接 aixed HTTP 服务 {base_url} ...")
     client = AixedClient(base_url)
     hard_fails = 0
+    retries = 0
+    last_log = 0.0
+    last_notify = 0.0
     while True:
         ok, info = client.ping()
         if ok:
             print(f"[bot] 自己的 wxid = {info}")
             return client
+        retries += 1
+        now = time.monotonic()
         hard_fails, note = _gate_retry_step(client, hard_fails)
-        if note:
-            print(f"[bot] {note}")
         if hard_fails >= _GATE_HARD_FAIL_LIMIT:
             return None
-        print(f"[bot] {info}，10 秒后重试 ...")
+        # 日志**限流**（2026-10-06）：以前每 10 秒两行（"限流中"+"10 秒后重试"），一晚能把
+        # 日志刷穿，而且看的人更慌。改成一分钟一行，并带上「第几次 / 等了多久 / 微信还在写库吗」
+        # —— 后者正是判断"该不该等"的那条事实（`core_db_age_sec`，纯 stat）。
+        if now - last_log >= _GATE_LOG_INTERVAL:
+            last_log = now
+            if note:
+                print(f"[bot] {note}")
+            try:
+                db_age = hook_check.core_db_age_sec()
+            except Exception:
+                db_age = None
+            wrote = (f"微信最近写库 {db_age:.0f} 秒前" if db_age is not None
+                     else "微信写库时间读不到")
+            print(f"[bot] ⏳ 还在等微信的库能打开（第 {retries} 次 / 约 {retries * 10} 秒；{info}；"
+                  f"{wrote}），10 秒后再试 ...")
+        # 卡过 `_GATE_NOTIFY_AFTER` 轮就**主动弹一次本地通知**：控制台没人看、WeChat 又收不到
+        # 消息的时候，这是唯一能告诉他"该去彻底重开微信"的路（和 C 的告警同一个通道）。
+        if retries >= _GATE_NOTIFY_AFTER and now - last_notify >= _GATE_NOTIFY_INTERVAL:
+            last_notify = now
+            try:
+                health.notify(
+                    "微信助手：还在等微信的库",
+                    "hook 还在应答、也显示已登录，但数据库句柄打不开（**不是掉登录**）。"
+                    "该做的：彻底退出微信 → 重新打开 → 扫码；助手不用动，它会自己接上。")
+            except Exception:
+                traceback.print_exc()
         time.sleep(10)
 
 

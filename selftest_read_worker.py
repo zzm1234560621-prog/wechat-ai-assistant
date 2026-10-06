@@ -200,12 +200,29 @@ def t7_no_reread_when_just_done():
     read_worker.reset_for_test()
     n = [0]
 
+    def _wait_done(chat, label, timeout=8.0):
+        """等 worker **真正收工**。
+
+        ⚠️ "结果能被 drain 到" ≠ "账已记完"：worker 是**先** `_RESULTS_PUT`、**再**在锁里
+        清 `_CURRENT` 并写 `_DONE`。中间那个极小窗口里两条判据都还拦得住重复（生产安全），
+        但用例断言的是具体那句文案 —— 不等这一下就会偶发假红（本会话真踩到：
+        全量跑红、单跑三次全绿）。
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with read_worker._LOCK:
+                if (chat, label) in read_worker._DONE and read_worker._CURRENT is None:
+                    return True
+            time.sleep(0.02)
+        return False
+
     def count_job():
         n[0] += 1
         return ("第一遍读完的内容", None)
 
     ok1, _ = read_worker.submit("filehelper", "01.mp3", count_job)
     got = _wait_results(1)
+    _wait_done("filehelper", "01.mp3")
     check("第一遍正常读完", ok1 and len(got) == 1, (ok1, got))
 
     ok2, note2 = read_worker.submit("filehelper", "01.mp3", count_job)
@@ -216,11 +233,13 @@ def t7_no_reread_when_just_done():
 
     ok3, _ = read_worker.submit("filehelper", "别的文件.txt", count_job)
     _wait_results(1)                     # 等它真的跑完（submit 是异步的）
+    _wait_done("filehelper", "别的文件.txt")
     check("文件名不同 → 照常读（去重只认同一份）", ok3 and n[0] == 2, (ok3, n[0]))
 
     read_worker.reset_for_test()
     read_worker.submit("filehelper", "坏的.bin", lambda: (None, "boom"))
     _wait_results(1)
+    _wait_done("filehelper", "坏的.bin")
     ok4, note4 = read_worker.submit("filehelper", "坏的.bin", lambda: ("好了", None))
     check("★ 上一遍**失败**的：照常允许重读（那条重试路不许堵）",
           bool(ok4) and "刚刚已经读完" not in note4, note4)
@@ -228,6 +247,7 @@ def t7_no_reread_when_just_done():
     read_worker.reset_for_test()
     read_worker.submit("filehelper", "旧.txt", lambda: ("内容", None))
     _wait_results(1)
+    _wait_done("filehelper", "旧.txt")
     with read_worker._LOCK:
         t0, e0 = read_worker._DONE[("filehelper", "旧.txt")]
         read_worker._DONE[("filehelper", "旧.txt")] = (t0 - read_worker._DEDUPE_DONE_SEC - 1, e0)
@@ -235,6 +255,11 @@ def t7_no_reread_when_just_done():
     check("过了去重窗口（默认 5 分钟）→ 允许重读",
           bool(ok5) and "刚刚已经读完" not in note5, note5)
 
+    # ⚠️ **别留"飞行中"的 job**：worker 是 daemon 线程，进程退出时如果它还在跑并在写 stdout，
+    # 解释器 finalize 会报 `Fatal Python error: _enter_buffered_busy … daemon threads`
+    # （断言全过、退出码却是 -1073740791 —— 本会话真踩到，全量跑红、单跑却绿）。
+    _wait_results(1)
+    _wait_done("filehelper", "旧.txt")
     read_worker.reset_for_test()
     return _ok
 

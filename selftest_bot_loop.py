@@ -1216,9 +1216,15 @@ def t_gate_selfheal():
     old_rescan = bot.live_history.force_rescan
     old_sleep = bot.time.sleep
     old_client = bot.AixedClient
+    old_db_age = bot.hook_check.core_db_age_sec
     calls = []
     try:
         bot.live_history.force_rescan = lambda c, min_interval=None: calls.append(min_interval) or True
+        # 库龄**钉成 None**：闸门那条路的判据会看"微信还在不在写库"（纯 stat、读的是真机器人
+        # 的库文件），不钉住的话这条用例的结论会随**本机微信当时忙不忙**变——那就是假绿/假红。
+        bot.hook_check.core_db_age_sec = lambda: None
+        bot._GATE_HEAL_AT[0] = 0.0
+        bot._GATE_HEAL_BYPASS_AT[0] = 0.0
 
         # ① 已登录 + 库全打不开 → **必须扫**，而且用闸门那条更松的间隔（不是 45 秒）
         n, note = bot._gate_retry_step(_GateCli(login=True), 0)
@@ -1263,6 +1269,59 @@ def t_gate_selfheal():
         bot.live_history.force_rescan = old_rescan
         bot.time.sleep = old_sleep
         bot.AixedClient = old_client
+        bot.hook_check.core_db_age_sec = old_db_age
+        bot._GATE_HEAL_AT[0] = 0.0
+        bot._GATE_HEAL_BYPASS_AT[0] = 0.0
+
+
+def t_gate_heal_when_wechat_back():
+    """★ 微信重登之后**别再干等 5 分钟**（2026-10-06 真机，用户原话「恢复时间久确实搞人心态」）。
+
+    现场：用户重登微信后，助手先前那次重扫是在"微信还没活"时做的（必然失败），之后每 10 秒
+    都被 300 秒限流挡回 ⇒ **干等约 4 分钟**；我手工 `force_rescan` **1.8 秒**修好。
+    判据用「微信自己的库现在写不写」（`core_db_age_sec`，纯 stat、不碰 hook）：
+    **库刚被写过** ⇒ 打不开句柄不是"微信死了"，而是句柄表陈旧 ⇒ 此刻扫几乎一定成功。
+    """
+    sec("闸门自愈：微信刚回来就补一次重扫（不再干等限流）")
+    D = bot.gate_heal_decision
+    IV = bot._GATE_HEAL_INTERVAL
+    chk(D(IV + 1, IV, 5) == "scan", "常规：距上次重扫超过间隔 → 扫")
+    chk(D(None, IV, 5) == "scan", "从没扫过 → 扫")
+    chk(D(10, IV, 5) == "bypass",
+        "★ 限流没到、但**微信的库刚被写过** → 绕开限流补一次")
+    chk(D(10, IV, None) == "wait",
+        "★ 拿不到库龄 → **一律不补**（无证据不乱扫）")
+    chk(D(10, IV, 3000) == "wait",
+        "★ 微信很久没写库（真死了）→ 不补，扫了也白扫")
+    chk(D(10, IV, 5, last_bypass_age=5) == "wait",
+        "★ 刚补过一次 → 不补（两次之间至少隔 60 秒）")
+    chk(D(10, IV, 5, last_bypass_age=bot._GATE_HEAL_BYPASS_INTERVAL + 1) == "bypass",
+        "补过一次、又过了间隔 → 还能再补")
+
+    # 真跑一遍 `_gate_selfheal`（钉住 force_rescan 与库龄，别碰真微信）
+    old_rescan = bot.live_history.force_rescan
+    old_db_age = bot.hook_check.core_db_age_sec
+    calls = []
+    try:
+        bot.live_history.force_rescan = lambda c, min_interval=None: calls.append(min_interval) or True
+        bot._GATE_HEAL_AT[0] = 0.0
+        bot._GATE_HEAL_BYPASS_AT[0] = 0.0
+        bot.hook_check.core_db_age_sec = lambda: 3.0          # 微信刚写过
+        bot._GATE_HEAL_AT[0] = time.monotonic() - 10.0        # 10 秒前才扫过（限流中）
+        note = bot._gate_selfheal(object())
+        chk(calls == [0.0], f"★ 绕开限流补扫：传给 force_rescan 的间隔是 0（实际 {calls}）")
+        chk("绕开限流" in note and "句柄表陈旧" in note, f"如实说清为什么补：{note[:50]!r}")
+        note2 = bot._gate_selfheal(object())
+        chk(calls == [0.0, bot._GATE_HEAL_INTERVAL] and "绕开限流" not in note2,
+            f"★ 紧接着第二次不再补（回常规节奏/限流文案）：{calls}")
+        bot.hook_check.core_db_age_sec = lambda: None
+        note3 = bot._gate_selfheal(object())
+        chk("绕开限流" not in note3, "库龄读不到 → 回到常规那条路")
+    finally:
+        bot.live_history.force_rescan = old_rescan
+        bot.hook_check.core_db_age_sec = old_db_age
+        bot._GATE_HEAL_AT[0] = 0.0
+        bot._GATE_HEAL_BYPASS_AT[0] = 0.0
 
 
 def t_bot_console():
@@ -2120,6 +2179,7 @@ def main():
     t_selfcheck()
     t_stall_selfheal()
     t_gate_selfheal()
+    t_gate_heal_when_wechat_back()
     t_bot_console()
     t_check_ret()
     t_own_image()
