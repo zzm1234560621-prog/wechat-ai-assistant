@@ -208,13 +208,19 @@ def format_results(results, query="", cfg=None):
     return text
 
 
+# 本机 SearXNG 也是**回环**服务 → 请求**一律不走代理**（2026-10-06：`aixed_api` 那边
+# 已经因为"进程环境里带 http_proxy"踩过一整天的坑 —— 助手连本机 hook 都被送去了一个
+# 没在跑的代理，表现就是"它没在工作"。同一个道理，这里也显式禁掉，与系统代理设置无关）。
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _default_fetch(url, timeout_s):
     req = urllib.request.Request(url, headers={
         "User-Agent": _UA,
         "Accept": "application/json",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     })
-    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+    with _LOOPBACK_OPENER.open(req, timeout=timeout_s) as r:
         return r.read().decode("utf-8", "ignore")
 
 

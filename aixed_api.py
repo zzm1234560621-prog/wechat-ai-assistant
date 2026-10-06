@@ -225,6 +225,17 @@ def resolve_self_wxid(cfg, client, backend):
         % (guess, "、".join(dirs)))
 
 
+# 本机 hook 的 HTTP 请求**一律不走代理**（2026-10-06 真机：助手"看起来没在工作"的真因）：
+# 助手的进程环境里可能带 `http_proxy` / `ALL_PROXY`（那台现场 `netstat` 能看到它往
+# `127.0.0.1:10808` 发 SYN_SENT，而那个代理并没在跑 ⇒ **每个请求都 10061**，于是收不到消息、
+# 状态盘 healthy=False，看起来像"助手死了"）。urllib 的 `proxy_bypass` 对字面量 `127.0.0.1`
+# **并不保证**成立，而这个 hook **永远在本机回环上** —— 走代理在物理上就是错的。
+# 所以显式给一个空 `ProxyHandler`：与系统/环境里的代理设置**彻底无关**。
+# 回归：`selftest_aixed`（子进程里带上指向死端口的代理变量，请求必须照样成功）。
+# ⚠️ 同一类问题还有 `web_read.py`（本机 SearXNG 也是回环），它那边同样显式禁代理。
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class AixedClient:
     # 允许调用方**按次**覆盖超时（`query_sql(db, sql, timeout=...)`）。live_history 用它
     # 给轮询里的查询压短超时：hook 偶尔会卡住，而 15 秒 × 一轮六七个查询 = 一轮一分多钟，
@@ -245,7 +256,9 @@ class AixedClient:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            # ⚠️ 用 `_LOOPBACK_OPENER` 而不是 `urllib.request.urlopen`：见它上面的注释
+            # （本机回环**永不走代理**；urlopen 会按环境/系统代理设置走）。
+            with _LOOPBACK_OPENER.open(req, timeout=timeout or self.timeout) as r:
                 body = r.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as e:
             detail = ""

@@ -3263,6 +3263,12 @@ def new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
             except Exception as e:
                 _note_hook_unreachable(e)
                 return [], cursors
+            # ✅ 探通 ⇒ **把这笔账清掉**（2026-10-06 补的真 bug）：`_POLL_ERRORS["hook"]`
+            # 以前**只写不清** —— 任何一次瞬断之后，`status.json` 就**永远** `healthy=False`
+            # （`Health._healthy()` 只看 poll_errors 空不空）、心跳里**永远**挂着「hook(N次)」，
+            # 用户看到的就是「它是不是没在工作？」，而其实下一轮就好了。
+            # 判据就在这一行：探针通了就是通了（和 `_note_poll_ok` 的语义完全一致）。
+            _note_poll_ok("hook")
 
         v4 = is_wechat4(client)
         # 用「分片表实际能不能查到」来决定走哪条路，而不是用 _uses_fts 的探测结果：

@@ -9,11 +9,14 @@
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 import agent_tools
 import aixed_api
@@ -280,6 +283,22 @@ def main():
 
     print("── AixedClient 基本接口 ──")
     ok &= check("get_dbs()", c.get_dbs() == DB_NAMES, c.get_dbs())
+
+    # ★ 本机 hook **永不走代理**（2026-10-06 真机："助手看起来没在工作"的真因）：
+    # 助手的进程环境里带了 `http_proxy`/`ALL_PROXY`（现场 netstat 能看到它往 `127.0.0.1:10808`
+    # 发 SYN_SENT，而那个代理没在跑）⇒ **每个请求都 10061**。`urllib.request.urlopen` 会按
+    # 环境的代理设置走，而 `proxy_bypass` 对字面量 `127.0.0.1` 并不保证成立。
+    # 这里**在子进程里**带毒（导入时就带着代理变量）跑一遍：真连本机假服务必须成功。
+    _bad_proxy = {"http_proxy": "http://127.0.0.1:1", "HTTP_PROXY": "http://127.0.0.1:1",
+                  "all_proxy": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1"}
+    _child = subprocess.run(
+        [sys.executable, "-c",
+         "import aixed_api,sys;"
+         f"print(aixed_api.AixedClient('http://127.0.0.1:{port}').ping()[0])"],
+        cwd=HERE, env=dict(os.environ, **_bad_proxy), capture_output=True, text=True)
+    ok &= check("★ 环境里带代理（指向死端口）也照样直连本机 hook —— 回环不走代理",
+                (_child.stdout or "").strip() == "True",
+                ((_child.stdout or "").strip(), (_child.stderr or "")[-120:]))
     ok &= check("_v3_msg_dbs() 只挑出 MSG 分片", live_history._v3_msg_dbs(c) == ["MSG0.db", "MSG1.db"], live_history._v3_msg_dbs(c))
     ok &= check("get_self_wxid()", c.get_self_wxid() == SELF_WXID, c.get_self_wxid())
     ok &= check("ping() 可用", c.ping() == (True, SELF_WXID), c.ping())
@@ -1057,6 +1076,34 @@ def main():
                 "hook" in live_history.poll_errors(), live_history.poll_errors())
     live_history._POLL_ERRORS.pop("hook", None)
     live_history.begin_poll(0)
+
+    # ★ 探通之后必须把这笔账**清掉**（2026-10-06 补的真 bug）：`_POLL_ERRORS["hook"]`
+    # 以前**只写不清**，于是任何一次瞬断之后 status.json 永远 healthy=False、心跳里永远
+    # 挂着「hook(N次)」—— 用户看到的就是「它是不是没在工作？」，而其实下一轮就好了。
+    class _FlakyClient(_DownClient):
+        """第一次探不通、之后探得通（模拟瞬断恢复）。"""
+
+        def __init__(self):
+            super().__init__()
+            self.probes = 0
+            self._lh_is4 = (time.time(), True)          # 直接给缓存，别再探 contact.db
+            self._lh_fts_tables = (time.time(), ["message_fts_v4_0"])
+
+        def db_status(self):
+            self.probes += 1
+            if self.probes == 1:
+                raise RuntimeError("连不上 http://127.0.0.1:30001（WinError 10061）")
+            return {"IsLogin": 1}
+
+    fl = _FlakyClient()
+    live_history._POLL_ERRORS.pop("hook", None)
+    live_history.new_messages(fl, {"message_fts_v4_0": 5})
+    ok &= check("瞬断那一轮照旧记下 hook（心跳里看得见）",
+                "hook" in live_history.poll_errors(), live_history.poll_errors())
+    live_history.new_messages(fl, {"message_fts_v4_0": 5})
+    ok &= check("★ 探通之后**清掉** hook 那笔账（否则 healthy 永远 False、心跳永远挂告警）",
+                "hook" not in live_history.poll_errors(), live_history.poll_errors())
+    live_history._POLL_ERRORS.pop("hook", None)
 
     print("\n── 分片熔断：同一个查询连错之后别再每轮砸它（2026-10-05 第二次崩溃的回归）──")
     # 事故：hook 对查询连续回 `HTTP 500`，而探活 `/QueryDB/status` **是通的**——
