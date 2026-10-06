@@ -38,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import admin
 import envsetup as env
 
 LOCK_PORT = 39001
@@ -215,6 +216,20 @@ def start(background=True, wait=45):
         return False, ("虚拟环境未就绪或依赖缺失。先跑 install.bat（或菜单里的「安装依赖」）。")
     py = env.VENV_PYW if (background and os.path.exists(env.VENV_PYW)) else env.VENV_PY
     bot = os.path.join(env.BASE, "bot.py")
+
+    # ⚠️ **提权在真正拉起进程之前**（2026-10-06 用户定的硬约束：助手永远跑在管理员上）。
+    # 为什么必须在这里而不能只靠 bot.py 自己那一道：`py` 可能是 **pythonw**
+    # （无窗口），而提权只能靠"再拉起一个进程"完成——那样会**多出一个控制台窗口**，
+    # 开机自启就成了"弹个黑窗"。所以由调用方指定 exe，提权后仍是无窗口那个 pythonw。
+    _aok, _amsg, _launched = admin.ensure_elevated(argv=[bot], exe=py, cwd=env.BASE,
+                                                  capture=True)
+    if not _aok:
+        return False, _amsg
+    if _launched:
+        # 刚在**另一个**提权窗口里把 bot 拉起来了 → 这一份必须什么都不做，
+        # 否则就是两个助手同时轮询 hook（会把微信搞崩，见 acquire_single_instance）。
+        return True, _amsg
+
     if not background:
         return True, "前台启动中（Ctrl+C 停止）…"
     try:
@@ -782,6 +797,20 @@ def ensure_search_service(cfg=None, wait=0):
 
 def main():
     arg = (sys.argv[1].lower() if len(sys.argv) > 1 else "status")
+    # ⚠️ 命令式入口在这里就提权（交互式 `botctl.py start/stop/...`）：提权后**等它跑完并沿用
+    # 它的退出码**，用户在本窗口里能直接看到结果；不提权的话父进程会立刻退出、看起来像
+    # "什么都没发生"。
+    # 为什么连 `stop` 也要提权：助手是**管理员**跑的（硬约束），普通权限的 `taskkill`
+    # 杀不掉高完整性进程 —— 提权少了这一条，「停不掉」就会变成新的坑。
+    # 只读命令（status/health/log/follow/search-status）**不提权**：看一眼状态不该弹 UAC。
+    if arg in ("start", "stop", "restart",
+               "search-start", "search-stop", "search-install"):
+        _ok, _msg, _launched = admin.ensure_elevated(capture=False, wait=True)
+        if not _ok:
+            print(f"[!] {_msg}")
+            sys.exit(1)
+        if _launched:
+            return
     if arg == "status":
         print(status_text())
     elif arg == "health":

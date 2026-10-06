@@ -62,16 +62,19 @@ mp4 exe **xlsx** zip txt 类别文件正常」——我们实测证实了其中�
 |---|---|---|
 | 端点选择 | `aixed_api.send_file_via(cfg)` | 默认 `"imgmsg"` → `/SendImgMsg`；可配 `"filemsg"` → `/SendFileMsg`（留给将来真带该接口的 hook）。**写歪的值回退 imgmsg**（这是能力不是安全闸，写错一个词不应变成「发不了」） |
 | 客户端方法 | `aixed_api.AixedClient.send_file(path, wxid, cfg=None)` | 按 `send_file_via` 打端点 |
-| 工具 | `agent_tools.t_send_file`（`send_file`） | 定位 → 解析收件人 → 能力闸 → 名单内直发 / 名单外进待确认 |
+| 工具 | `agent_tools.t_send_file`（`send_file`） | 定位（两种来源，见下两行）→ 解析收件人 → 能力闸 → 微信来源按名单直发 / **盘上来源与名单外一律进待确认** |
 | 能力开关 | `agent.send_file`（**默认 true**） | 只有显式写 `false`/`0` 才关；关掉时**当场如实拒绝且不进待确认队列** |
-| 文件定位 + 边界 | `file_read.pick()` | **只认微信 `msg/file/` 下**、按文件名（含 `(1)` 重名退让）、**多份命中不替用户挑** |
+| 文件定位①（微信） | `file_read.pick()` | **只认微信 `msg/file/` 下**、按文件名（含 `(1)` 重名退让）、**多份命中不替用户挑** |
+| 文件定位②（电脑） | `files.path_ok()` | 模型给**绝对路径**（2026-10-04 T9 扩）：过 `files.roots` / `files.deny` + 触发者闸门 `files.who_allows` → 带 `extra={src: disk}`，**一律进确认队列、绝不走名单直发** |
 | 确认闸门 | `set_pending(kind="file")` + `send_pending(..., cfg=cfg)` | **发文件永远要用户回「确认」**（不可逆动作） |
-| 发送前二次校验 | `send_pending` 的 `file` 分支 | 确认之前**再定位一次**，定位不到就「一份都不发」并如实说 |
+| 发送前二次校验 | `send_pending` 的 `file` 分支 | 确认之前**再判一次**：微信来源要求「按文件名还能重新定位到同一个文件」；盘上来源要求**按当前配置再过一次 `files.path_ok`**。不过就「一份都不发」并如实说 |
 | 重启恢复 | `bot.restore_pending` | 恢复 `file` 字段 |
-| 回归 | `selftest_policy.test_send_file`（25 条） | 默认进待确认 / 关掉时如实拒绝且不进队列 / 禁止绕路禁止假装 / 端点解析与写歪回退 / 复核不过不发 / `cfg` 被带到 client |
+| 回归 | `selftest_policy.test_send_file`（25 条）+ `selftest_files.py` 的盘上来源段（带反证） | 默认进待确认 / 关掉时如实拒绝且不进队列 / 禁止绕路禁止假装 / 端点解析与写歪回退 / 复核不过不发 / `cfg` 被带到 client / **盘上来的零确认直发会被反证抓出来** |
+| 模型可见文本 | `selftest_tool_registry.py` §6 | `TOOLS['send_file'].description` 与两份 config 的 system_prompt **都要写明两种来源**（文件名 / 绝对路径）。2026-10-05 真机踩过：放宽只写在代码与本文档里，模型照旧回「send_file 只能发微信里收/发过的文件」 |
 
-**不要**为了「能发任意文件」而把 `file_read.pick()` 的白名单放开；
-`agent.send_image_dirs` 是**另一条**边界（发图用的），两边**不要合并**。
+**不要**为了「能发任意文件」而把 `file_read.pick()` 的**读取**边界放开（读那条路仍只认
+`msg/file/`）；发文件是**另一条**准入（`files.path_ok` + 磁盘来源强制确认），两条别合并。
+`agent.send_image_dirs` 是**第三条**边界（发图用的），也不要合并。
 
 ## 三、留下的、真实存在的边界
 

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 
+import admin
 import botctl
 import envsetup as env
 import settings
@@ -152,6 +153,10 @@ def auto():
             return
 
     print("[自动] 启动助手（Ctrl+C 停止）...")
+    _ok, _msg = admin.ensure_elevated(argv=["bot.py"], exe=env.VENV_PY, cwd=BASE)
+    if not _ok:
+        print(f"[自动] {_msg}")
+        return
     subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
 
 
@@ -333,6 +338,11 @@ def act_restart():
 def act_foreground():
     if not env.venv_ready():
         return "虚拟环境未就绪（不存在、已失效或依赖缺失），请先「安装依赖」。"
+    # 和后台那条路同一个门（`botctl.start` 里也有一道）：助手必须以管理员跑。
+    # 控制台通常已经是管理员了（`main()` 开头就提权），这里是给"别的调用方"兜底。
+    _ok, _msg = admin.ensure_elevated(argv=["bot.py"], exe=env.VENV_PY, cwd=BASE)
+    if not _ok:
+        return _msg
     print("[自动] 前台启动（Ctrl+C 停止）...")
     subprocess.run([env.VENV_PY, "bot.py"], cwd=BASE)
     return None
@@ -342,6 +352,39 @@ def act_log_tail():
     print()
     print(botctl.tail(40))
     return None
+
+
+def act_fix_hook():
+    """只有一件事：**把包里那份 version.dll 覆盖到微信目录**，并当场核对哈希。
+
+    为什么单独有这一项（2026-10-06 真机，用户卡了一下午）：
+    「包里那份是新的」和「微信里装的那份是新的」是**两个文件**——解压新包、装依赖、
+    配模型都不会碰微信目录里那个 `version.dll`。而 `do_hook_install.ps1` 前面还有一道
+    版本闸（版本不对就什么都不做），于是出现过：用户重装了好几遍包，微信目录里
+    躺的**始终是旧 DLL**，助手每 10 秒刷「hook 已加载，但数据库打不开（微信没登录？）」
+    ——文案把人往"扫码登录"上带。
+    这一项**不过版本闸**（换文件本身与版本无关），也不改任何设置，只做替换 + 哈希自验，
+    结果**落盘**（提权窗口一关输出就没了）。要恢复：同目录下备份着 `version.dll.bak_*`。
+    """
+    script = "do_fix_hook.ps1"
+    print("    用途：微信目录里那份 hook 是旧的（比如 519168），把包里这份（527360）换上去。")
+    print("    ⚠️ 换之前请**完全退出微信**（右下角托盘图标右键退出）——文件被占用会替换失败。")
+    size, note = _hook_dll_state()
+    print(f"    现在微信目录里那份：{note}")
+    if not _confirm("确认替换？(y/N) "):
+        return "已取消。"
+    ok, msg = run_ps1(script)
+    logp = os.path.join(HOOK_DIR, "hook-fix-log.txt")
+    lines = []
+    try:
+        with open(logp, "r", encoding="ascii", errors="replace") as fh:
+            lines = [ln.rstrip() for ln in fh.read(4000).splitlines() if ln.strip()]
+    except OSError:
+        lines = []
+    tail = "\n".join("    " + ln for ln in lines[-8:]) if lines else "    [!] 没读到日志（脚本没跑起来？）"
+    return (("[√] " if ok else "[!] ") + msg + "\n" + tail +
+            "\n    → 换完**重启微信并扫码登录**，再起助手。"
+            f"\n    （要还原：微信目录下有 version.dll.bak_* 备份；日志：{logp}）")
 
 
 def act_hook(script, what):
@@ -945,6 +988,114 @@ def _verify_downgrade(t0):
     return False
 
 
+def _hook_dll_state():
+    """`(微信目录里那份 version.dll 的字节数, 人话)`；读不到返回 `(0, 为什么)`。
+
+    ⚠️ 为什么需要这一句（2026-10-06 真机，用户卡了一整个下午）：**「包里那份是新的」和
+    「微信里装的那份是新的」是两个文件。** 一键配置在版本闸没过时会**静默 return**，
+    于是装 hook 一步没做、微信目录里躺的还是旧 DLL，而用户看到的是"打了一堆警告然后结束"，
+    以为已经装完了。真实症状：助手每 10 秒刷「hook 已加载，但数据库打不开（微信没登录？）」
+    —— 文案把人往「扫码登录」上带，真相却是 hook 从没换过。
+    所以：只要跟 hook 安装有关，**就把微信目录里那份的字节数摆出来**（519168=旧 / 527360=新）。
+    """
+    try:
+        wx = _find_weixin_dir()
+    except Exception as e:                          # noqa: BLE001 —— 诊断不许反过来炸掉流程
+        return 0, f"找不到微信目录（{type(e).__name__}: {e}）"
+    if not wx:
+        return 0, "找不到微信安装目录（微信没装？）"
+    p = os.path.join(wx, "version.dll")
+    if not os.path.isfile(p):
+        return 0, f"{p} 不存在（hook 还没装过）"
+    n = os.path.getsize(p)
+    known = {519168: "**旧的**（要求核心库连续一直在写，安静时永不放行）",
+             527360: "**新的**（读保存位置 + 25 秒窗口，零主动扫描）"}
+    return n, f"{n} 字节 —— {known.get(n, '未知构建')}"
+
+
+def _find_weixin_dir():
+    """微信安装目录（有 Weixin.exe 的那个）。找不到返回空串。
+
+    与 `installers/wechat-4.1.10.27/_common.ps1` 的 `Find-Weixin` 同源：
+    HKCU/HKLM 的 `SOFTWARE\\Tencent\\Weixin` → `%ProgramFiles%\\Tencent\\Weixin`。
+    """
+    import winreg
+    cands = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r"SOFTWARE\Tencent\Weixin") as k:
+                for name in ("InstallPath", "InstallDir"):
+                    try:
+                        v, _ = winreg.QueryValueEx(k, name)
+                    except OSError:
+                        continue
+                    if v:
+                        cands.append(str(v).rstrip("\\/"))
+        except OSError:
+            continue
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(env_name)
+        if root:
+            cands.append(os.path.join(root, "Tencent", "Weixin"))
+    for d in cands:
+        if d and os.path.isfile(os.path.join(d, "Weixin.exe")):
+            return d
+    return ""
+
+
+def _stop_after_version_gate():
+    """版本闸没过 → **明说「后面几步都没做」**，并给出下一步命令。
+
+    ⚠️ 这里的每一句都是 2026-10-06 真机换来的：旧实现只打一句「后面的步骤先不做了」就
+    `return None`，用户以为一键配置跑完了，实际**连 hook 都没装**，微信目录里还是旧 DLL。
+    所以必须说清三件事：① 停在第几步；② **哪些步骤没做**（尤其装 hook）；
+    ③ 现在微信目录里那份 hook 是什么（字节数能一眼分辨新旧）。
+    """
+    print()
+    print("=" * 46)
+    print("  ⛔ 一键配置**没做完**：停在第 0 步（微信版本），后面的步骤**一步都没执行**")
+    print("=" * 46)
+    print("  没做的：1) 装 hook   2) 装依赖   3) 可选组件   4) 启动 + 配模型")
+    size, note = _hook_dll_state()
+    print(f"  现在微信目录里的 hook：{note}")
+    if size and size != 527360:
+        print("  ⚠️ 注意：**包里那份是新的、微信里装的那份是旧的** —— 解压新包不会替换它。")
+    print()
+    print("  下一步（三条路，任选一条）：")
+    print(f"    ① 把微信版本换成 {WANTED_WEIXIN}，然后再按一次 [9]；")
+    print(f"    ② 只是想先装 hook：菜单 [8] → [7] → [1]（会弹 UAC）；")
+    print("    ③ 手工核对：")
+    print('         (Get-Item "C:\\Program Files\\Tencent\\Weixin\\version.dll").Length')
+
+
+def _report_hook_install():
+    """装 hook 之后**把结果读回来**：微信目录里那份是什么 + 脚本日志的尾巴。
+
+    ⚠️ 为什么必须有这一句（2026-10-06 真机）：`do_hook_install.ps1` 是在**提权新窗口**里
+    跑的，那个窗口一关输出就没了；用户看到的是"一闪而过"，于是**根本不知道装没装上**
+    （真机那次脚本其实压根没跑：`hook-install-log.txt` 都不存在）。所以控制台这边必须
+    主动去读它的落盘证据，并把微信目录里那份 DLL 的**字节数**摆出来。
+    """
+    size, note = _hook_dll_state()
+    print(f"    [i] 微信目录里的 hook：{note}")
+    logp = os.path.join(HOOK_DIR, "hook-install-log.txt")
+    if not os.path.isfile(logp):
+        print("    [!] 那个脚本的日志**不存在** ⇒ 它这次**没有真的跑起来**")
+        print("        （日志是它第一件事就写的；没有 = 没运行。常见原因：UAC 被点了「否」。）")
+        return
+    try:
+        with open(logp, "r", encoding="utf-8", errors="replace") as fh:
+            tail = [ln.rstrip() for ln in fh.read(4000).splitlines() if ln.strip()][-6:]
+    except OSError as e:
+        print(f"    [!] 日志读不出来：{e}")
+        return
+    print(f"    [i] 它的日志（{logp}）最后几行：")
+    for ln in tail:
+        print(f"        {ln}")
+    print("    → 装完**重启微信**（version.dll 只在微信启动时加载），再确认通了：浏览器打")
+    print("      http://127.0.0.1:30001/QueryDB/status   （返回 JSON 就成）")
+
+
 def first_run():
     """**第一次装**：把「别人想用的话该点哪儿」变成一次点击。
 
@@ -978,8 +1129,7 @@ def first_run():
     # 2026-10-04 真机：另一台电脑微信是 4.1.15.13，[9] 走完一遍日志全绿、端口从没通。
     print("--- 第 0 步：微信版本 ---")
     if not ensure_weixin_version():
-        print("    [!] 微信版本不是 " + WANTED_WEIXIN + "，后面的步骤先不做了。")
-        print("        （版本换好之后再按一次 [9] 即可。）")
+        _stop_after_version_gate()
         return None
     print()
 
@@ -994,8 +1144,7 @@ def first_run():
         if _confirm("    现在装？(Y/n) ", default_no=False):
             ok, msg = run_ps1("do_hook_install.ps1")
             print(("[√] " if ok else "[!] ") + msg)
-            print("    → 装完**重启微信**，再确认通了：浏览器打")
-            print("      http://127.0.0.1:30001/QueryDB/status   （返回 JSON 就成）")
+            _report_hook_install()
         else:
             print("    已跳过。以后想装：菜单 [8] → [7] → [1]。")
 
@@ -1095,13 +1244,15 @@ def menu():
                     ("2", "关闭", lambda: run("autostart.py", ["off"])),
                     ("3", "查看状态", lambda: run("autostart.py", ["status"])),
                 ])),
-                ("7", "Hook（装 / 摘 / 装回）", lambda: _submenu("Hook 与微信", [
+                ("7", "Hook（装 / 摘 / 装回 / 修）", lambda: _submenu("Hook 与微信", [
                     ("1", "装 hook（放 version.dll + 禁用微信自动更新）",
                      lambda: act_hook("do_hook_install.ps1", "装 hook")),
                     ("2", "摘 hook（改名 .disabled，会强杀卡死的微信）",
                      lambda: act_hook("do_remove_hook.ps1", "摘 hook")),
                     ("3", "装回 hook（并重启微信）",
                      lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
+                    ("4", "★ 只替换 version.dll（微信里那份是旧的时用这个）",
+                     act_fix_hook),
                 ])),
                 ("8", "打开状态页（本地只读网页）", act_status_page),
                 ("9", "搜索服务（网上搜索后端 启 / 停 / 看 / 装）", lambda: _submenu(
@@ -1142,6 +1293,14 @@ def main():
     所以名字叫「部署」而不是「配置」，而且它必须保持是个**薄壳**。
     """
     arg = sys.argv[1].strip().lower() if len(sys.argv) > 1 else ""
+    _eok, _emsg, _elaunched = admin.ensure_elevated(capture=True)
+    if not _eok:
+        print(f"\n[admin] ❌ {_emsg}")
+        input("\n按回车退出 ... ")
+        return
+    if _elaunched:
+        # 刚在另一个提权窗口里把控制台拉起来了 → 这一份退出（别开两个菜单）
+        return
     try:
         if arg in ("first", "--first-run", "setup", "一键配置", "一键部署"):
             first_run()

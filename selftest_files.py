@@ -544,6 +544,27 @@ def test_send_file_from_disk():
             "send_file", {"to": "老张", "name": os.path.join(td, "nope.pdf")})
         ok &= check("绝对路径但文件不存在 → 如实说", "没有这个文件" in out, out)
 
+        # `~/...` 也必须走**盘上**那条路（2026-10-05 真机连撞两次）：
+        # Windows 上 `os.path.isabs("~/x")` 为 False，所以第一版把模型的
+        # `~/Desktop/TF/TF/1.docx` 丢给了「按文件名找」→ 回一句「文件名不合法」
+        # → 模型去猜 `C:\Users\Administrator\...` → 再报「没有这个文件」。
+        home = os.path.expanduser("~")
+        tilde = "~/Desktop/selftest_一定不存在_xyz.pdf"
+        out = _box(cfg, cli, chat).run("send_file", {"to": "老张", "name": tilde})
+        ok &= check("`~/...` 走盘上那条路（回「没有这个文件」+ 展开后的真实家目录）",
+                    "没有这个文件" in out and home in out and "不合法" not in out,
+                    out[:160])
+        out = _box(cfg, _Cli(), "wxid_stranger", from_self=False).run(
+            "send_file", {"to": "老张", "name": tilde})
+        ok &= check("……而且照样受触发者闸门约束（证明它没漏回按文件名那条路）",
+                    "不能用" in out, out[:140])
+
+        # 相对路径：**不许**丢给「按文件名找」（那边只会说「不合法」，看不懂）
+        out = _box(cfg, _Cli(), chat).run(
+            "send_file", {"to": "老张", "name": os.path.join("sub", "报告.pdf")})
+        ok &= check("带分隔符的相对路径 → 明说要**绝对路径**",
+                    "绝对路径" in out and "不合法" not in out, out[:160])
+
         # 触发者闸门对发文件也生效（新开的能力不能跟着老路径一起没闸）
         cli3 = _Cli()
         out = _box(cfg, cli3, "wxid_stranger", from_self=False).run(

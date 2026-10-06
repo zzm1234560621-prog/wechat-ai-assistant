@@ -356,7 +356,7 @@ def t8_scan_deadline():
     _real_proc, _real_k32, _real_scan = (voice_mem.weixin_main_process,
                                          voice_mem._k32, voice_mem.scan_silk)
     try:
-        voice_mem.weixin_main_process = lambda: (1234, _H())
+        voice_mem.weixin_main_process = lambda probe=None: (1234, _H())
         voice_mem._k32 = lambda: type("K", (), {"CloseHandle": staticmethod(lambda h: None)})()
         voice_mem.scan_silk = lambda h, deadline=None, **kw: ([], False)
         texts, why = voice_mem.read(1400, cfg={"voice": {"scan_seconds": 8}})
@@ -484,7 +484,7 @@ def t10_length_fingerprint(tmp):
                               if s.startswith(voice_mem.MAGIC) else None)
         voice_mem._read_mem = lambda h, addr, n: blobs.get(addr, b"")[:n]
         voice_mem.available = lambda: (True, "")
-        voice_mem.weixin_main_process = lambda: (1, object())
+        voice_mem.weixin_main_process = lambda probe=None: (1, object())
         voice_mem._k32 = lambda: type("K", (), {"CloseHandle": staticmethod(lambda h: None)})()
         voice_mem.scan_silk = lambda h, deadline=None, **kw: (hits, True)
         voice_mem.silk_to_wav = lambda silk, wav: (1.0, 24000, "")
@@ -534,6 +534,154 @@ def t10_length_fingerprint(tmp):
          voice_mem.silk_to_wav, audio_read.transcribe_scored) = _saved
 
 
+def t11_memory_access_message():
+    """⚠️ 根因回归：**「打不开微信内存」和「微信没在跑」必须是两句不同的人话**。
+
+    2026-10-06 真机（用户发两条语音、各收到一条报错）：微信好好跑着（进程表里 5 个
+    `Weixin.exe`），但它是以 **High 完整性**启动的（提权开的微信），助手是 Medium
+    —— 跨完整性级别时 `OpenProcess(QUERY_INFORMATION|VM_READ)` 被系统拒绝
+    （`GetLastError=5`）。旧代码把这种情况和"微信压根没开"混成同一句
+    「读不到微信进程内存（微信没在跑？或者权限不够）」，用户于是去查"微信开没开"，
+    方向正好反了。
+
+    正确行为：有 `Weixin.exe` 却一个都打不开 → 说**权限/完整性级别**、并给出两条可执行的路；
+    进程表里没有 `Weixin.exe` → 才说"没在跑"。诊断字段来自 `ProcessProbe`
+    （`weixin_main_process(probe=...)`，返回值契约不变）。
+    """
+    sec("读不到微信内存：区分「没在跑」与「跨权限打不开」")
+    from ctypes import c_uint64
+
+    class _H:
+        pass
+
+    class _K32Denied:
+        """OpenProcess 一律失败（模拟跨完整性级别）。"""
+        @staticmethod
+        def CreateToolhelp32Snapshot(*a, **k):
+            return 0
+
+        @staticmethod
+        def Process32First(*a, **k):
+            return 0
+
+        @staticmethod
+        def CloseHandle(h):
+            return 1
+
+        @staticmethod
+        def GetLastError():
+            return 5
+
+        @staticmethod
+        def OpenProcess(access, inherit, pid):
+            return 0
+
+        @staticmethod
+        def ReadProcessMemory(*a, **k):
+            return 0
+
+    class _K32None(_K32Denied):
+        """进程表里连 Weixin.exe 都没有。"""
+        @staticmethod
+        def OpenProcess(access, inherit, pid):
+            raise AssertionError("没有候选进程时不该尝试 OpenProcess")
+
+    class _K32Ok(_K32Denied):
+        """拿得到句柄，但没有一个进程带 Weixin.dll。"""
+        @staticmethod
+        def OpenProcess(access, inherit, pid):
+            return _H()
+
+    _saved = (voice_mem._k32, voice_mem._has_weixin_dll,
+              voice_mem.available, voice_mem.weixin_main_process)
+    try:
+        voice_mem.available = lambda: (True, "可以用")
+
+        # ① 有进程、但一个都打不开（真机这一档）
+        def _enumerate_denied(k32, probe):
+            probe.saw_any = True
+            probe.denied = True
+            return None, ""
+
+        voice_mem._k32 = lambda: _K32Denied()
+        voice_mem.weixin_main_process = (
+            lambda probe=None: _enumerate_denied(_K32Denied(), probe))
+        texts, why = voice_mem.read(1400, cfg={})
+        check("打不开内存 → 不给文本（绝不编）", texts == [], texts)
+        check("……优先说**打不开内存 / 权限**，而不是旧的「没在跑？或者权限不够」",
+              "打不开它的内存" in why and "或者权限不够" not in why, why)
+        check("……并明说不是「微信没在跑」", "不是「微信没在跑」" in why, why)
+        check("……给出两条可执行的路（重启微信 / 提权跑助手）",
+              "普通双击" in why and "管理员身份运行" in why, why)
+
+        # ② 进程表里压根没有 Weixin.exe → 才说没在跑
+        def _enumerate_none(k32, probe):
+            probe.saw_any = False
+            probe.denied = False
+            return None, ""
+
+        voice_mem._k32 = lambda: _K32None()
+        voice_mem.weixin_main_process = (
+            lambda probe=None: _enumerate_none(_K32None(), probe))
+        texts2, why2 = voice_mem.read(1400, cfg={})
+        check("没有 Weixin.exe → 如实说「没在跑」", "没在跑" in why2, why2)
+        check("……且不再提权限那条路（两种失败不许混）", "管理员" not in why2, why2)
+
+        # ③ 第三种组合（有进程、句柄也有、只是没一个带 Weixin.dll）单独成句。
+        #    这一档在当前机器人上走不到（微信主进程一定带 Weixin.dll），所以不写细句子，
+        #    只钉住**分类**不许回退成上面两句。
+        def _enumerate_nodll(k32, probe):
+            probe.saw_any = True
+            probe.denied = False
+            return None, ""
+
+        voice_mem._k32 = lambda: _K32Ok()
+        voice_mem.weixin_main_process = (
+            lambda probe=None: _enumerate_nodll(_K32Ok(), probe))
+        texts3, why3 = voice_mem.read(1400, cfg={})
+        check("第三种失败单独成句（既不冒充「没在跑」、也不冒充权限）",
+              texts3 == [] and "没在跑" not in why3 and "管理员" not in why3, why3)
+
+        # ④ 真实枚举路径照样能走通（用桩进程表），返回值契约不变
+        class _K32Real(_K32Denied):
+            @staticmethod
+            def CreateToolhelp32Snapshot(flags, pid):
+                return 77
+
+            @staticmethod
+            def Process32First(snap, byref_pe):
+                pe = byref_pe._obj
+                pe.szExeFile = b"weixin.exe"
+                pe.th32ProcessID = 4242
+                return 1
+
+            @staticmethod
+            def Process32Next(snap, byref_pe):
+                return 0
+
+            @staticmethod
+            def OpenProcess(access, inherit, pid):
+                return _H()
+
+        voice_mem.available = lambda: (True, "可以用")
+        voice_mem._k32 = lambda: _K32Real()
+        voice_mem._has_weixin_dll = lambda pid: True
+        # ⚠️ 用**真的** weixin_main_process（桩的是内核调用），所以先把它恢复
+        voice_mem.weixin_main_process = _saved[3]
+        probe = voice_mem.ProcessProbe()
+        pid, h = voice_mem.weixin_main_process(probe=probe)
+        check("找得到进程 → 返回 (pid, handle)，契约不变",
+              pid == 4242 and h is not None, (pid, h))
+        check("……probe 记下「进程表里有」", probe.saw_any is True, probe.saw_any)
+        # 不带 probe 也必须照旧工作（老调用方 / 旧自测的调用形态）
+        pid2, h2 = voice_mem.weixin_main_process()
+        check("不传 probe → 行为不变（老调用方不受影响）",
+              pid2 == 4242 and h2 is not None, (pid2, h2))
+    finally:
+        (voice_mem._k32, voice_mem._has_weixin_dll,
+         voice_mem.available, voice_mem.weixin_main_process) = _saved
+
+
 def main():
     print("=" * 60)
     print("语音条逆向工具 voice_msg 回归自测（不联网、不需真实语音、不碰微信）")
@@ -550,6 +698,7 @@ def main():
         t8_scan_deadline()
         t9_frame_estimate_gate(tmp)
         t10_length_fingerprint(tmp)
+        t11_memory_access_message()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 60)

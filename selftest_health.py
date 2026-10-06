@@ -636,6 +636,105 @@ def test_cursor_stall():
     return ok
 
 
+def test_hook_db_dead():
+    """「hook 可达、但微信的库查不动」——触发保守、确诊靠探针、恢复也报（2026-10-06）。
+
+    现场：微信被压崩之后进程**没退**、30001 还应答、`IsLogin` 还报 1，但句柄表空、
+    核心库自崩溃那刻起再没被写过。三态登录探针把它判成「在线」⇒ 用户拿不到任何提示。
+    这一条钉的就是：这种状态**要主动喊**，而且**不能拿模糊信号乱喊**。
+    """
+    ok = True
+    print("\n── 「hook 可达但库查不动」：触发保守 + 权威探针 + 恢复也报 ──")
+
+    def _new(cfg=None):
+        n = FakeNotifier()
+        c = {"health": {"status_file": os.path.join(_tmpdir(), "dbdead.json")}}
+        c["health"].update(cfg or {})
+        return health.Health(c, notify_fn=n), n
+
+    # ① 只有「库很久没被写」——没人用微信时本来就是常态 ⇒ **绝不许探、绝不许报**
+    h, n = _new()
+    for _ in range(30):
+        h.note_round(False, db_age_sec=9999)
+    ok &= check("★ 只是「库很久没被写」（轮询健康）→ 不触发（2026-10-02 假警报的形状）",
+                h.hook_db_dead_due() is False)
+    ok &= check("这种状态不许出声", not n.calls)
+
+    # ② 只有「轮询不健康」——可能只是 hook 一时慢，库新鲜 ⇒ 也不触发
+    h, n = _new()
+    for _ in range(30):
+        h.note_round(True, db_age_sec=5)
+    ok &= check("★ 只是「轮询慢」（库新鲜）→ 不触发", h.hook_db_dead_due() is False)
+
+    # ③ 两条都成立 → 而且只在阈值之后（保守：10 轮 / 600 秒）
+    h, n = _new()
+    for _ in range(9):
+        h.note_round(True, db_age_sec=700)
+    ok &= check("第 9 轮还不够（阈值 10）", h.hook_db_dead_due() is False,
+                h.hook_stress_rounds)
+    h.note_round(True, db_age_sec=700)
+    ok &= check("★ 连续 10 轮不健康 + 库 700 秒没动 → 该去问了",
+                h.hook_db_dead_due() is True)
+    ok &= check("健康一轮立刻清零（恢复不拖泥带水）",
+                (h.note_round(False, db_age_sec=1), h.hook_stress_rounds == 0)[1])
+    ok &= check("拿不到库龄（None）→ 绝不当成「很旧」",
+                (h.note_round(True, db_age_sec=None),
+                 h.hook_db_dead_due() is False)[1])
+
+    # ④ 探针确诊 → 告警（文案要能照着做）、状态、计数、_healthy
+    h, n = _new()
+    for _ in range(10):
+        h.note_round(True, db_age_sec=900)
+    h.note_hook_db_probe(False, "查 session.db 回：get database handle which named session.db failed")
+    ok &= check("★ 确诊后弹通知", len(n.calls) == 1, n.calls)
+    # 通知回调有 (title, text) 和 (text, title) 两种签名，这里只看「内容在不在」
+    text = " ".join(str(x) for x in n.calls[0]) if n.calls else ""
+    ok &= check("★ 告警说清「做什么」（重启微信 + 扫码）",
+                "退出微信" in text and "扫码" in text, text[:80])
+    ok &= check("★ 告警说清「不用做什么」（助手不用动）", "助手不用动" in text)
+    ok &= check("★ 告警点明 IsLogin 会骗人", "IsLogin" in text)
+    ok &= check("确诊后 db_dead=True 且不再重复探", h.db_dead is True
+                and h.hook_db_dead_due() is False)
+    ok &= check("确诊算「不健康」（状态页看得见）", h._healthy() is False)
+    snap = h.snapshot()
+    for k in ("db_dead", "db_dead_count", "db_dead_at", "db_age_seconds",
+              "hook_stress_rounds", "db_recovered_count", "db_stale_limit",
+              "hook_stress_limit"):
+        ok &= check(f"快照里有 {k}", k in snap)
+
+    # ⑤ 同类告警冷却期内不重复弹
+    h.note_hook_db_probe(False, "还是查不动")
+    ok &= check("★ 冷却期内不重复打扰（但计数照记）",
+                len(n.calls) == 1 and h.db_dead_count == 2, len(n.calls))
+
+    # ⑥ 探针「连不上」= 不结论（那条路归登录探针）
+    h, n = _new()
+    for _ in range(12):
+        h.note_round(True, db_age_sec=900)
+    got = h.note_hook_db_probe(None, "连不上 hook（归登录探针管）")
+    ok &= check("★ 连不上 hook → 不下结论、不弹窗、不算库死",
+                got == "" and h.db_dead is False and not n.calls, (got, len(n.calls)))
+
+    # ⑦ 恢复：轮询正常 + 探针说能查 → 报一句「过去了」
+    h, n = _new()
+    for _ in range(10):
+        h.note_round(True, db_age_sec=900)
+    h.note_hook_db_probe(False, "查不动")
+    ok &= check("先确诊（1 条告警）", len(n.calls) == 1)
+    h.note_round(False, db_age_sec=1)
+    h.db_probed_at -= 400        # 探针之间本来就有最小间隔（那 5 分钟里微信早该恢复了）
+    ok &= check("★ 轮询恢复 → 该去问一次探针确认", h.hook_db_recovered_due() is True)
+    got = h.note_hook_db_probe(True, "session.db 可查（0.04 秒）")
+    ok &= check("★ 探针确认恢复 → 报一句", got == "recovered" and len(n.calls) == 2, n.calls)
+    ok &= check("恢复不再算「不健康」", h._healthy() is not False, h._healthy())
+    ok &= check("恢复计数 +1", h.db_recovered_count == 1)
+    rtext = " ".join(str(x) for x in n.calls[1]) if len(n.calls) > 1 else ""
+    ok &= check("恢复文案说的是「过去了」", "过去" in rtext, rtext[:60])
+    ok &= check("恢复后不再重复探（等下一次触发）",
+                h.hook_db_recovered_due() is False and h.hook_db_dead_due() is False)
+    return ok
+
+
 def main():
     ok = True
     print("=" * 50)
@@ -646,6 +745,7 @@ def main():
     ok &= test_snapshot_minimal()
     ok &= test_note_poll_shape()
     ok &= test_cursor_stall()
+    ok &= test_hook_db_dead()
     ok &= test_notes_and_status_file()
     ok &= test_status_page()
     print("\n" + "=" * 50)

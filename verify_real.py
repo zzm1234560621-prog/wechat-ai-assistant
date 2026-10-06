@@ -30,6 +30,12 @@ if HERE not in sys.path:
 BOT_INSTANCE_PORT = 39001        # 和 bot.py 的单实例锁同一个端口
 QUERY_BUDGET_NOTE = []
 
+# 「我是谁」的解析**唯一所有者在 aixed_api**：自检和 bot 必须走同一条路
+# （见下面 resolve_self_wxid 的说明）。这里只是把它引进来，别名带下划线
+# 是为了不和下面那个同名包装函数撞名。
+from aixed_api import resolve_self_wxid as _resolve_self_wxid      # noqa: E402
+import aixed_api                                                   # noqa: E402
+
 _OK = 0
 _BAD = 0
 _WARN = 0
@@ -71,6 +77,17 @@ def bot_is_running():
         return True
 
 
+def resolve_self_wxid(cfg, client, backend):
+    """自己的 wxid → `(wxid, 来源说明, 这次查了几次库, 说明/告警)`。
+
+    ⚠️ **实现就在 `aixed_api`**（唯一所有者）：自检和 bot 必须走**同一条路**，否则会出现
+    「自检说不健康、而 bot 其实跑得好好的」——那会把换台电脑的人指去手填一个本可以自动
+    拿到的值。以前这里抄了一份，2026-10-06 换台电脑真机后收敛成一份（那次就是这条路
+    认错了人：见 `aixed_api.resolve_self_wxid` 的注释）。
+    """
+    return _resolve_self_wxid(cfg, client, backend)
+
+
 def main():
     print("=" * 66)
     print("真机自检（只读；请先停掉 bot）")
@@ -99,7 +116,7 @@ def main():
         line("warn", f"后端是 {backend}，本脚本只对 aixed 主线做完整检查")
         return _summary()
 
-    from aixed_api import AixedClient, AixedError           # noqa: E402
+    from aixed_api import AixedClient, AixedError            # noqa: E402
     client = AixedClient(base)
     t0 = time.time()
     try:
@@ -128,18 +145,30 @@ def main():
 
     # ---------- 2. 库结构 / 游标 / 分片 ----------
     sec("2. 库结构与轮询游标（这一步会发几次查库）")
-    wxid = str(cfg.get("self_wxid") or "")
-    if not wxid:
-        try:
-            wxid = client.get_self_wxid() or ""
-        except Exception:
-            wxid = ""
-        QUERY_BUDGET_NOTE.append("get_self_wxid")
+    wxid, wxid_from, wxid_used, wxid_note = resolve_self_wxid(cfg, client, backend)
+    QUERY_BUDGET_NOTE.extend(wxid_used)
     if wxid:
         live_history.set_self_wxid(wxid)
-        line("ok", f"自己的 wxid 拿到了：{wxid[:6]}…（判「哪条是我发的」要用它）")
+        if "contact 表" in wxid_from:
+            line("warn", f"自己的 wxid 是从 contact 表里认出来的：{wxid}"
+                         f"（能跑，但建议写进 config.yaml 的 self_wxid，免得每次靠认）")
+        else:
+            line("ok", f"自己的 wxid 拿到了（来源：{wxid_from}）：{wxid[:6]}…"
+                       f"（判「哪条是我发的」要用它）")
+        if wxid_note:
+            line("warn", wxid_note)
     else:
-        line("bad", "拿不到自己的 wxid —— 历史里将分不清「我」和「对方」；请在 config.yaml 填 self_wxid")
+        line("bad", "拿不到自己的 wxid —— 历史里将分不清「我」和「对方」；"
+                    "请在 config.yaml 填 self_wxid（库里也认不出来）")
+        if wxid_note:
+            line("warn", wxid_note)
+        try:
+            _cands = aixed_api.account_dir_wxids()
+        except Exception:
+            _cands = []
+        if _cands:
+            line("warn", "本机微信账号目录里有：" + "、".join(_cands)
+                         + "（用 find_self_wxid.py --apply 填对的那个）")
 
     try:
         v4 = live_history.is_wechat4(client)

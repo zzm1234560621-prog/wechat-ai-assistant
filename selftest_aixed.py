@@ -929,6 +929,112 @@ def main():
                 live_history.MSGDBS_RESCAN_INTERVAL >= 10 * live_history.RESCAN_MIN_INTERVAL,
                 (live_history.MSGDBS_RESCAN_INTERVAL, live_history.RESCAN_MIN_INTERVAL))
 
+    print("\n── 自己的 wxid：接口给不出时从库里认（2026-10-05 部署真机的回归）──")
+    # 事故：`/GetSelfProfile` 这个构建**不给 wxid**，而打开包的 config.yaml 里
+    # `self_wxid` 只有注释没有值 —— 别的电脑装完就露空，且**不报错**。
+    # 判据是「contact 表里第一个 wxid_ 开头的会话行」（filehelper / @chatroom 排在后面）。
+    class _SelfStub(aixed_api.AixedClient):
+        """假客户端：**继承真 AixedClient**，这样测的是线上那条方法（不是抄一份）。"""
+
+        def __init__(self, rows):
+            super().__init__("http://127.0.0.1:1")   # 不会真发请求：下面盖掉了 query_sql
+            self.rows = rows
+            self.sqls = []
+
+        def query_sql(self, db, sql, timeout=None):
+            self.sqls.append((db, sql))
+            return self.rows
+
+    _st = _SelfStub([{"username": "wxid_a1b2c3d4e5f6g7"}])
+    ok &= check("★ 库里认得自己的 wxid", _st.detect_self_wxid() == "wxid_a1b2c3d4e5f6g7",
+                _st.detect_self_wxid())
+    _sql = _st.sqls[-1][1] if _st.sqls else ""
+    ok &= check("★ 只认 wxid_ 开头且不含 @ 的行（filehelper/@chatroom 不能当自己）",
+                "ESCAPE" in _sql and "NOT LIKE '%@%'" in _sql and "FROM contact" in _sql, _sql)
+    ok &= check("★ 认的时候只查 contact.db", _st.sqls[-1][0] == "contact.db", _st.sqls[-1][0])
+    ok &= check("真返回里夹着坏值时也不乱拿",
+                _SelfStub([{"username": "filehelper"},
+                           {"username": "wxid_aaaaaaaaaaaa"},
+                           {"username": "99999@chatroom"}]).detect_self_wxid()
+                == "wxid_aaaaaaaaaaaa",
+                _SelfStub([{"username": "filehelper"},
+                           {"username": "wxid_aaaaaaaaaaaa"}]).detect_self_wxid())
+    ok &= check("查不动就如实给空串（绝不猜一个 id 出来）",
+                _SelfStub([]).detect_self_wxid() == "", "空")
+    ok &= check("模块级入口在假客户端上安全（没有这个方法也不炸）",
+                aixed_api.detect_self_wxid(object()) == "", "object()")
+
+    print("\n── 「我是谁」要认得出，而且**认错必须被否掉**（2026-10-06 第二次换台电脑真机的回归）──")
+    # 事故：四级里 contact 表那条判据是**行序经验**。部署机上它认出了 `wxid_q73…`，
+    # 而消息里的 sender_id 不是它 ⇒ `is_self` 恒为 0 ⇒ bot 把「自己刚发出去的回复」
+    # 当成对方的新消息、自己答自己（用户看到「重复回复」），全程不报错。
+    # 修法：拿**本机账号目录**（离线、确定，微信自己写的目录名）核实这个值，对不上就否掉。
+    _saved_dirs = aixed_api.account_dir_wxids
+
+    class _GuessClient(aixed_api.AixedClient):
+        """假客户端：hook 给不出 wxid，contact 表「认」出 `wxid_fromdb`。"""
+
+        def __init__(self):
+            super().__init__("http://127.0.0.1:1")
+            self.sqls = []
+
+        def get_self_wxid(self):
+            return ""
+
+        def query_sql(self, db, sql, timeout=None):
+            self.sqls.append(db)
+            return [{"username": "wxid_fromdb"}]
+
+    try:
+        aixed_api.account_dir_wxids = lambda: ["wxid_onlyone123"]
+        _gc = _GuessClient()
+        _r = aixed_api.resolve_self_wxid({}, _gc, "aixed")
+        ok &= check("★ 只有一个账号目录时直接用目录名（离线判据，**一个库都不查**）",
+                    _r[0] == "wxid_onlyone123" and "账号目录" in _r[1] and _gc.sqls == [],
+                    (_r, _gc.sqls))
+
+        aixed_api.account_dir_wxids = lambda: ["wxid_aaaa1111bbbb", "wxid_cccc2222dddd"]
+        _r = aixed_api.resolve_self_wxid({}, _GuessClient(), "aixed")
+        ok &= check("★ contact 表猜出来的人**不在本机登录过的账号里** → 否掉、如实说认不出",
+                    _r[0] == "" and "wxid_fromdb" in _r[3] and "否掉" in _r[3], _r)
+
+        aixed_api.account_dir_wxids = lambda: ["wxid_fromdb", "wxid_cccc2222dddd"]
+        _r = aixed_api.resolve_self_wxid({}, _GuessClient(), "aixed")
+        ok &= check("★ 猜测与账号目录对得上 → 采用，并标明「已核实」",
+                    _r[0] == "wxid_fromdb" and "已核实" in _r[1], _r)
+
+        aixed_api.account_dir_wxids = lambda: []
+        _r = aixed_api.resolve_self_wxid({}, _GuessClient(), "aixed")
+        ok &= check("★ 找不到账号目录时照旧兜底，但**如实标注「未核实」**（不许假装核实过）",
+                    bool(_r[0] == "wxid_fromdb" and "未核实" in _r[1] and _r[3]), _r)
+
+        aixed_api.account_dir_wxids = lambda: ["wxid_fromdb"]
+        _r = aixed_api.resolve_self_wxid({"self_wxid": "wxid_fromcfg"}, _GuessClient(), "aixed")
+        ok &= check("① 配置里填了就用配置（手填的最高优先，不受核实影响）",
+                    _r[0] == "wxid_fromcfg" and _r[1] == "config.yaml", _r)
+    finally:
+        aixed_api.account_dir_wxids = _saved_dirs
+
+    ok &= check("account_dir_wxids() 真的能报出本机账号目录（部署机靠它核实）",
+                isinstance(aixed_api.account_dir_wxids(), list), aixed_api.account_dir_wxids())
+
+    # fail-safe 的开关：**只读上次观察、不查库**（观测点在 _v4_new_messages 里，零额外请求）
+    _save_wxid, _save_ok = live_history._SELF_WXID, live_history._SELF_ID_OK
+    try:
+        live_history._SELF_WXID, live_history._SELF_ID_OK = "", True
+        ok &= check("★ 没有自己的 wxid → self_identity_ok() 为假（兜底闸门要打开）",
+                    live_history.self_identity_ok() is False)
+        live_history._SELF_WXID, live_history._SELF_ID_OK = "wxid_me", None
+        ok &= check("有 wxid、还没观察过 → 不算「认不出」（正常机器不受影响）",
+                    live_history.self_identity_ok() is True)
+        live_history._SELF_WXID, live_history._SELF_ID_OK = "wxid_me", True
+        ok &= check("观察过、查得到 → 认得出来", live_history.self_identity_ok() is True)
+        live_history._SELF_WXID, live_history._SELF_ID_OK = "wxid_me", False
+        ok &= check("★ 观察过、查不到（值在消息 id 空间里根本不存在）→ 认不出，兜底生效",
+                    live_history.self_identity_ok() is False)
+    finally:
+        live_history._SELF_WXID, live_history._SELF_ID_OK = _save_wxid, _save_ok
+
     class _DownClient:
         def __init__(self):
             self.queries = 0

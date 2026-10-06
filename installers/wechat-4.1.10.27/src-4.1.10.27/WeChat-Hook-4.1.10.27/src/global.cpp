@@ -14,6 +14,10 @@ HMODULE g_hWeixinDll = nullptr;
 HMODULE g_hWeixinExe = nullptr;
 HWND    g_WeixinMainHwnd = nullptr;
 volatile uint64_t g_IsLogin = 0;
+// db 层门禁：只有就绪判据线程「验过句柄真能查」之后才置 1（见 inline_weixin_dll_load.cpp）。
+volatile uint64_t g_DbLayerReady = 0;
+// 句柄表扫描许可：判据线程起来后就置 1。**与门禁分开**，否则判据自己会被门禁挡住（循环依赖）。
+volatile uint64_t g_HandleScanAllowed = 0;
 volatile uint64_t g_getprofile = 0;
 CRITICAL_SECTION g_dbMgrCriticalSection;
 

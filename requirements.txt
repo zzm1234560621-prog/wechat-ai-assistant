@@ -37,6 +37,15 @@ PyYAML>=6.0
 # 读微信里收到的 PDF 用（find_files / read_file）。纯 Python、无编译依赖，
 # 不和上面几家打架。docx/xlsx/pptx 不用库——都是 zip+xml，标准库就能扒。
 pypdf>=4.0
+# ⚠️ **zstandard 是核心依赖，不是可选项**（2026-10-06 第二台部署机真机）：
+#    微信 4.x 把一部分 `Msg_` 的 `message_content` **用 zstd 压缩**存（长文本、appmsg、
+#    **语音条的 XML** 都是）。`live_history.decode_msg_content()` 靠它解；缺了会**静默**
+#    解成空串 —— 表现是「短消息一切正常，只有语音答不上来」：
+#    `voice_info()` 拿不到 `voicelength` → 「拿不到这条语音的时长，认不出是哪一段」。
+#    以前它只写在 .venv 里（手工装的，`pip show zstandard` 的 Required-by 是空的），
+#    没进这份清单 ⇒ 换台电脑就缺 ⇒ 又是「开发机上好用、发布包里静默失效」那一类。
+#    它很小（纯 wheel），把它写进这里，installer / 启动自检 / 一键部署 就都会带上。
+zstandard>=0.22
 
 # --- 可选：不随主程序安装 ----------------------------------------------------
 # ⚠️ 这一段里的包**必须写成注释**，不许写成正式需求行。原因：`envsetup.requirements_specs()`

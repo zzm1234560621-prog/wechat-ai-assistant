@@ -63,6 +63,17 @@ class AixedError(RuntimeError):
     """连不上服务或服务返回了错误。"""
 
 
+class AixedUnreachable(AixedError):
+    """**根本没连上** hook（进程没了 / 端口不通 / 卡到不接连接）。
+
+    为什么要单独一个类型（2026-10-06）：这两种失败在处置上**完全不同** ——
+    「连不上」归登录探针（微信没了就该叫用户重启），而「连上了、但它回『库查不动』」
+    才是「hook 可达、库层已死」。拿一个通用异常 + 去 grep 文案区分是判据散落，
+    所以在唯一知道这个区别的地方（`_http` 的 except 分支）把它类型化。
+    ⚠️ 它**是** `AixedError` 的子类：现有 `except AixedError` 的地方行为一个字不变。
+    """
+
+
 def _as_int(v):
     try:
         return int(v or 0)
@@ -111,6 +122,109 @@ class Msg:
         return bool(self.is_self)
 
 
+def detect_self_wxid(client):
+    """任意 aixed 后端客户端 → 自己的 wxid（认不出给空串）。
+
+    模块级入口，给 `bot.py` 启动那一段用：**配置没有、接口也给不出来时才走它**。
+    `getattr` 是因为自测里那些假客户端只认 `query_sql(db, sql)`；不支持就返回空串，
+    这里**不吞真异常**（认不出自己本来就是「如实说不知道」那一类，不拦截别的问题）。
+    """
+    fn = getattr(client, "detect_self_wxid", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn() or "")
+    except Exception:
+        return ""
+
+
+def account_dir_wxids():
+    """本机微信**登录过的账号目录**里的 wxid（离线，不碰 hook；认不出给空列表）。
+
+    微信 4.x 的账号目录名就是 `<wxid>_<数字后缀>`（`D:\\wechat\\xwechat_files\\wxid_xxx_2895`），
+    目录名是微信自己写的、跟登录态绑定 —— 这是本项目里唯一一条**确定**的「本机有谁登录过」
+    的判据，`find_self_wxid.py` 一直用它。这里把它接进「我是谁」那条链，
+    用来**核实**下面那条经验判据（见 `resolve_self_wxid`）。
+
+    ⚠️ 它列出的是「这台机器登录过的账号」，**不保证只有一个**（同一个人有两台号、或
+    别人在这台机器上登录过）。多个时**绝不替用户挑**——调用方要么不用、要么如实报出来。
+    """
+    try:
+        import find_self_wxid
+        found = find_self_wxid.find_self_wxid()      # [(wxid, 账号目录), ...]
+    except Exception:
+        return []
+    out = []
+    for item in found or []:
+        try:
+            w = str(item[0] or "")
+        except (TypeError, IndexError):
+            continue
+        if w and w not in out:
+            out.append(w)
+    return out
+
+
+def resolve_self_wxid(cfg, client, backend):
+    """「我是谁」的**唯一**解析入口 → `(wxid, 来源说明, 这次查了什么, 说明/告警)`。
+
+    四级（顺序就是优先级）：
+      ① `config.yaml` 的 `self_wxid` —— 用户手填，最高，**不查任何库**；
+      ② hook 的 `/GetSelfProfile`（`client.get_self_wxid()`；**有的构建不给 wxid**）；
+      ③ 本机微信**账号目录名**（`account_dir_wxids()`，离线确定；只有一个账号时才敢直接用）；
+      ④ 从本地 `contact` 表认（`detect_self_wxid`）—— **必须与 ③ 对得上才敢用**。
+
+    **为什么 ④ 必须被核实**（2026-10-06 第二次换台电脑真机）：④ 的判据是「contact 表里
+    第一个 `wxid_` 开头的行」，那是从**一台机器**上观察到的**行序**，不是证明。那台机器上
+    它认出了 `wxid_q73…`，但消息里的 `sender_id` 根本不是它 ⇒ `is_self` 恒为 0 ⇒ bot 把
+    「自己刚发出去的回复」当成对方的新消息，一遍遍自己答自己（用户看到的就是「重复回复」），
+    而且**全程不报错**。认错比认不出更糟：认错等于拿别人的身份说话（不跳过自己、
+    历史里把别人当我、还可能拿别人的号发消息）。所以对不上就**否掉**、如实说「认不出」。
+
+    4 元组的第 4 项是给用户看的说明（正常时是 `""`）：bot 启动和 `verify_real.py`
+    都把它打出来，**不许静默**。`wxid` 为空而第 4 项非空 = 「本来猜了一个、被我否掉了」。
+    """
+    wxid = str((cfg or {}).get("self_wxid") or "")
+    if wxid:
+        return wxid, "config.yaml", [], ""
+
+    used = []
+    try:
+        wxid = client.get_self_wxid() or ""
+    except Exception:
+        wxid = ""
+    used.append("get_self_wxid")
+    if wxid:
+        return wxid, "hook 接口", used, ""
+
+    if backend != "aixed":
+        # wcferry/3.9.x 那条路没有这套「从库里认」的判据（见 bot.py 的 connect_wcferry）。
+        return "", "", used, ""
+
+    dirs = account_dir_wxids()               # ③ 离线、确定（不查库）
+    used.append("account_dir_wxids")
+    if len(dirs) == 1:
+        return dirs[0], "账号目录（离线判据）", used, ""
+
+    guess = detect_self_wxid(client)          # ④ 经验判据（要核实）
+    used.append("detect_self_wxid")
+    if not guess:
+        return "", "", used, ""
+
+    if not dirs:
+        # 找不到微信账号目录 ⇒ 没法核实。保留原有兜底行为，但如实标注「没核实过」。
+        return guess, "contact 表（自动认的·未核实）", used, \
+            "本机找不到微信账号目录，这个值是猜的、没能核实（建议写进 config.yaml 的 self_wxid）"
+
+    if guess in dirs:
+        return guess, "contact 表（自动认的·已核实）", used, ""
+
+    return "", "", used, (
+        "contact 表猜出来的「%s」**不在本机登录过的账号里**（%s），已否掉："
+        "认错人比认不出更糟（认错会拿别人的身份说话）"
+        % (guess, "、".join(dirs)))
+
+
 class AixedClient:
     # 允许调用方**按次**覆盖超时（`query_sql(db, sql, timeout=...)`）。live_history 用它
     # 给轮询里的查询压短超时：hook 偶尔会卡住，而 15 秒 × 一轮六七个查询 = 一轮一分多钟，
@@ -141,7 +255,7 @@ class AixedClient:
                 pass
             raise AixedError(f"{path} 返回 HTTP {e.code}：{detail}") from e
         except (urllib.error.URLError, OSError) as e:
-            raise AixedError(
+            raise AixedUnreachable(
                 f"连不上 {url}（{e}）。确认微信已启动、version.dll 已加载、端口配对。"
             ) from e
         if not body.strip():
@@ -377,6 +491,47 @@ class AixedClient:
             return False, ("hook 在、微信也显示已登录（IsLogin=1），但数据库句柄打不开"
                            "——掉登录再登录后常见，重扫一次通常就修好")
         return False, "hook 已加载，但数据库打不开（微信没登录？请在微信里扫码登录）"
+
+    # ---------- 自己的 wxid：接口给不出来时，从库里认 ----------
+
+    def detect_self_wxid(self):
+        """拿不到自己的 wxid 时，从 SQLite 里把「自己」认出来。
+
+        **为什么必须补这一条**（2026-10-05 部署真机）：`get_self_wxid()` 走的是
+        `/GetSelfProfile`，而这个构建里那个接口**不给 wxid**，返回里没有
+        `wxid`/`userName` 任何一个键 → 拿到空串。于是别的电脑上装完就露出一串后果：
+        `resolve_contacts(..., "我自己")` 认不出自己、群发时不跳过自己、
+        历史里分不清「我」和「对方」；而打开包的 `config.yaml` **本来就没填 `self_wxid`**
+        （只有开发机那份填了）——纯换台机器就命中，不报错、只是功能歪。
+
+        判据（微信 4.x 真机取证）：自己的账号在 `contact` 表里是 **第一个
+        `wxid_` 开头**的会话行，`filehelper` 与 `@chatroom` 排在它后面，
+        `@openim`（企业微信）也带着 `wxid_`；**行序不稳定**，所以只钉这条判据、
+        不依赖顺序。
+
+        拿不到就如实返回空串（`""` 表示「这次没认出来」，调用方照旧走原有兜底），
+        **绝不猜一个 id 出来**——猜错等于把别人的 wxid 当自己，比认不出更糟。
+
+        ⚠️ **这条判据是经验（行序），不是证明**：调用方（`bot` / `verify_real`）
+        必须走 `resolve_self_wxid()`，它会拿本机**账号目录**核实这个值，
+        对不上就否掉。2026-10-06 换台电脑真机上它就是认错了人，而且不报错，
+        后果是 bot 自己回答自己刚发出的回复（见 `resolve_self_wxid` 的注释）。
+        """
+        try:
+            rows = self.query_sql(
+                "contact.db",
+                "SELECT username FROM contact "
+                "WHERE username LIKE 'wxid\\_%' ESCAPE '\\' "
+                "AND username NOT LIKE '%@%' LIMIT 1")
+        except Exception:
+            return ""
+        for r in self._rows(rows):
+            v = r.get("username") if isinstance(r, dict) else (
+                r[0] if isinstance(r, (list, tuple)) and r else None)
+            v = str(v or "").strip()
+            if v and v.startswith("wxid_") and "@" not in v:
+                return v
+        return ""
 
     # ---------- 轮询收消息（这套接口没有收消息回调） ----------
     # 「怎么按微信版本取消息」的 schema 知识放在 live_history 里，这里只做委托与适配。

@@ -452,7 +452,12 @@ def t_poll_failure_throttled(tmp):
         bot.STATE_PATH = os.path.join(tmp, "state.json")
         bot._STATE = None
         c = _BoomThenMsg(fails=300)
-        src = bot.iter_aixed_messages(c, 0.001, tick=None)
+        # ⚠️ 必须显式关掉 `poll_ramp`：不传 cfg 时它是**默认开启**的（起步阶段每轮静置
+        # 30 秒），这个用例要跑 300 轮，于是整个套件会在这里卡一个多小时（真事：
+        # 2026-10-05 加了 _ramp_sleep 之后它就一直没跑完，而「全量自测全绿」是那之前
+        # 记的）。这条用例测的是**失败节流**，与轮询节奏无关，所以关掉节奏闸。
+        src = bot.iter_aixed_messages(c, 0.001, tick=None,
+                                      cfg={"poll_ramp": {"enabled": False}})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             got = next(src).n          # 300 次失败之后才拿到这条
@@ -1526,6 +1531,60 @@ def t_from_self_reaches_toolbox():
         plugins.REGISTRY.rollback_source("_selftest_bot_loop")
 
 
+def t_own_echo_without_identity():
+    """认不出自己时，「我刚发出去的那句话」也必须被认掉（2026-10-06 换台电脑真机的回归）。
+
+    ## 事故现场
+
+    另一台电脑上 bot 反复「重复回复」：日志里 `[bot] 收到 filehelper: 配置已记下：…`
+    ——**收到的正是它自己上一条回复**，然后它又答了一遍。根因是「我是谁」认错了人
+    （contact 表那条行序判据，见 `aixed_api.resolve_self_wxid`），于是 `is_self` 恒为 0，
+    而 `is_own_reply()` 那道闸**嵌在 `if msg.from_self():` 里面**，压根不会被问到。
+
+    ## 这一条钉什么
+
+    * 事实分开：`from_self`（谁发的）与 `identity_ok`（认不认得自己）是**两个**事实，
+      后者为假时前者不可信 —— 这种情况下「文本一字不差、就在刚才」必须单独生效；
+    * **只在认不出自己时**兜底：正常机器（`identity_ok=True`）一个字都不变，
+      否则「对方恰好说了和我们上一条回复一样的话」会被静默丢掉；
+    * 主循环真的接了这条（源码级钉子：判据本体被测到了，接线也要在）。
+    """
+    sec("认不出自己时，自己的回显也要被认掉（与身份无关的兜底闸门）")
+    # ⚠️ **必须换掉 `STATE_PATH`**：`remember_sent()` 从 2026-10-06 起会把「我发过的话」
+    # 落盘，照真实路径跑就会改写用户**现有**的 `data/state.json`（里面是真游标和待确认
+    # 队列，不是测试夹具）—— 和 `t_clear_command` 换 `DIALOG_PATH` 同一条规矩。
+    tmp = tempfile.mkdtemp(prefix="bot_loop_echo_")
+    old_path, old_state = bot.STATE_PATH, bot._STATE
+    try:
+        bot.STATE_PATH = os.path.join(tmp, "state.json")
+        bot._STATE = None
+        bot.remember_sent("这条是助手刚发出去的话")
+        chk(bot.looks_like_own_echo_without_identity(False, False, "这条是助手刚发出去的话")
+            is True,
+            "★ 认不出自己 + 文本就是我刚发的 → 跳过（不再自己答自己）")
+        chk(bot.looks_like_own_echo_without_identity(True, False, "这条是助手刚发出去的话")
+            is False,
+            "自己发的消息走上面那条路（from_self 分支自己管，这里不重复拦）")
+        chk(bot.looks_like_own_echo_without_identity(False, True, "这条是助手刚发出去的话")
+            is False,
+            "★ 认得自己时**不拦**（正常机器行为一个字不变）")
+        chk(bot.looks_like_own_echo_without_identity(False, False, "一句我没发过的话") is False,
+            "没发过的话照样往下走（只认「刚发过」的原文，不猜）")
+        chk(bot.looks_like_own_echo_without_identity(False, False, "") is False,
+            "空文本不拦（不许把空消息当回显）")
+        src = inspect.getsource(bot.main)
+        chk("looks_like_own_echo_without_identity(" in src
+            and "self_identity_ok()" in src,
+            "★ 主循环真的接了这条闸门（判据本体在函数里，接线也得在）")
+        chk(src.index("looks_like_own_echo_without_identity(")
+            < src.index("if msg.from_self():"),
+            "★ 位置在 `if msg.from_self():` **之前**（嵌在里面就等于没接）")
+    finally:
+        bot.STATE_PATH, bot._STATE = old_path, old_state
+        bot._SENT_RECENT.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_help_matches_reality():
     """`/help` 里写的每个命令都必须**真的能发** —— 文档不许写没实现的东西。
 
@@ -1701,6 +1760,33 @@ def t_round_pacing():
         "读不出来 → 回默认 1（不静默变成 0=关）")
 
 
+def t_poll_ramp():
+    sec("起步冷却：连上微信后先静置、再逐步加快（2026-10-05 真机：崩溃都贴着登录窗口）")
+    cfg = {"poll_ramp": {"enabled": True, "early_sec": 300, "early_interval": 30,
+                         "mid_sec": 600, "mid_interval": 10, "final_sec": 600}}
+    iv, mr = 5, 1
+    # t0 = 0，用 now 参数注入时刻（纯函数，不睡真的）
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, cfg, now=0) == 30,
+        "第 0 秒：每轮睡 early_interval")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, cfg, now=299) == 30,
+        "前 5 分钟内一直是慢挡")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, cfg, now=300) == 10,
+        "过了 early_sec → 换中挡")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, cfg, now=900) == iv + 5,
+        "过了 early+mid → 接近正常间隔（+5 秒缓冲）")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, cfg, now=1500) == iv,
+        "★ 三段都过完 → 完全回到 poll_interval（不会永久变慢）")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, {"poll_ramp": {"enabled": False}}) == iv,
+        "★ enabled: false → 行为与旧版一致（可回退）")
+    chk(bot._ramp_sleep(False, 0.1, iv, mr, 0, {}) == iv,
+        "★ 完全没有 poll_ramp 段 → 也按旧版走（老配置文件不会变慢）")
+    # 有消息时不许因为冷却而比 min_round 更慢的规矩被破坏
+    chk(abs(bot._ramp_sleep(True, 0.2, iv, mr, 0, cfg, now=0) - 30) < 1e-9,
+        "冷却期内有消息：仍按慢挡（这正是要压住窗口的地方）")
+    chk(abs(bot._ramp_sleep(True, 0.2, iv, mr, 0, cfg, now=1500) - 0.8) < 1e-9,
+        "冷却结束后有消息：回到 min_round 补时（与 _round_sleep 同规矩）")
+
+
 def t_offtarget_note():
     sec("丢消息要留痕：只有「拿不到会话名」的那类才算故障（2026-10-05）")
     bot._OFFTARGET_N[0] = 0
@@ -1725,6 +1811,272 @@ def t_max_catchup():
         "★ 读不出来 → 回默认阈值，而不是静默变成 0（那等于悄悄把闸关了）")
 
 
+def t_catchup():
+    """「重启补齐」= 早于本进程启动，**不看消息有多旧**（2026-10-06 事故三的回归）。
+
+    ## 事故现场
+
+    换个电脑一登录，助手把自己上一轮刚发出去的问候 / 失败提示当成用户的新提问，一条条再答
+    一遍（用户原话：「把所有问题又回了一遍」）。根因之一就是这条判据以前还要求
+    「比 `state.stale_after`（120 秒）还旧」—— 于是**启动前 2 分钟内**产生的东西
+    （自己刚发的回复、换台电脑时同步进来的历史）被当成新消息照回。
+    证据与完整链路见 `docs/restart-catchup-notes.md`。
+
+    ## 这一条钉什么
+
+    * 判据**只有**「早于本进程启动」：启动前 10 秒和启动前 10 小时一个待遇；
+    * 两个边界不许丢：时间戳取不到 / 落在未来 → **不算补齐**（宁可多处理一条，
+      也不许因为读不到时间戳就把一条真·新消息静默丢掉）；
+    * 旋钮退休了：`state.stale_after` 不许再出现在代码与两份 config 里
+      （留着一个「配了不生效」的键比删掉更坏），想「完全不续」用 `resume_window: 0`；
+    * 主循环真的接了这条（判据本体被测到了，接线也要在）。
+    """
+    sec("重启补齐 = 早于本进程启动（不看年龄）（2026-10-06 事故三）")
+    now = 1_791_260_000.0
+    start = now - 60
+    chk(bot.is_catchup(start - 10, start, now) is True,
+        "★ 启动前 10 秒的消息也算补齐（旧判据会因为「不到 120 秒」把它当新消息照回）")
+    chk(bot.is_catchup(now - 3600, start, now) is True, "启动前一小时当然算补齐")
+    chk(bot.is_catchup(now - 10, start, now) is False,
+        "★ 启动**之后** 10 秒来的消息不算补齐（照常处理）")
+    chk(bot.is_catchup(now + 5, start, now) is False,
+        "★ 启动之后来的消息不是补齐（照常处理）")
+    chk(bot.is_catchup(0, start, now) is False,
+        "★ 时间戳取不到 → 不算补齐（宁可多处理一条，也不静默丢新消息）")
+    chk(bot.is_catchup("", start, now) is False, "空时间戳同上")
+    chk(bot.is_catchup(None, start, now) is False, "None 时间戳同上")
+    chk(bot.is_catchup(now + 3600, start, now) is False,
+        "★ 时间戳落在未来（时钟被拨过）→ 不算补齐，不许当旧消息丢掉")
+    chk(bot.is_catchup(now - 10, 0, now) is False,
+        "没给启动时刻 → 不拦（不知道就别当成旧消息）")
+    src = inspect.getsource(bot.main)
+    chk("is_catchup(" in src, "★ 主循环真的接了这条判据")
+    chk("stale_after" not in src, "★ 年龄门槛退休了（代码里不许再读它）")
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in ("config.example.yaml", "config.yaml"):
+        p = os.path.join(root, name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue                    # 本机 config.yaml 可能不在；包里的那份必须查
+        chk(re.search(r"^\s*stale_after\s*:", text, re.M) is None,
+            f"★ {name} 里不再有 stale_after 这个键（留个配了不生效的旋钮更坏）")
+
+
+def _db_dead_client(kind):
+    """假客户端：`alive` 能查 / `dead` 回「句柄拿不到」/ `unreachable` 连不上。"""
+    class _C:
+        def __init__(self):
+            self.calls = 0
+
+        def query_sql(self, db, sql):
+            self.calls += 1
+            if kind == "alive":
+                return [{"ok": 1}]
+            if kind == "dead":
+                raise aixed_api.AixedError(
+                    f"查库 {db} 失败：get database handle which named {db} failed")
+            raise aixed_api.AixedUnreachable("连不上 http://127.0.0.1:30001（连接被拒）")
+    return _C()
+
+
+def t_hook_db_dead(tmp):
+    """「hook 可达、但库查不动」的触发与三态（2026-10-06 真机缺口的回归）。
+
+    ## 事故现场
+
+    微信被压崩之后进程**没有退出**：30001 还应答、`IsLogin` 还报 1、`cycles` 还在涨，
+    但句柄表已经空（`handlesAlive = 0`）、`db_storage` 自崩溃那刻起再没被写过。
+    三态登录探针把它判成「在线」⇒ **用户拿不到任何提示**，只看到「它没反应」。
+
+    ## 这一条钉什么
+
+    * 触发**保守**：只有「连续 N 轮不健康」+「核心库 M 秒没被写」**同时**成立才去探库
+      （单独任何一条都会误报：前者可能只是 hook 慢，后者在没人用微信时是常态）；
+    * 探针**三态**：查不动 → 报（文案要能照着做）；能查 → 一个字都不说；
+      **连不上 → 不结论**（那条路归登录探针，别抢它的活）；
+    * 恢复走**同一条**探针确认，再报一句「过去了」；
+    * 主循环真的接了这条链（事实喂进去、判据与探针都挂在轮询循环里）。
+    """
+    sec("「hook 可达但库查不动」：触发 + 探针三态 + 恢复（2026-10-06）")
+    if bot.health is None:
+        chk(False, "health.py 应该能导进来")
+        return
+    notes = []
+    h = bot.health.Health({"health": {"status_file": os.path.join(tmp, "hookdb.json")}},
+                          notify_fn=lambda t, x: notes.append((t, x)) or True)
+
+    # ① 条件不成立时，**一个查询都不许发**（探针要碰句柄表，不能每轮问）
+    c = _db_dead_client("dead")
+    chk(bot.handle_hook_db_dead(h, c, {}) is None and c.calls == 0,
+        "★ 没到阈值 → 什么都不做、一次都不探")
+    for _ in range(10):
+        h.note_round(True, db_age_sec=900)
+    chk(h.hook_db_dead_due() is True, "两条都越线 → 该探了")
+
+    # ② 探针说「能查」→ 不下结论、不打扰
+    c2 = _db_dead_client("alive")
+    chk(bot.handle_hook_db_dead(h, c2, {}) is None and h.db_dead is False,
+        "★ 探针说能查 → 一个字都不说（不吓用户）")
+
+    # ③ 探针说「查不动」→ 报，且文案能照着做
+    #    （两次探针之间有最小间隔，现实里是「5 分钟后再问一次」——这里把它推过去）
+    h.db_probed_at -= 400
+    c3 = _db_dead_client("dead")
+    msg = bot.handle_hook_db_dead(h, c3, {})
+    chk(bool(msg) and "退出微信" in msg and "扫码" in msg,
+        f"★ 确诊 → 给出「重启微信 + 扫码」的可执行文案（实际：{(msg or '')[:50]}）")
+    chk("IsLogin" in (msg or ""), "★ 文案点明 IsLogin 会骗人")
+    chk(h.db_dead is True and len(notes) == 1,
+        f"确诊并弹了一次通知（实际 db_dead={h.db_dead}, 通知 {len(notes)} 条）")
+
+    # ④ 连不上 hook → **不结论**（登录探针的活，别抢）
+    h2 = bot.health.Health({"health": {"status_file": os.path.join(tmp, "hookdb2.json")}},
+                           notify_fn=lambda t, x: True)
+    for _ in range(10):
+        h2.note_round(True, db_age_sec=900)
+    c4 = _db_dead_client("unreachable")
+    chk(bot.handle_hook_db_dead(h2, c4, {}) is None and h2.db_dead is False,
+        "★ 连不上 hook → 不下结论（那条路归登录探针）")
+
+    # ⑤ 恢复：轮询正常 + 探针确认 → 报一句
+    h.note_round(False, db_age_sec=1)
+    h.db_probed_at -= 400        # 两次探针之间本来就有最小间隔（现实里那 5 分钟早过了）
+    chk(h.hook_db_recovered_due() is True, "轮询恢复 → 该去确认一次")
+    rmsg = bot.handle_hook_db_recovered(h, _db_dead_client("alive"), {})
+    chk(bool(rmsg) and "过去" in rmsg,
+        f"★ 恢复也报一句（不静默）（实际：{(rmsg or '')[:50]}）")
+    chk(h.db_dead is False and h.db_recovered_count == 1,
+        f"状态清账 + 计数（实际 db_dead={h.db_dead}, 恢复 {h.db_recovered_count}）")
+
+    # ⑥ 接线：事实喂进去、判据与探针都挂在**轮询循环**里（`iter_aixed_messages`，
+    #    不是 `main` —— 主循环只是消费它 yield 出来的消息）
+    src = inspect.getsource(bot.iter_aixed_messages)
+    chk("h.note_round(" in src, "★ 轮询循环每轮喂「健不健康 + 库龄」")
+    chk("hook_check.core_db_age_sec()" in src, "★ 库龄用的是唯一所有者（纯文件、不碰 hook）")
+    chk("handle_hook_db_dead(" in src and "handle_hook_db_recovered(" in src,
+        "★ 触发链真的接在轮询循环里")
+
+
+def t_sent_memory_durable(tmp):
+    """「我刚发出去的话」必须扛得住重启（2026-10-06 事故三的另一半）。
+
+    控制会话（文件传输助手）里，助手自己发的字和用户打的字在库里**都是 `from_self`**
+    （`respond_to_self: true`），所以 `_SENT_RECENT` / `is_own_reply()` 是**唯一**能区分
+    「自己的回显」和「用户新提问」的判据；它以前只在内存里，进程一重启就空 ——
+    上一轮刚发的问候被当成新消息再答一遍，就是用户看到的「重复回复」。
+
+    这里钉：落盘 → 「重启」（内存清空 + `load_sent_memory()`）→ 仍认得出；
+    **只存指纹不存原文**；过期的不恢复；过量的只留最近的；坏文件不挡住启动。
+    """
+    sec("「我刚发出去的话」扛得住重启（只存指纹、不存原文）")
+    old_path, old_state = bot.STATE_PATH, bot._STATE
+    old_recent = dict(bot._SENT_RECENT)
+    try:
+        bot.STATE_PATH = os.path.join(tmp, "sent_state.json")
+        bot._STATE = None
+        bot._SENT_RECENT.clear()
+        mine = "这条是助手刚发出去的回复（自测用）"
+        bot.remember_sent(mine)
+        chk(bot.is_own_reply(mine) is True, "刚发的 → 认得出")
+        with open(bot.STATE_PATH, encoding="utf-8") as f:
+            raw = f.read()
+        chk(mine not in raw and mine[:6] not in raw,
+            "★ 盘上只有指纹、连前几个字都没有（state.json 是会被翻开看的文件）")
+
+        # 模拟重启：内存清空，从盘读回
+        bot._SENT_RECENT.clear()
+        n = bot.load_sent_memory()
+        chk(n == 1, f"重启后读回 1 条（实际 {n}）")
+        chk(bot.is_own_reply(mine) is True,
+            "★ 重启后仍认得出自己的回显（这一条就是事故三的另一半）")
+        chk(bot.is_own_reply("用户新说的一句话") is False, "没发过的话照样往下走")
+
+        # 过期的不恢复（否则「对方恰好说了和我们旧回复一样的话」会被静默丢掉）
+        bot._SENT_RECENT.clear()
+        bot._STATE = {}
+        bot.state_set(bot._SENT_KEY, {bot._sent_fp(mine): time.time() - bot._SENT_TTL - 1})
+        chk(bot.load_sent_memory() == 0, "★ 过期的指纹不恢复")
+        chk(bot.is_own_reply(mine) is False, "过期之后不再认作自己的回显")
+
+        # 坏掉的状态文件不许挡住启动（和 state.json 那条同一个规矩）
+        bot._SENT_RECENT.clear()
+        bot._STATE = None
+        with open(bot.STATE_PATH, "w", encoding="utf-8") as f:
+            f.write("{ 这不是 json")
+        chk(bot.load_sent_memory() == 0, "坏文件 → 当空的，不抛异常")
+
+        # 过量：只留最近的 _SENT_MAX 条（state.json 不许无限长）
+        bot._SENT_RECENT.clear()
+        base = time.time()
+        for i in range(bot._SENT_MAX + 10):
+            bot._SENT_RECENT[bot._sent_fp(f"第{i}条")] = base + i
+        bot._sent_prune()
+        chk(len(bot._SENT_RECENT) == bot._SENT_MAX,
+            f"★ 只留最近 {bot._SENT_MAX} 条（实际 {len(bot._SENT_RECENT)}）")
+        chk(bot._sent_fp("同一条话").__len__() == 16, "指纹是定长 16 位（只存指纹的前提）")
+    finally:
+        bot.STATE_PATH, bot._STATE = old_path, old_state
+        bot._SENT_RECENT.clear()
+        bot._SENT_RECENT.update(old_recent)
+
+
+def t_poll_backoff():
+    """运行期让路：hook 卡了才放慢，正常路径**一个字节都不变**（2026-10-06 加）。
+
+    ## 为什么有它
+
+    10-06 13:37 那次崩溃前，日志是一串 **1.0~3.4 秒的空探测慢查询**
+    （`SELECT 1 FROM sqlite_master LIMIT 1` 打在 MSG0..MSG7 / contact 上），而「慢查询」
+    以前只打印、**没有任何消费者** —— 已经变慢的微信不会因此少挨查询。
+
+    ## 这一条钉什么
+
+    * **正常路径零变化**：不让路时 `next_interval(base)` 原样返回 base —— 这是它和
+      `poll_ramp` 的关键区别（那个是**每次启动**都慢 25 分钟，用户 10-05 否掉的就是它）；
+    * 进/出都有**滞回**（连续 3 轮不正常才进、连续 3 轮正常才出），坏一轮好一轮不许进
+      ——否则间隔会忽长忽短；
+    * `sleep_sec: 0` = 关掉；配置读不出来**回默认值，不许静默变成 0**（那等于悄悄关闸）；
+    * 主循环真的接了：事实算**一次**、同时喂给让路和 health，睡多久过 `next_interval`。
+    """
+    sec("运行期让路：hook 卡了才放慢，正常路径不变（2026-10-06）")
+    b = bot.StressBackoff()                       # 默认 3 轮 / 30 秒 / 3 轮
+    chk(b.next_interval(5) == 5.0, "★ 没让路时原样返回（正常路径零变化）")
+    chk(b.note_round(False) == "" and b.active is False, "正常轮：什么都不发生")
+    chk(b.note_round(True) == "" and b.active is False, "第 1 轮不正常：还没到阈值（防抖）")
+    b.note_round(True)
+    chk(b.note_round(True) == "enter" and b.active is True, "★ 连续 3 轮 → 进让路")
+    chk(b.next_interval(5) == 30.0, "★ 让路期间间隔 30 秒")
+    chk(b.next_interval(45) == 45.0, "让路只会**更慢**，不会把更长的间隔改短")
+    chk(b.note_round(False) == "" and b.active is True, "恢复也要滞回：正常 1 轮还不够")
+    b.note_round(False)
+    chk(b.note_round(False) == "exit" and b.active is False, "★ 连续 3 轮正常 → 出让路")
+    chk(b.next_interval(5) == 5.0, "出让路后立刻回到原节奏")
+    chk(b.max_stress_rounds == 3 and b.entered == 1, "诊断计数记下来了")
+
+    b2 = bot.StressBackoff()
+    for _ in range(6):
+        b2.note_round(True)
+        b2.note_round(False)
+    chk(b2.active is False, "★ 坏一轮好一轮 → 永远不进（滞回就是防这个）")
+
+    chk(bot._backoff_cfg({}) == (3.0, 30.0, 3.0), "缺省 3 / 30 / 3")
+    chk(bot._backoff_cfg({"poll_backoff": {"sleep_sec": 0}})[1] == 0.0, "0 = 关")
+    chk(bot.StressBackoff(3, 0, 3).enabled() is False
+        and bot.StressBackoff(3, 0, 3).note_round(True) == "",
+        "★ sleep_sec=0 → 整条关掉（一次都不进）")
+    chk(bot._backoff_cfg({"poll_backoff": {"sleep_sec": "abc"}})[1] == 30.0,
+        "★ 读不出来 → 回默认，不许静默变成 0（那等于悄悄关闸）")
+    chk(bot._slow_round_sec({}) == 3.0, "「慢」的阈值真源是 health.DEFAULTS（3 秒）")
+
+    src = inspect.getsource(bot.iter_aixed_messages)
+    chk("backoff.note_round(" in src and "backoff.next_interval(" in src,
+        "★ 轮询循环真的接了这条（记状态 + 决定睡多久）")
+    chk(src.count("_unhealthy = (") == 1 and "h.note_round(_unhealthy" in src,
+        "★ 「这一轮健不健康」只算一次，喂给让路 + health 两个消费者")
+
+
 def main():
     print("=" * 60)
     print("bot.py 改动回归自测（无微信 / 不碰 hook / 不联网）")
@@ -1744,6 +2096,8 @@ def main():
         t_image_dirs_union(tmp)
         t_stash_media(tmp)
         t_inline_image_round(tmp)
+        t_sent_memory_durable(tmp)
+        t_hook_db_dead(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     t_redact_wiring()
@@ -1759,13 +2113,17 @@ def main():
     t_auto_reply_truth_note()
     t_now_line()
     t_from_self_reaches_toolbox()
+    t_own_echo_without_identity()
     t_clear_command()
     t_help_matches_reality()
     t_help_args_really_work()
     t_chdir_project_root()
     t_round_pacing()
+    t_poll_ramp()
     t_offtarget_note()
     t_max_catchup()
+    t_catchup()
+    t_poll_backoff()
 
     print("\n" + "=" * 60)
     if _FAIL:

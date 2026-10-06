@@ -174,6 +174,44 @@ def t5_start_guards():
         check("venv 未就绪 → 拒绝启动并指向 install.bat",
               not ok and "install.bat" in msg, msg)
         check("同样没有拉起进程", spawned == [], spawned)
+
+        # ── 提权那一道闸（2026-10-06 用户定的硬约束：助手永远跑在管理员上）──
+        # 自测里**绝不真弹 UAC**：把 admin 那两件事换成桩。
+        old_admin = (botctl.admin.ensure_elevated, botctl.admin.is_admin)
+        try:
+            botctl.env.venv_ready = lambda *a, **k: True
+
+            # ① UAC 被拒 → 必须**如实失败**，且不许拉起任何进程（绝不偷偷降级跑）
+            botctl.admin.ensure_elevated = lambda **kw: (
+                False, "提权被取消（UAC 里点了「否」）", False)
+            botctl.admin.is_admin = lambda: False
+            ok2, msg2 = botctl.start()
+            check("提权被拒 → 启动失败（**绝不静默降级成普通权限**）",
+                  not ok2 and "取消" in msg2, msg2)
+            check("……并且一个进程都没拉起", spawned == [], spawned)
+
+            # ② 刚在另一个提权窗口里把 bot 拉起来了 → 这一份必须**什么都不做**
+            #    （否则两个助手同时轮询 hook，实测会把微信搞崩）
+            calls = []
+            botctl.admin.ensure_elevated = lambda **kw: (
+                calls.append(kw) or (True, "已在新窗口里以管理员身份启动", True))
+            botctl.admin.is_admin = lambda: False
+            ok3, msg3 = botctl.start()
+            check("刚拉起提权进程 → 本进程不再拉进程（防两个助手同时跑）",
+                  ok3 and spawned == [], (ok3, msg3, spawned))
+            check("……提权时把 **pythonw**（无窗口）和 bot.py 传下去了",
+                  calls and calls[0].get("exe", "").lower().endswith("pythonw.exe")
+                  and calls[0].get("argv", [""])[0].endswith("bot.py"), calls)
+
+            # ③ 本来就是管理员 → 正常往下走（这里只验"过了闸"，真 spawn 由别的用例管）
+            botctl.admin.ensure_elevated = lambda **kw: (True, "已经是管理员", False)
+            botctl.admin.is_admin = lambda: True
+            botctl.owner = lambda *a, **k: 55044      # 装作已经跑起来，避免真拉进程
+            ok4, msg4 = botctl.start()
+            check("已经是管理员 → 照常启动（走原有的 owner 判定）",
+                  not ok4 and "已经有一个在跑" in msg4, msg4)
+        finally:
+            botctl.admin.ensure_elevated, botctl.admin.is_admin = old_admin
     finally:
         botctl.owner, botctl.env.venv_ready = old_owner, old_ready
         botctl.subprocess.Popen = old_popen

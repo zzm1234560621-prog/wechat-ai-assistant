@@ -208,8 +208,10 @@ OPTIONAL_PIP = {
     },
     "semantic": {
         "label": "本地语义检索（sentence-transformers，会拖进 torch，最重的一项）",
-        # 比其它项多两步：下模型 + **建索引（建之前必须停 bot）**。所以 console 把它
-        # 单列一项，并在「一键部署」里**默认不装**（要手打 y 才装）。
+        # 比其它项多两步：下模型 + **建索引（建之前必须停 bot）**。
+        # ⚠️ 它**也**在「一键部署」默认装的那一批里（2026-10-05 用户拍板，`console._HEAVY`
+        # 因此清空）—— 唯一保留的人工确认是「建索引要停一下助手」，那一步单独问。
+        # 别把这里再写回「默认不装」：那是 _HEAVY 还有它的时候的说法。回归：selftest_install。
         "specs": ["sentence-transformers"],
         "imports": ["sentence_transformers"],
     },

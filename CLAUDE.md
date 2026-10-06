@@ -132,10 +132,9 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   - **人设 / 称呼 / 从历史学语气这三块的完整规矩在 `docs/auto-reply-notes.md`** ——
     CLAUDE.md 有指令预算（约 64KB），**超了尾部会被截掉**，所以细节挪去那儿了。改这块前先读它。
     要点：人设与称呼都是**每个会话一份**（`rec[...]` 优先，全局那份只是默认）、单条是**整体替换**；
-    `review` / `persona` 不带 `who` **一律拦住**（要改全局必须写 `who=全局`，别让漏参数静默扩大影响面）；
-    学语气**只送我自己发的文本**（判据只能用 `local_type`，别按内容是否以 `[` 开头判断）；
-    学不成**如实说、且绝不影响加人**；绝不自动覆盖已有人设（`persona_source` 要保住）；
-    称呼**同时是联系人别名**，与库里的精确匹配是**合并**的（重名交给重名保护去问，不许静默挑一个＝发错人）。
+    `review` / `persona` 不带 `who` **一律拦住**；学语气**只送我发的文本**（判据只能用 `local_type`）；
+    学不成**如实说、不影响加人**；绝不自动覆盖已有人设（`persona_source` 要保住）；
+    称呼**同时是联系人别名**，与库里精确匹配**合并**（重名交给重名保护，不许静默挑一个）。
   - **称呼与自动回复名单是解绑的**（2026-10-04 用户拍的：「不能强绑定」）。称呼存
     **`settings.json` 顶层 `addresses`**（读 `address_of()` / 写 `set_address()`），
     `/auto address` 与工具 `action=address` 对**任何联系人**可用。三条不许动：
@@ -255,9 +254,15 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
     `languages` 默认 `[zh,en]`，探测出表外语言**如实拒绝、不给文本**；**语音处理必须排在
     `is_label_only` 之前**（英文界面 `[Audio] 8"` 否则静默丢弃）。见 `docs/voice-notes-2026-10-03.md`。
   - ⚠️ **语音条定位（2026-10-03 晚侦察后修）**：`silk_for_duration` 的 `est` **必须 clamp 到
-    末帧**——旧代码 `est > 帧数` 会把内存里**完整存在**的候选扔掉（长语音读不出来的根因）；
-    定位再用消息 XML 的 `length` 做指纹（真实 SILK 长度 = `length`−1）。**别删**"够不着就不
-    解码"的便宜闸（否则几百次 pilk 解码卡死轮询）。见 **`docs/voice-reliability-2026-10-03.md`**。
+    末帧**（旧代码 `est > 帧数` 会扔掉内存里**完整存在**的候选——长语音读不出来的根因）；
+    定位用 XML 的 `length` 做指纹（真实 SILK 长度 = `length`−1）。**别删**"够不着就不解码"的
+    便宜闸（否则几百次 pilk 解码卡死轮询）。见 **`docs/voice-reliability-2026-10-03.md`**。
+  - ⚠️ **助手必须以管理员运行**（2026-10-06 用户拍的硬约束，部署到别的电脑也一样）：
+    语音要读微信进程内存，而 Windows 不许低完整性进程读高完整性进程（微信提权开 →
+    普通权限助手 `OpenProcess` 就是 `err=5`）。四个「起 bot」入口（`助手.bat`/`启动助手.bat`/
+    开机自启/`botctl.start`）都过 **`admin.ensure_elevated()`**、启动弹一次 UAC；
+    **别再加第五个入口而不接这道闸**。命令串只许在 `admin.py` 写一次，
+    坑与自测见 **`docs/admin-elevation-notes.md`**。
   - **三条硬约束**（改之前先读 `docs/voice-input-spec.md`）：① `audio.max_seconds`（默认 1800）+ `file.max_bytes`
     是**硬上限，超了如实拒绝、绝不静默截断音频**；
     ② **绝不在聊天里静默下模型** —— 推理只认本地目录（结构上不可能联网），下载只由
@@ -316,22 +321,19 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 
 ## ⚠️ hook 使用铁律
 
-**这个 hook 前后把微信搞崩过 6 次**（转储里能数出 6 份，见下面的对照）。崩溃的直接诱因是**两个 bot（或两路查询）同时在轮询**——已加了单实例锁（`bot.py:acquire_single_instance`，回环端口 39001），但这只是兜底，真正的死因是下面三条：
+**这个 hook 前后把微信搞崩过 8 次**（转储里能数出 8 份）。崩溃的直接诱因是**两个 bot（或两路查询）同时在轮询**——已加了单实例锁（`bot.py:acquire_single_instance`，回环端口 39001），但这只是兜底，真正的死因是下面三条。
 
 **崩溃取证怎么做**：微信自己的转储在
 `%APPDATA%\Tencent\xwechat\crashinfo\reports\Weixin_*.dmp`（不是 WER 那份）。
 `%TEMP%\dump_parse.py <dmp>` 能直接解出异常码 / 出错地址 / 归属模块偏移（纯 struct，不要 windbg）。
+**8 份转储的完整对照表、逐份异常地址、崩溃点反汇编，以及 2026-10-05「收紧就绪判据」的
+判据/owner/部署/验证记录，全在 `docs/hook-login-gate-notes.md`**（改 hook 之前先读它）。
+一句话版本：命中最多的是 `Weixin.dll+0x32BB4xx~+0x32BB80x`（句柄对象被当成有效对象用，
+读 `0x1`/`0x10000`/`0xFFFF…` 这类非地址值），另有 `+0x505AFBD` 读 NULL 与 `ntdll` 堆损坏。
 
-| 转储 | 出错位置 | 类型 |
-|---|---|---|
-| 9a6d8521 / 236cbbac(00:08) / 0a06ee65 | Weixin.dll **+0x32BB4xx ~ +0x32BB80x** | 写 NULL |
-| 0d35e9b6 (09:28) | Weixin.dll +0xE23753 | 写 NULL |
-| 488215b7 (13:17) | Weixin.dll +0x505AFBD | **读 NULL** |
-| c4ce3551 (09-30 22:51) | ntdll.dll | **0xC0000374 堆损坏** |
-
-**注意：转储的模块表里看不到这个 hook**（六份都没有）。钩子会把自己从 PEB 模块链里摘掉
-（见 `installers/.../src*/` 的 `inline_weixin_dll_load.cpp` 和 `docs/hook-anti-tamper-notes.md`），
-所以**别用「模块在不在」判断钩子有没有涉案**——要看 30001 端口是不是还被那个 PID 占着。
+**注意：转储的模块表里看不到这个 hook**。钩子会把自己从 PEB 模块链里摘掉
+（见 `docs/hook-anti-tamper-notes.md`），所以**别用「模块在不在」判断钩子有没有涉案**
+——要看 30001 端口是不是还被那个 PID 占着。
 
 1. **绝不裸调 `GetAllDBName`。** 每调一次都在 700MB 进程里做一次全内存扫描（`getDatabaseInfo()` 先 `m_dbs.clear()` 再 `searchDatabases()`）。唯一允许的调用点是 `live_history.force_rescan()`（自带限流，只为拿「句柄表被重建」这个副作用）。想判断某个库在不在，探 `sqlite_master`。
 2. **绝不做不带选择性过滤的排序查询。** 典型反例 `WHERE local_type=1 ORDER BY create_time DESC`（先匹配全部消息再排序），实测 0.3 秒起、劣化时到 6 秒。
@@ -378,13 +380,12 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **debug 顺序**：
   0. **先分诊「是不是掉登录了」**：跑 `is_login()` / `self_profile()`。
      微信会**自己重启到登录界面**（换 PID、内存掉到 ~148MB、30001 仍在监听但 `IsLogin: 0`）——
-     表现和 fts 静默失效几乎一样，但**恢复只能人工扫码**，`force_rescan` 没用还白花一次全内存扫描。
-     判据：掉登录 → `is_login()` 为 False、`self_profile()` 全空；fts 失效 → 两者都正常、只是查不出行。
+     表现和 fts 静默失效几乎一样，但**恢复只能人工扫码**，`force_rescan` 没用还白搭一次全内存扫描。
      ⚠️ 2026-10-05 真机更正：本机这份自编 DLL 的 `g_IsLogin` **只置 1、从不置回 0**
-     （`docs/hook-login-gate-notes.md`），所以上面这条判据会骗人——**真正管用的是「库能不能查」**：
-     `IsLogin: 1` + 三个库全 `get database handle which named … failed` = 句柄表被重建，
-     这种状态**重扫是有用的**（实测 2.7 秒修好），别再当成「只能扫码」。启动闸门里已接自愈
-     （`bot._gate_retry_step`）；闸门也**只在连不上 hook 时才放弃**。
+     （`docs/hook-login-gate-notes.md`），所以上面这条判据会骗人 —— **真正管用的是「库能不能查」**：
+     `IsLogin: 1` + 三个库全 `handle … failed` = 句柄表被重建，这种状态**重扫有用**
+     （实测 2.7 秒修好），别再当成「只能扫码」。启动闸门已接自愈（`bot._gate_retry_step`），
+     且**只在连不上 hook 时才放弃**。
   1. 再看 `bot.log` 的轮询心跳（`[bot] 轮询心跳 #N，游标=X`）。游标不动就是 fts 那条。
   2. 才手工 `force_rescan`。
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。
@@ -427,9 +428,9 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **掉登录必须主动探、主动告警。** 微信会自己重启回登录界面（见「静默失效」的 debug 顺序第 0 步），
   所以链路上每 30 轮心跳调一次 `due_login_check()` / `note_login()`，掉了就弹本地通知
   （`health.notify`，best-effort，10 秒超时，**绝不弹阻塞对话框**）。
-  同类告警按 `health.alert_cooldown` 冷却，防刷屏。
-- **`health.notify` 只用系统自带 PowerShell + `NotifyIcon` 弹气泡**，不用 `msg.exe` / `MessageBox`
-  （那会把 bot 卡死）。**是否真机可见尚未确认**，见 `docs/fixes-2026-10.md`。
+  同类告警按 `health.alert_cooldown` 冷却，防刷屏。**「hook 还应答、但库查不动」也走这条线**
+  （判据/阈值见 `docs/poll-reliability-notes.md` §10）。
+- **`health.notify` 只用系统自带 PowerShell + `NotifyIcon`**（不用 `msg.exe`/`MessageBox`，那会把 bot 卡死）。**真机可见性未确认**，见 `docs/fixes-2026-10.md`。
 - **发送失败只告警、绝不自动重试。** 发消息不可逆，超时/HTTP 500 时无法确认对方到底收没收到，
   重试就可能发两条。`bot.send()` 统一兜住异常、`note_send_failure()` 记一笔、如实回给用户。
 - **`redact` 只改「送出去的那一份文本」。** `bot.build_user_prompt()` 末尾按 `privacy.redact`
@@ -439,9 +440,8 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **`usage` 落盘 `data/usage.jsonl`**（`data/` 已被 .gitignore 忽略），`/用量 [天数]` 读它。
   **已接线**：`llm.py` 四个返回点各调一次 `_rec_openai` / `_rec_anthropic`
   （anthropic 与 openai 两协议 × `chat` / `chat_with_tools`），只记
-  `ts/provider/model/prompt_tokens/completion_tokens/kind`，
-  **不记请求内容、不记密钥**；记账失败只告警、绝不影响本次调用
-  （`usage.record` 自己不抛，`llm._record_usage` 是第二道保险）。
+  `ts/provider/model/prompt_tokens/completion_tokens/kind`，**不记请求内容、不记密钥**；
+  记账失败只告警、绝不影响本次调用（`usage.record` 自己不抛，`llm._record_usage` 是第二道保险）。
   只记**成功拿到 usage 的调用**，所以它是「本地估算」而不是账单；
   价目表里**没有**的模型 `price_of` 返回 None、`/用量` 会明说「没有价目表，只报 token 不算钱」
   ——**别为了好看给它编一个价格**；反过来**官方明确免费的**（如`glm-4-flash-250414`）
@@ -470,12 +470,12 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - **往对话记忆里只放原始提问和最终答复**（`bot.dialog_*`），**绝不能放检索到的历史**——那段每轮都重算，记下来等于每轮重发整块历史，token 直接爆。
 - **发消息是不可逆动作**，默认不许乱发：名单外的一律走「待确认」（`agent_tools`）。别绕过这个机制。文本/图片/转发的分派在 `agent_tools.send_pending()`。
 - **发出去的文件会回显成新消息**（同图片那个坑；2026-10-03 真机踩出「为什么会重复发」）：file 分支发完必须 `remember_sent_file()`，主循环用 `is_own_file()` 认掉。
-- **`send_image` 的路径必须过 `_image_path_ok()` 白名单**。path 是**模型填的**，不校验就等于让它从你硬盘上挑任意文件发出去。默认白名单是 `image_cache.allowed_image_dirs()` 推出来的**微信图片缓存根**（`<账号>/cache`），**不是整个 `xwechat_files`**（那是 `data_root()`，里面有配置、`db_storage`、收到的文件）；推不出来才退回 `data_root()` 并告警。用户在 `agent.send_image_dirs` 里配的目录是**加在默认之上**（并集），**不是换一份名单**——以前实现是「配了就顶掉默认」，真机自检里撞出来过：用户为了自测加了个 `test_images`，就**静默地**再也发不出聊天里的图了。改并集时**必须打一条告警**说明「两处都能发」（边界可以宽，但用户得知道宽在哪）。要加目录让**用户**改 `agent.send_image_dirs`，不要自己改配置绕。`send_images`（按目录群发）走同一个 `_in_allowed_dirs`，别另开一套。
+- **`send_image` 的路径必须过 `_image_path_ok()` 白名单**。path 是**模型填的**，不校验就等于让它从你硬盘上挑任意文件发出去。默认白名单是 `image_cache.allowed_image_dirs()` 推出来的**微信图片缓存根**（`<账号>/cache`），**不是整个 `xwechat_files`**（那是 `data_root()`，里面有配置、`db_storage`、收到的文件）；推不出来才退回 `data_root()` 并告警。用户在 `agent.send_image_dirs` 里配的目录是**加在默认之上**（并集）——以前是「配了就顶掉默认」，真机撞过：用户为自测加了 `test_images`，就**静默地**再也发不出聊天里的图。改并集时**必须打一条告警**说明「两处都能发」。要加目录让**用户**改配置，不要自己改配置绕。`send_images` 走同一个 `_in_allowed_dirs`。
 - **hook 能发文本、图片和普通文件**（pdf/Word/Excel/zip）。⚠️ 文件走的**也是 `/SendImgMsg`**
   （2026-10-02 实测 xlsx/zip 真成了文件消息 `local_type=(6<<32)|49`、服务端字段齐全、无新转储）；
   `/SendFileMsg` 是 404。所以「hook 发不了普通文件、得重编译 C++」**是错的，别再写回去**。
   接线：`agent.send_file`（默认 true）+ `agent.send_file_via`（默认 imgmsg）+ `aixed_api.send_file`；
-  发文件仍要用户确认、定位只认 `msg/file/`。证据见 `docs/send-file-hook-notes.md`。
+  发文件仍要用户确认；定位认 `msg/file/` 与绝对路径。证据见 `docs/send-file-hook-notes.md`。
 - **重名不许静默取第一个。** 解析联系人统一走 `ToolBox._one()`，重名时回一句让模型去问用户——静默取第一个会读错人、发错人。
   - **调 `resolve_contacts` / `resolve_one` 时记得传 `aliases`**（`auto_reply.address_aliases(cfg)`）：
     那是「学到的称呼」那张表，不传的话「给老张发消息」就认不出来。
@@ -500,12 +500,12 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
     bot 原样直发的那段）——少发一个人却不写＝静默缩小影响面。
 - **渲染「谁说的」一律用显示名。** 预取路径用 `bot._msg_speaker()`，工具路径用 `agent_tools.speaker_of()` / `format_history_lines()`。**绝不要把 talker（wxid / roomid）原样塞进给模型的文本**——模型会照抄一串 id 给你。这是 2026-10-01「看不到真正的名字」的根因。
 - **hook 不支持并发**。工具串行执行，查询有预算（`agent.max_queries`）；连发消息是同步的、故意不开线程。任何"并发加速"的想法都会让微信崩。
-- **定时任务同样不许开后台线程。** `scheduler.py` 靠 `bot._Ticker` 挂在**收消息那条线程**的轮询空档里跑（`iter_aixed_messages` / `iter_wcferry_messages` 各调一次）。代价是精度只有 `poll_interval`（默认 5 秒），换来「定时发消息」和「轮询」永不并发。往 `run_due` 里加新动作时别起线程。
+- **定时任务同样不许开后台线程。** `scheduler.py` 靠 `bot._Ticker` 挂在**收消息那条线程**的轮询空档里跑（`iter_aixed_messages` / `iter_wcferry_messages` 各调一次）。代价是精度只有 `poll_interval`（默认 5 秒），换来「定时发消息」和「轮询」永不并发。
 - **不支持的功能要如实报错，不许静默降级。** 典型：定时任务里 `action: call`（语音通话）现在打不出去，`run_due` 就明确报错并通知用户，**绝不偷偷改成发文本**——那是在骗用户。加新功能时保持这条。
 - **发送失败只告警、不自动重试**（`bot.send()` 里兜住，见上面「运行看护」）。别为了「更可靠」加重试：发消息不可逆，重试可能让对方收到两条。
 - **待确认项是多条时先回编号菜单。** 用户回「确认 <编号>」指明哪一条，只说「确认」会再问一次、**绝不替他猜**（`bot.pending_index_of`）。命令/发送/审核草稿三类队列混在一起时，显示的编号和实际执行的那条必须是同一条（回归用例在 `selftest_policy.py` / `selftest_bot_loop.py`）。
 - **落盘状态只有一份真源：`data/state.json`。** 轮询游标和待确认队列都写它，**原子写**（同目录临时文件 + `os.replace`）；文件坏了/读不出来**只告警、不许拦住启动**（也就退回「从最新开始收」）。
-  「重启补齐」的语义：落盘游标距今在 `state.resume_window`（默认 1800 秒）内就续上；续上来的、比 `state.stale_after`（默认 120 秒）还旧、**且早于本进程启动**的消息 = 停机期间的旧消息，**只通知、不自动回复**（`watch` 命中仍通知），命令和提问也不补。判据按**消息年龄**走，不按「第几轮」，所以积压多少条都不会误判。
+  「重启补齐」的语义：落盘游标距今在 `state.resume_window`（默认 1800 秒）内就续上；续上来的消息里，**早于本进程启动**的一律 = 停机期间/上一台电脑上产生的旧消息，**只通知、不自动回复**（`watch` 命中仍通知），命令和提问也不补。判据是**进程启动时刻**、不是消息年龄（2026-10-06 改，理由见 `docs/restart-catchup-notes.md`）。
 - **加新模块时先看它有没有「绝不查库 / 绝不自己起线程」的要求。** `health` / `status_page` 有（见「运行看护」）；`usage`（只读 `data/usage.jsonl`）、`redact`（纯函数、只改送出去的那份）也**不许**顺手去碰 hook。
 - **不要随手重启微信**：每次重启都会掉登录态，要重新扫码。
 - **可选依赖（语音 / 网上搜索 / 文件格式包 / 本地语义检索）不许写成 `requirements.txt` 的正式行**：
@@ -513,7 +513,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   `envsetup.install_optional` / `botctl.search_install`（一键部署第 ③ 步、**可选组件.bat**），
   开关写 `settings.json` 的 `optional`；**四项都默认装**（`_HEAVY` 空，2026-10-05 用户拍板把语义
   也纳入自动装；只剩「建索引要停助手」那一次确认），装成后 `console._enable_runtime_switch`
-  顺手打开 `search.enabled`/`semantic.enabled`（写 settings.json，**不碰 config.yaml**）。
+  顺手打开 `search.enabled`/`semantic.enabled`（写 settings.json）。
   SearXNG 源码随包携带在 `searxng\`，**它的 .venv 与缓存绝不进包**，
   `botctl.search_home()` 是「用哪一份」的唯一判据（能用的优先）。`.rar` 到底能不能读的判据在
   `archive_read.find_rar_tool()`（rarfile 只是壳；**不在 PATH ≠ 没装**，它连默认安装位置一起找）。
@@ -543,12 +543,16 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   版本常量唯一真源是 `_common.ps1` 的 `$WX_WANTED_VERSION`，`console.WANTED_WEIXIN`
   必须与它一致（`selftest_portable.py` 钉着这一对；纯函数回归在 `selftest_install.py` T5）。
   ⚠️ 别退回「读不出版本就拦」：读不出**不等于**版本不对，`unknown` 要如实问用户。
-- **包里那份 `version.dll` 必须是带登录门禁的构建**（2026-10-04 换过）：厂商原版
-  （483840 / `5ABB5002`）的源码快照里 `g_IsLogin` **恒为 0**（置 1 的那段登录 hook 在开源快照里
-  被移除了），装上去就是「hook 通了、查询全失败、`IsLogin` 恒 0」，而日志写着「已放置，成功」。
-  现在包里是**开发机现役那份**（499200 / `9FBD1340`，有「找新鲜库」那套判据），厂商原版归档成
-  `version_old_backup.dll`——**别再拷回去**。判据：二进制里有 `xwechat_files` + `db_storage`
-  宽字符串（`selftest_portable.py` §6 钉着这一条）。细节见 `docs/hook-login-gate-notes.md`。
+- **包里那份 `version.dll` 必须是带登录门禁的构建**（2026-10-06 换过）：现在是
+  **527360 / `868BFF8F`**（读 ini 找数据目录、25 秒窗口、零主动扫描）；519168 / `3877BA84`
+  归档为 `version_gate_v2_20261005.dll`——**别再换回去**：它的判据是"库要连续一直在写"，
+  安静账号上**闸门永不开**（`IsLogin` 恒 0，bot 每 10 秒刷「数据库打不开（微信没登录？）」，
+  而文案是误导的——用户登录着）。`version_new.dll` 这名字要留着（两个 do_*.ps1 点它）。
+  细节见 `docs/hook-login-gate-notes.md` 开头那节。
+- **解压新包≠换掉已装的 hook**（两个文件）。启动时会跑 **`hook_check`**：比「微信目录那份 vs
+  包里那份」的 SHA256，连上 hook 后再看 `/QueryDB/status` 有没有 **`LoginGateInfo`**（旧构建没这字段）；
+  不一致就打印该跑的命令。诊断 **`hook_doctor.py` 随包放根目录**，判据只在 `hook_check.py` 一处。
+  回归 `selftest_hook_check.py` + `selftest_portable.py` §7b。
 - **改 hook 源码**（`installers/wechat-4.1.10.27/src-4.1.10.27/WeChat-Hook-4.1.10.27`）后重编译：
   ```bash
   "C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe" \
@@ -573,4 +577,4 @@ T1–T11 都已落库、各自带回归。**细节与「别改回去什么」见
 - 源码快照两份，**xLog hook 偏移不同，不要混用**：项目内 `installers/wechat-4.1.10.27/src-4.1.10.27/`，以及作者发布包里解出来的那一份（放哪儿由你自己决定，**别把绝对路径写进文档/配置**）。
 - 图片加密：`docs/wechat4-dat-image-notes.md`；hook 反篡改：`docs/hook-anti-tamper-notes.md`。
 - 语音条可行性评估：`docs/voice-msg-feasibility.md`。
-- **打电话（微信语音通话）**：**已定案：hook 做不到**（真机+官方文档三重证据）。**2026-10-03 用户口径：只删描述** —— `TOOLS` 那条 `call`、两份 config 的 `system_prompt`、README 那节都删了，但 `t_call` / `callgate.py` / `aixed_api.call_voip` / hook 的 `/CallVoip` **全保留**（故 `t_call` 是**故意的孤儿处理器**，`selftest_tool_registry.py` 里有一条带原因的例外）；要恢复可见就把 `TOOLS` 那条 call 加回去（原文在 git 历史里）。**别顺手删代码**。全部证据见 **`docs/call-voip-notes.md`**。
+- **打电话（微信语音通话）**：**已定案：hook 做不到**（真机+官方文档三重证据）。**2026-10-03 用户口径：只删描述** —— `TOOLS` 那条 `call`、两份 config 的 `system_prompt`、README 那节都删了，但 `t_call` / `callgate.py` / `aixed_api.call_voip` / hook 的 `/CallVoip` **全保留**（`t_call` 是**故意的孤儿处理器**）。**别顺手删代码**，证据见 **`docs/call-voip-notes.md`**。

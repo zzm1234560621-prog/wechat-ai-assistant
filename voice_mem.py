@@ -137,13 +137,36 @@ def _k32():
     return ctypes.windll.kernel32
 
 
-def weixin_main_process():
+class ProcessProbe:
+    """`weixin_main_process(probe=...)` 的诊断出口（给人看的失败原因）。
+
+    为什么要有它：`read()` 以前把"找不到进程"和"进程在、但打不开"**混成同一句**
+    ——「微信没在跑？或者权限不够」。2026-10-06 真机就是这么骗人的：微信好好跑着
+    （进程表里 5 个 `Weixin.exe`），只是它**以 High 完整性启动**（用户提权开了微信），
+    而助手是 Medium，于是 `OpenProcess(QUERY_INFORMATION|VM_READ)` 被系统拒绝
+    （`GetLastError=5`）。用户照着那句提示去查「微信是不是没开」，方向完全错了。
+
+    所以把两件事分开记：`saw_any` = 进程表里有没有 `Weixin.exe`；`denied` = 有进程、
+    但一个 `OpenProcess` 都没成功（跨完整性级别 / 权限不足 / 被安全软件拦）。
+    """
+
+    __slots__ = ("saw_any", "denied")
+
+    def __init__(self):
+        self.saw_any = False
+        self.denied = False
+
+
+def weixin_main_process(probe=None):
     """找主微信进程（**有 Weixin.dll 的那个**）。找不到返回 `(None, "")`。
 
     ⚠️ 判据是「模块表里有没有 Weixin.dll」，不是「内存最大的那个」：
     后者要先问 `GetProcessMemoryInfo`，而它在 kernel32 里不存在（真名
     `K32GetProcessMemoryInfo`），ctypes 抛 AttributeError 再被吞掉，
     就变成「一个进程都没找到、却什么都不报」——踩过。
+
+    `probe`（可选，见 `ProcessProbe`）：只填诊断字段，**不改返回值** ——
+    既有的两元组契约和自测都不动。
     """
     import ctypes.wintypes as wt
     k32 = _k32()
@@ -170,10 +193,14 @@ def weixin_main_process():
                 if not k32.Process32Next(snap, ctypes.byref(pe)):
                     break
         k32.CloseHandle(snap)
+    if probe is not None:
+        probe.saw_any = bool(pids)
 
     for pid in pids:
         h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
         if not h:
+            if probe is not None:
+                probe.denied = True
             continue
         if _has_weixin_dll(pid):
             return pid, h
@@ -571,9 +598,26 @@ def read(duration_ms, out_dir=None, tol_ms=MATCH_TOL_MS, transcribe=True, cfg=No
 
     import audio_read
     import time as _time
-    pid, h = weixin_main_process()
+    probe = ProcessProbe()
+    pid, h = weixin_main_process(probe=probe)
     if not h:
-        return [], "读不到微信进程内存（微信没在跑？或者权限不够）。"
+        # ⚠️ 这两种失败**必须分开说**（2026-10-06 真机踩到）：
+        #   ① 进程表里压根没有 Weixin.exe = 微信真的没开；
+        #   ② 有 Weixin.exe、但一个都打不开 = **跨完整性级别**（微信被提权打开 →
+        #      High；助手是 Medium → OpenProcess 被拒，GetLastError=5）。
+        # 混成一句「微信没在跑？或者权限不够」，用户会去查「微信开没开」，
+        # 而真相正好相反：微信开着，是**权限不对**，要重启微信（不提权）或提权跑助手。
+        if probe.denied:
+            return [], ("读到微信进程了，但**打不开它的内存**——最快的解释是"
+                        "**微信是用管理员权限开的**，而助手不是，Windows 不允许低权限进程读"
+                        "高权限进程的内存。**不是「微信没在跑」**。两条路：① 关掉微信、"
+                        "从开始菜单**普通双击**重开（推荐，助手不用动）；② 或者让助手也以"
+                        "管理员身份运行。这条语音没读出来，别编。")
+        if probe.saw_any:
+            return [], ("微信进程在，但没有一个能读内存（可能被安全软件拦、或进程刚要退出）。"
+                        "这条语音没读出来，别编。")
+        return [], ("进程表里没有 Weixin.exe —— 微信**没在跑**（或者跑的是旧版 "
+                    "WeChat.exe）。这条语音没读出来，别编。")
     out_dir = out_dir or os.path.join(HERE, "data", "voice_mem")
     # 扫内存的**硬时间上限**：超了就放弃并如实说（`voice.scan_seconds`，默认 20 秒）。
     # 为什么默认是这个数：完整扫描实测 4~16 秒（见 `DEFAULT_SCAN_SECONDS` 的注释），

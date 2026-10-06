@@ -26,7 +26,15 @@ DEFAULTS = {
     "login_check_interval": 300.0,   # 多久探一次登录态（秒）
     "alert_cooldown": 3600.0,        # 同一类告警的最小间隔（秒），防刷屏
     "status_file": os.path.join(PROJECT_ROOT, "data", "status.json"),
+    # 「hook 可达、但库层死了」的触发阈值（2026-10-06 加；用户要求**偏保守**：
+    # 宁可晚十几分钟，也不要发那种「你被叫去扫码、其实没事」的假警报）。
+    "hook_stress_rounds": 10.0,      # 连续多少轮轮询不健康（慢 / 被总时限截断 / 分片错）
+    "db_stale_sec": 600.0,           # 核心库多少秒没被写过
+    "hook_slow_round_sec": 3.0,      # 一轮超过多少秒算「慢」（平时一轮不到 1 秒）
 }
+
+# 两次「权威探针」之间至少隔这么久：探针要碰句柄表，绝不能每轮都去问。
+DB_PROBE_MIN_GAP = 300.0
 
 # 通知子进程的超时（秒）。失败/超时就放弃，绝不阻塞 bot。
 NOTIFY_TIMEOUT = 10
@@ -315,6 +323,33 @@ class Health:
         # {同类告警的 key: 上次发出的时间}，用来实现冷却
         self._alert_sent = {}
 
+        # —— 「hook 可达、但库层死了」（2026-10-06 真机；见 docs/poll-reliability-notes.md §10）——
+        # 触发用两条**互相独立**的事实：轮询连续不健康 + 核心库很久没被写。
+        # 结论**只由权威探针给**（bot 调 live_history.db_alive_probe 后回填）。
+        self.hook_stress_limit = _num(
+            h.get("hook_stress_rounds", DEFAULTS["hook_stress_rounds"]),
+            DEFAULTS["hook_stress_rounds"],
+        )
+        self.db_stale_limit = _num(
+            h.get("db_stale_sec", DEFAULTS["db_stale_sec"]),
+            DEFAULTS["db_stale_sec"],
+        )
+        self.hook_slow_round_sec = _num(
+            h.get("hook_slow_round_sec", DEFAULTS["hook_slow_round_sec"]),
+            DEFAULTS["hook_slow_round_sec"],
+        )
+        self.hook_stress_rounds = 0        # 当前连续多少轮不健康
+        self.max_hook_stress_rounds = 0    # 本次运行以来的最长连续（诊断用）
+        self.db_age_seconds = None         # 核心库最后被写距今（None = 拿不到 = 未知）
+        self._db_age_missing_noted = False # 「拿不到库龄」只告警一次（静态条件，别刷屏）
+        self.db_probed_at = None           # 最近一次权威探针的时刻
+        self.db_probe_detail = ""
+        self.db_dead = False               # 已确诊「库查不动」且还没确认恢复
+        self.db_dead_count = 0
+        self.db_dead_at = None
+        self.db_dead_detail = ""
+        self.db_recovered_count = 0
+
     # ------------------------------------------------------------------ 轮询
 
     def note_poll(self, cursor=None, errors=None):
@@ -378,6 +413,115 @@ class Health:
         self.note_sent(ok=False, detail=_err_text(err))
 
     # ------------------------------------------------------------------ hook
+    # 「hook 可达、但库层死了」——触发、确诊、恢复（2026-10-06；详见 §10 那节）
+    #
+    # 现场：微信被压崩之后进程**没退**、30001 还应答、`IsLogin` 还报 1，但句柄表空
+    # （`handlesAlive = 0`）、核心库自崩溃那刻起再没被写过。三态登录探针把它判成
+    # 「在线」⇒ 用户拿不到任何提示，只看到「它没反应」。这里补的就是这个缺口。
+
+    def _probe_allowed(self):
+        """距上次权威探针够不够久（一次触发只问一次，探针要碰句柄表）。"""
+        if self.db_probed_at is None:
+            return True
+        return (time.time() - self.db_probed_at) >= min(DB_PROBE_MIN_GAP, self.alert_cooldown)
+
+    def note_round(self, unhealthy, db_age_sec=None):
+        """记一轮轮询的「健不健康」+ 核心库有多久没被写。**每轮调用，纯内存、不做 IO。**
+
+        `unhealthy` 由 bot 判：这一轮慢 / 被总时限截断 / 有分片错误。
+        连续不健康会累加，**健康一轮立刻清零**（恢复不拖泥带水）。
+        `db_age_sec=None`（拿不到）= 不动上一次的值，也**不会**让它变成「很旧」。
+        """
+        try:
+            if db_age_sec is not None:
+                self.db_age_seconds = float(db_age_sec)
+                self._db_age_missing_noted = True
+            elif not self._db_age_missing_noted:
+                # 拿不到库写入时间 ⇒ **这条看护永远不会触发**。必须说一声（本项目的铁律：
+                # 静默失效最贵），但只说一次（它是静态条件，刷屏没意义）。
+                self._db_age_missing_noted = True
+                _warn("拿不到微信库的最后写入时间（数据根找不到？）——"
+                      "「hook 可达但库查不动」这条主动告警**不会生效**；"
+                      "轮询与登录探针不受影响。")
+            if unhealthy:
+                self.hook_stress_rounds += 1
+                if self.hook_stress_rounds > self.max_hook_stress_rounds:
+                    self.max_hook_stress_rounds = self.hook_stress_rounds
+            else:
+                self.hook_stress_rounds = 0
+        except Exception as e:
+            _warn(f"note_round 记账失败：{e}")
+
+    def hook_db_dead_due(self):
+        """该不该去问**权威探针**「库还查得动吗」。**保守：两条独立事实同时成立。**
+
+        ⚠️ 这里只回答「该不该探」，**绝不下结论**——结论由 `note_hook_db_probe` 给。
+        为什么两条都要：
+          * 只有「轮询不健康」：可能只是 hook 一时慢，库好好的 → 会误报；
+          * 只有「库很久没被写」：没人用微信时本来就不写 → **必须不报**
+            （2026-10-02 就是拿这种模糊信号报了假警报）。
+        """
+        try:
+            if self.db_dead:
+                return False                 # 已确诊、等恢复：不重复探
+            if self.hook_stress_rounds < self.hook_stress_limit:
+                return False
+            if self.db_age_seconds is None or self.db_age_seconds < self.db_stale_limit:
+                return False
+            return self._probe_allowed()
+        except Exception as e:
+            _warn(f"hook_db_dead_due 判断失败：{e}")
+            return False
+
+    def hook_db_recovered_due(self):
+        """确诊过之后轮询恢复正常 → 再问一次权威探针，**确认**恢复（同一个判据）。"""
+        try:
+            if not self.db_dead or self.hook_stress_rounds > 0:
+                return False
+            return self._probe_allowed()
+        except Exception as e:
+            _warn(f"hook_db_recovered_due 判断失败：{e}")
+            return False
+
+    def note_hook_db_probe(self, ok, detail=""):
+        """权威探针结果（三态：`True` 能查 / `False` 查不动 / `None` 探针自己失败）。
+
+        返回 `"dead"` / `"recovered"` / `""`（无变化），让 bot 决定要不要往微信里也发一条。
+        告警走 `_alert_cooldown`（同类冷却），文案**必须能照着做**：做什么（重启微信+扫码）
+        与不用做什么（助手不用动）。
+        """
+        try:
+            self.db_probed_at = time.time()
+            self.db_probe_detail = str(detail or "")
+            if ok is None:
+                return ""                    # 探不了 ≠ 坏了（连不上那条归登录探针）
+            if not ok:
+                self.db_dead = True
+                self.db_dead_count += 1
+                self.db_dead_at = self.db_probed_at
+                self.db_dead_detail = self.db_probe_detail
+                self._alert_cooldown(
+                    "hook_db_dead", "微信这边的库查不动了",
+                    "hook 还在应答，但**微信的库查不动**（这不是掉登录）。\n"
+                    f"触发：连续 {self.hook_stress_rounds} 轮轮询不正常，"
+                    f"而且核心库已经 {int(self.db_age_seconds or 0)} 秒没被写过。\n"
+                    f"探针说：{self.db_dead_detail}\n"
+                    "该做的：**完全退出微信 → 重新打开 → 扫码登录**；"
+                    "助手不用动，微信回来我会自己接上。\n"
+                    "（这种状态下 `IsLogin` 往往还报 1 —— 别被它骗。）")
+                return "dead"
+            self.db_dead = False
+            if self.db_dead_count:
+                self.db_recovered_count += 1
+                self._alert_cooldown(
+                    "hook_db_recovered", "微信的库又能查了",
+                    "刚才那次「库查不动」已经过去：核心库又能查、轮询也恢复正常。\n"
+                    f"探针说：{self.db_probe_detail}")
+                return "recovered"
+            return ""
+        except Exception as e:
+            _warn(f"note_hook_db_probe 记账失败：{e}")
+            return ""
 
     def note_hook_error(self, err):
         """记录一次 hook 层错误（连不上 30001、慢查询、HTTP 500 之类）。"""
@@ -539,6 +683,17 @@ class Health:
             "login_lost_count": self.login_lost_count,
             "login_restored_count": self.login_restored_count,
             "login_probe_failed_count": self.login_probe_failed_count,
+            # hook 可达、但库层死了（2026-10-06；判据与告警见 note_round / note_hook_db_probe）
+            "hook_stress_rounds": self.hook_stress_rounds,
+            "max_hook_stress_rounds": self.max_hook_stress_rounds,
+            "db_age_seconds": (None if self.db_age_seconds is None
+                               else _round(self.db_age_seconds)),
+            "db_dead": bool(self.db_dead),
+            "db_dead_count": self.db_dead_count,
+            "db_dead_at": _iso(self.db_dead_at),
+            "db_dead_detail": self.db_dead_detail,
+            "db_recovered_count": self.db_recovered_count,
+            "db_probe_detail": self.db_probe_detail,
             # 告警
             "alert_count": self.alert_count,
             "last_alert_at": _iso(self.last_alert_at),
@@ -546,12 +701,17 @@ class Health:
             # 配置（只放不敏感的，方便状态页对照）
             "login_check_interval": self.login_check_interval,
             "alert_cooldown": self.alert_cooldown,
+            "hook_stress_limit": self.hook_stress_limit,
+            "db_stale_limit": self.db_stale_limit,
+            "hook_slow_round_sec": self.hook_slow_round_sec,
         }
 
     def _healthy(self):
-        """粗判：掉登录 / 有分片错误 / 很久没轮询 = 不健康。不确定时返回 None。"""
+        """粗判：掉登录 / 库层死了 / 有分片错误 / 很久没轮询 = 不健康。不确定时返回 None。"""
         try:
             if self.last_login_ok is False:
+                return False
+            if self.db_dead:
                 return False
             if self.poll_errors:
                 return False

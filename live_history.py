@@ -27,11 +27,77 @@ import time
 
 try:
     import zstandard
-except ImportError:            # 没装也能跑，只是 appmsg 的 XML 解不开
+except ImportError:
+    # ⚠️ 别以为「没装也能跑」：微信 4.x 把**长文本 / appmsg / 语音条 XML** 的
+    # `message_content` 用 zstd 存，缺了它 `decode_msg_content()` 只能给空串
+    # —— 而空串会让上层**如实说读不出来**（语音变「拿不到时长」），**不报错**。
+    # 2026-10-06 第二台部署机就是这么哑的。它是 requirements.txt 的正式依赖；
+    # 真缺了，下面 `decode_msg_content` 会打一行明确的告警（只打一次）。
     zstandard = None
 
 # 微信 4.x 判断「这条是不是我发的」需要自己的 wxid，启动时由 bot 设置。
 _SELF_WXID = ""
+
+# 「缺 zstandard」这件事只告警一次（进程内）。它是个静态条件，刷屏没有意义。
+_ZSTD_MISSING_NOTE = [False]
+
+# 「我自己」**现在到底认不认得出来**（只给 fail-safe 用，不是判据本身）。
+#   None  = 还没观察过（不拦）
+#   True  = 最近一次查自己的 sender_id 查到了
+#   False = 最近一次查不到（`_SELF_WXID` 为空也算）
+# 认不出来时 `is_self` 会**恒为 0**：bot 把「我发的」当成「对方发的」。谁用得到它：
+# `bot.py` 主循环那条与身份无关的闸门（「这句话我刚发过」）——
+# 认不出自己的机器上，也必须拦住「自己刚发出的回复被当成新提问再答一遍」。
+_SELF_ID_OK = None
+
+
+def self_identity_ok():
+    """「我自己」确实认得出来吗（只读上次观察，**不查库**）。
+
+    观测点：三条收消息的路本来就各自要算一次「我在这套 id 空间里是哪个 id」
+    （fts 的 `_v4_fts_self_id` / 会话表的 `_v4_self_rowid` / session 兜底的 sender 形状），
+    顺手把结果记进 `_SELF_ID_OK` —— **不额外增加 hook 请求**。
+
+    没观察过时返回 True（**不拦**）：这是「不知道」，而 fail-safe 只在**确认认不出**时
+    才生效，免得正常机器上多出一条多余的行为差异。
+    """
+    if not _SELF_WXID:
+        return False
+    return _SELF_ID_OK is not False
+
+
+# 「认不出自己」这件事**留一行痕就够**（进程内一次）。为什么必须留：认不出时
+# `is_self` 恒为 0，后果是 bot 把自己刚发出的回复当成对方的新消息、自己答自己
+# （2026-10-06 换台电脑真机的「重复回复」），而这条链以前**一个字都不说** ——
+# 用户只看得到「重复回复」，看不到根因。
+# 为什么要等**连续 3 轮**：单轮查不到也可能只是 hook/库那一瞬间不接（重试就好），
+# 一抖就喊「认不出自己」会把排查方向指错——这正是本项目反复踩过的「日志骗人」。
+_SELF_ID_NOTE_ONCE = [False]
+_SELF_ID_FAILS = [0]
+
+
+def _note_self_id(ok, why=""):
+    """记下「这一轮认不认得自己」，连续认不出时留一行日志（有原因就说原因）。
+
+    三条路各自的判据不同（fts：自己的 fts rowid 查不查得到；会话表：自己的
+    Name2Id.rowid；session 兜底：sender 是不是 wxid 形状），但事实是同一个：
+    **拿到的 self_wxid 跟消息里的 sender id 对不上，或者根本没拿到**。
+    """
+    global _SELF_ID_OK
+    _SELF_ID_OK = bool(ok)
+    if _SELF_ID_OK:
+        _SELF_ID_FAILS[0] = 0
+        return
+    _SELF_ID_FAILS[0] += 1
+    if _SELF_ID_NOTE_ONCE[0] or _SELF_ID_FAILS[0] < 3:
+        return
+    _SELF_ID_NOTE_ONCE[0] = True
+    print(f"[live] ⚠️ 连续 {_SELF_ID_FAILS[0]} 轮认不出「我自己」"
+          f"（{why or '原因不明'}）——「我发的」会被当成对方发的（历史里分不清"
+          f"我/对方），而且 bot 会去回答自己刚发出的回复。兜底闸门已生效：不会答自己。"
+          f"要彻底修好：.venv\\Scripts\\python.exe find_self_wxid.py --apply"
+          f" 把 self_wxid 填对，再重启助手。", file=sys.stderr, flush=True)
+
 
 # 轮询分片最近一次失败：{分片名: (错误信息, 连续失败次数)}
 # 存在的意义是让上层能发现「hook 查不动了」——以前这里静默 continue，
@@ -170,6 +236,10 @@ class PollBudgetOut(RuntimeError):
 
 _poll_deadline = [0.0]        # 本轮死线（monotonic）；0 = 不限时
 _budget_logged_at = [0.0]
+# 本轮有没有**用光过总时限**（一个事实，不做判断）。给「这一轮健不健康」用：
+# 慢/被截断是「hook 卡住」的早期信号，而 `bot` 那边的看护要拿它当触发条件之一
+# （见 bot.handle_hook_db_dead / docs/poll-reliability-notes.md 第 10 节）。
+_round_tripped = [False]
 
 
 def begin_poll(budget=None):
@@ -180,7 +250,13 @@ def begin_poll(budget=None):
     """
     b = POLL_BUDGET_SEC if budget is None else budget
     _poll_deadline[0] = (time.monotonic() + b) if (b and b > 0) else 0.0
+    _round_tripped[0] = False
     return _poll_deadline[0]
+
+
+def round_tripped():
+    """本轮有没有被总时限截断过（只读事实；判断留给上层）。"""
+    return bool(_round_tripped[0])
 
 
 def poll_budget_left():
@@ -199,6 +275,7 @@ def _log_budget_trip():
     left = poll_budget_left()
     if left is None or left > 0:
         return
+    _round_tripped[0] = True
     now = time.monotonic()
     if now - _budget_logged_at[0] < 30.0:
         return
@@ -557,6 +634,17 @@ def decode_msg_content(mc):
         return str(mc)
     if raw[:4] == b"\x28\xb5\x2f\xfd":
         if zstandard is None:
+            # **不许静默**：这条内容是 zstd，但本机没这个库 —— 后果是「语音拿不到时长 /
+            # 长文本变成空」，而用户只看到「读不出来」。留一行（进程内只留一次，
+            # 免得刷屏）并直接给出修法。2026-10-06 第二台部署机就卡在这里。
+            if not _ZSTD_MISSING_NOTE[0]:
+                _ZSTD_MISSING_NOTE[0] = True
+                print("[live] ⚠️ 这条消息的内容是 zstd 压缩的，但本机**没有装 zstandard**："
+                      "语音（拿不到时长）、长文本、appmsg 都会读不出来，而且看起来"
+                      "只是「读不出来」。修法："
+                      ".venv\\Scripts\\python.exe -m pip install zstandard，然后重启助手"
+                      "（它已经是 requirements.txt 的正式依赖，重跑一次依赖安装也会带上）。",
+                      file=sys.stderr, flush=True)
             return ""
         try:
             raw = zstandard.ZstdDecompressor().decompress(raw, max_output_size=4 << 20)
@@ -1038,6 +1126,12 @@ def _v4_history_from_tables(client, talker, limit=50, keyword=None, since=None,
     rows = []
     for db in _v4_msg_dbs(client):
         self_id = _v4_self_rowid(client, db)
+        # 这一层判「我发的」靠 `real_sender_id == 自己的 Name2Id.rowid`；查不到自己的 rowid
+        # 就等于**认不出自己**（is_self 恒为 0）。顺手把这个事实记下来，给 fail-safe 闸门用
+        # （见 self_identity_ok）：认不出时不能去回答「自己刚发出的回复」（零额外请求，
+        # 这个 rowid 这一轮本来就要查）。
+        _note_self_id(self_id is not None,
+                      "这个分片的 Name2Id 里找不到自己那个 wxid 的 rowid")
         sql = (
             f"SELECT local_id, local_type, real_sender_id, create_time, message_content, "
             f"packed_info_data "
@@ -1449,6 +1543,41 @@ def fts_alive(client):
         return True, f"fts 分片可读（{len(tabs)} 个）"
     return False, ("读**不到** fts 分片表（查询不报错、只是 0 行）——"
                    "这正是「静默失效」的典型形态")
+
+
+def db_alive_probe(client, db="session.db"):
+    """「库到底能不能查」——判断「hook 可达、库层已死」的**权威探针**。三态：
+
+      * `True`  —— 库能查（最便宜的一条 `SELECT` 成功）；
+      * `False` —— **hook 明确回了「查不动」**（HTTP 错误 / 服务端报错）⇒ 确诊；
+      * `None`  —— 连不上 hook（或探针自己出错）⇒ **不结论**，那条路归登录探针管。
+
+    为什么需要它（2026-10-06 真机）：微信被 hook 压崩之后进程**没有退出** ——
+    30001 还应答、`IsLogin` 还报 1、`LoginGateInfo.cycles` 还在涨，但句柄表已经空
+    （`handlesAlive = 0`），所有查询都回 `get database handle which named … failed`。
+    三态登录探针把它判成「在线」，于是助手一声不吭地对着一具尸体每 5 秒轮询一轮，
+    用户只看到「它没反应」。
+
+    ⚠️ 与 `fts_alive()` 的分工：那个问「fts 分片读得到吗」（句柄表要重扫时的判据）；
+    这个问「**任一核心库**能不能查」，而且**不受本轮轮询的总时限约束** —— 它是独立探测，
+    被轮询预算掐断会假报「库死了」。
+
+    ⚠️ 只在**触发条件成立时**调用（见 `bot.handle_hook_db_dead`）：它要碰句柄表，
+    库层真死的时候这一次查询本身会触发一次全内存扫描，不是每轮该做的事。
+    """
+    sql = "SELECT 1 AS ok FROM sqlite_master LIMIT 1"      # 任何 sqlite 库都有这张表
+    t0 = time.monotonic()
+    try:
+        fn = getattr(client, "query_sql", None) or getattr(client, "exec_db_query", None)
+        if fn is None:
+            return None, "当前后端没有 query_sql 接口（探不了库）"
+        _invoke(fn, db, sql, timeout=QUERY_TIMEOUT)
+    except Exception as e:
+        from aixed_api import AixedUnreachable
+        if isinstance(e, AixedUnreachable):
+            return None, f"连不上 hook（归登录探针管，这里不下结论）：{e}"
+        return False, f"查 {db} 回：{type(e).__name__}: {str(e)[:160]}"
+    return True, f"{db} 可查（{time.monotonic() - t0:.2f} 秒）"
 
 
 def _v4_fts_session_map(client, refresh=False):
@@ -2739,6 +2868,44 @@ def _v4_pickup_nontext(client, cursors, already, limit=10):
     return out
 
 
+_SHARD_COL_MISS_AT = [0.0]
+
+
+def _note_shard_column_miss():
+    """合并查询没带 `shard` 列时留一行痕（限流 5 分钟）。
+
+    只在**后端/桩不给这一列**时才会走到（真 SQLite 一定会带，见 `_v4_shard_batch_sql`）。
+    那时候我们不推进分片游标 ⇒ 下一轮会重读这批行 —— `aixed_api` 的 `seen`
+    （talker+时间+内容）会把重复挡掉，**只会重复读、不会丢消息**。
+    """
+    now = time.monotonic()
+    if now - _SHARD_COL_MISS_AT[0] < 300.0:
+        return
+    _SHARD_COL_MISS_AT[0] = now
+    print("[live] ⚠️ fts 合并查询没带 `shard` 列（老后端 / 自测桩？）——本轮不推进分片游标，"
+          "靠 seen 去重保证不丢消息（下一轮会重读这批）。", file=sys.stderr, flush=True)
+
+
+def _v4_shard_batch_sql(tables, cursors, limit=POLL_ROWS_PER_SHARD):
+    """把 N 个 fts 分片「各自游标之后的新行」拼成**一条** `UNION ALL`。
+
+    为什么每条分支都包一层子查询：SQLite 的 `ORDER BY` / `LIMIT` **只能挂在整条
+    compound select 的末尾**，不能挂在单个分支上 —— 包成 `SELECT * FROM (…)` 才能
+    「每个分片各自取 N 行」。本地 sqlite3 实测过形状（列名、分支顺序、每片 LIMIT 都对）。
+
+    `tables` 由调用方**先剔除熔断中的分片**再传进来，这里只做拼接。
+    """
+    parts = []
+    for tab in tables:
+        cur = _as_int((cursors or {}).get(tab, 0))
+        parts.append(
+            "SELECT * FROM ("
+            f"SELECT '{_q(tab)}' AS shard, rowid, acontent, session_id, sender_id, "
+            f"create_time, local_type, message_local_id "
+            f"FROM {tab} WHERE rowid > {cur} ORDER BY rowid ASC LIMIT {int(limit)})")
+    return " UNION ALL ".join(parts)
+
+
 def _v4_new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
     """按 **rowid 游标**取新消息——纯索引范围扫描，最便宜的一条路。
 
@@ -2763,39 +2930,62 @@ def _v4_new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
 
     smap = _v4_fts_session_map(client)
     self_id = _v4_fts_self_id(client)
+    # 顺手把「这次到底认不认得自己」记下来（**零额外请求**，这一轮本来就要查它）：
+    # 认不出的机器上 is_self 恒为 0，bot 主循环要靠这个开关打开那条与身份无关的闸门
+    # （见 self_identity_ok 的注释）。
+    _note_self_id(self_id is not None,
+                  "自己那个 wxid 在 fts 的 Name2Id 里查不到，或这几张库这会儿查不动")
     out = []
     smap_refreshed = False        # 本轮最多刷新一次映射（见下面「查不到会话名」那段）
     miss_sids = []
-    for tab in tables:
-        if shard_blocked(tab):
-            # 熔断中：这一轮连查都不查（见 SHARD_FAIL_LIMIT 那段）。
-            # 游标不动 ⇒ 冷却结束从原地接着查，**只会晚、不会丢**。
-            continue
-        cur = _as_int(cursors.get(tab, 0))
-        sql = (
-            "SELECT rowid, acontent, session_id, sender_id, create_time, local_type, "
-            "message_local_id "
-            f"FROM {tab} WHERE rowid > {cur} ORDER BY rowid ASC LIMIT {int(limit)}"
-        )
+
+    # ── 4 个分片**一次查完**（2026-10-06）──────────────────────────────────
+    # 以前是一个分片一条请求：每轮 4 条 SQL + 1 条探活。而 hook **每收到一个请求都要
+    # 遍历校验所有库句柄**（见 hook 使用铁律），所以 4 条请求 = 4 倍这份固定开销。
+    # 合并成一条 `UNION ALL`（每个分片带**自己那个 rowid 游标**、各自 `LIMIT`）之后，
+    # 一轮从 5 个请求降到 2 个 —— 空闲期的常态压力直接砍掉六成，**不动任何延迟**。
+    #
+    # 为什么不担心「丢分片级隔离」：这 4 张表在**同一个** `message_fts.db` 里、共用一份
+    # 句柄，真机上失败从来是一起失败（`message_fts_v4_0..3` 同时报同一句
+    # `get database handle which named message_fts.db failed`）——分片级隔离本来就是幻觉。
+    # 熔断仍然按分片记：被熔断的分片**不进这条 SQL**（不查它），其余的照查。
+    live_tabs = [t for t in tables if not shard_blocked(t)]
+    if live_tabs:
+        sql = _v4_shard_batch_sql(live_tabs, cursors, limit)
         try:
             found = _query(client, "message_fts.db", sql)
-            _note_poll_ok(tab)
         except Exception as e:
-            # 只报第 1/10/50 次，避免刷屏；不静默是因为静默会让人以为「只是没消息」
-            _note_poll_error(tab, e)
-            continue
+            # 合并查询失败没法归因到某一个分片 → 把**参与这次查询的**分片都记一笔
+            # （它们的句柄是同一份，实际上就是这么一起坏的）。只报 1/10/50 次，不刷屏。
+            for tab in live_tabs:
+                _note_poll_error(tab, e)
+            found = []
+        else:
+            for tab in live_tabs:
+                _note_poll_ok(tab)
+
+        shard_unknown = False
         for r in found:
-            rid = _as_int(_pick(r, "rowid", 0))
-            if rid > cursors.get(tab, 0):
-                cursors[tab] = rid
+            tab = str(_pick(r, "shard", 0) or "")
+            rid = _as_int(_pick(r, "rowid", 1))
+            if tab in tables:
+                if rid > _as_int(cursors.get(tab, 0)):
+                    cursors[tab] = rid
+            elif tab:
+                pass                     # 出了个没见过的分片名（新分片？）→ 只推进 __time__
+            else:
+                # 后端没给 `shard` 列（老后端 / 自测桩）：**不推进分片游标**，
+                # 只推进时间游标。代价是下一轮会把这些行再读一遍 —— 而 `aixed_api`
+                # 的 `seen` 去重（talker+时间+内容）会把重复挡掉，**只会重复读、不会丢消息**。
+                shard_unknown = True
             # 同时维护时间游标：万一 fts 掉线要退回按会话表查，得有个合理的起点
-            ts = _as_int(_pick(r, "create_time", 4))
+            ts = _as_int(_pick(r, "create_time", 5))
             if ts > _as_int(cursors.get("__time__", 0)):
                 cursors["__time__"] = ts
-            lt = _as_int(_pick(r, "local_type", 5))
-            text = str(_pick(r, "acontent", 1) or "")
-            sid = _as_int(_pick(r, "session_id", 2))
-            sender = _as_int(_pick(r, "sender_id", 3))
+            lt = _as_int(_pick(r, "local_type", 6))
+            text = str(_pick(r, "acontent", 2) or "")
+            sid = _as_int(_pick(r, "session_id", 3))
+            sender = _as_int(_pick(r, "sender_id", 4))
             talker = smap.get(sid) or ""
             if not talker:
                 # ⚠️ 查不到会话名 ≠ 这条消息不重要。**先刷新一次映射再判**：那份映射是
@@ -2818,19 +3008,21 @@ def _v4_new_messages(client, cursors, limit=POLL_ROWS_PER_SHARD):
                     # 不查原文的话模型只看到用户打的那几个字，答非所问。
                     # 取不到时由 _appmsg_text **如实标注**（绝不假装摘要就是全文）。
                     text = _appmsg_text(client, talker,
-                                        _pick(r, "message_local_id", 6), text)
+                                        _pick(r, "message_local_id", 7), text)
                 else:
                     text = _render_nontext(lt, text)
             out.append({
                 "talker": talker,
                 "content": text,
                 "is_self": 1 if (self_id is not None and sender == self_id) else 0,
-                "time": _fmt_time(_pick(r, "create_time", 4)),
+                "time": _fmt_time(_pick(r, "create_time", 5)),
                 "_ts": ts,
                 # local_type 带下去：上层要区分「文本 vs 图片」才能决定该不该
                 # 响应（例如自己刚发出去的图不该再被当成新消息）。
                 "local_type": lt,
             })
+        if shard_unknown:
+            _note_shard_column_miss()
 
     if miss_sids:
         # 刷新过映射还是拿不到会话名：留一行痕（限流）。上层会按「非目标会话」丢掉它们 ——
@@ -2891,11 +3083,23 @@ def _v4_new_messages_session(client, cursors, limit=200):
                   "本轮收不到任何消息", file=sys.stderr, flush=True)
         return [], cursors
     out = []
+    # 这一层判「我发的」是 `sender == _SELF_WXID`，**只有当 `last_msg_sender` 真的是
+    # wxid 形状时才成立**。实测这列有的构建/有的行给的不是 wxid（数字 id / 空）——
+    # 那种行 `is_self` 必然是 0，也就是「我发的」会被当成对方发的，bot 会去回答
+    # 自己刚发出的回复。下面按**数据**判一次，认不出就把 fail-safe 闸门打开
+    # （见 self_identity_ok）：判据是「这列像不像 wxid」，不是猜。
+    # `_sender_seen`：**这一轮真有可判的发言人**才下结论；空结果（正常空闲）什么都不说
+    # （否则空闲也会被判成「认不出自己」，把日志和排查方向一起指错）。
+    _sender_looks_wxid = False
+    _sender_seen = False
     for r in rows:
         content = str(_pick(r, "summary", 1) or "").strip()
         if not content:
             continue  # 最后一条不是文本（图片/语音…），summary 是空的
         sender = str(_pick(r, "last_msg_sender", 3) or "")
+        _sender_seen = True
+        if sender.startswith("wxid_") and "@" not in sender:
+            _sender_looks_wxid = True
         ts = _as_int(_pick(r, "last_timestamp", 2))
         m = {
             "talker": str(_pick(r, "username", 0) or ""),
@@ -2915,6 +3119,10 @@ def _v4_new_messages_session(client, cursors, limit=200):
             m["local_type"] = _as_int(raw_lt)
         out.append(m)
     out.sort(key=lambda m: m["_ts"])
+    # 这一轮到底认不认得自己：只有「这一列确实长得像 wxid」才算认得出（见上面那段）。
+    if _sender_seen:
+        _note_self_id(bool(_SELF_WXID) and _sender_looks_wxid,
+                      "没拿到 self_wxid，或会话表里的 last_msg_sender 不是 wxid 形状")
     cursors["__time__"] = max([m["_ts"] for m in out], default=since)
     return out, cursors
 

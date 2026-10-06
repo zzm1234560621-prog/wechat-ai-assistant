@@ -10,6 +10,7 @@ selftest_aixed.py 是 hook 层的回归基线，**本文件只 import 它、绝�
 用法：python selftest_live_history.py
 """
 import contextlib
+import inspect
 import io
 import sqlite3
 import sys
@@ -468,6 +469,69 @@ def main():
     ok &= check("取不到 last_msg_type → **不加 local_type 键**（老库行为不变）",
                 len(nm) == 1 and "local_type" not in nm[0], nm)
 
+    # 「我在这条路上认不认得出来」：这层比的是 `sender == _SELF_WXID`，所以只有
+    # `last_msg_sender` 真的是 wxid 形状时才算认得出。有的行/有的构建给的是数字 id，
+    # 那种行 is_self 必然是 0（= 我发的会被当成对方发的，bot 会去答自己刚发的回复），
+    # 这时 fail-safe 闸门必须打开（见 live_history.self_identity_ok）。
+    ok &= check("★ 兜底路的 sender 是 wxid → 认得自己（兜底闸门不打开）",
+                live_history.self_identity_ok() is True,
+                live_history.self_identity_ok())
+
+    def _session_numeric_sender(db, sql):
+        if db == "session.db":
+            return [{"username": "filehelper", "summary": "数字 id 的说话人",
+                     "last_timestamp": V4_SESSION_TS, "last_msg_sender": 49,
+                     "last_msg_type": 1}]
+        _dead_db(db)
+
+    _num, _ = live_history._v4_new_messages_session(
+        _FakeClient(_session_numeric_sender), {"__time__": NOW})
+    ok &= check("★ 兜底路的 sender 不是 wxid（数字 id）→ 如实判「认不出自己」，闸门打开",
+                live_history.self_identity_ok() is False
+                and bool(_num) and _num[0].get("is_self") == 0,
+                (live_history.self_identity_ok(), _num))
+    live_history._SELF_ID_OK = None                       # 别影响后面的用例
+
+    # 接线钉子：**三条**收消息的路各自都要把「认不认得自己」记下来，否则 fail-safe
+    # 闸门在某条路上永远是「不知道」＝不生效（那正是它要防的那条路）。
+    _wiring = (inspect.getsource(live_history._v4_new_messages)
+               + inspect.getsource(live_history._v4_history_from_tables)
+               + inspect.getsource(live_history._v4_new_messages_session))
+    ok &= check("★ 三条路（fts / 会话表 / session 兜底）都记了「认不认得自己」",
+                _wiring.count("_note_self_id(") >= 3, _wiring.count("_note_self_id("))
+
+    # 「认不出自己」必须**留一行痕**（以前一个字都不说，用户只看得到「重复回复」）；
+    # 但要等连续 3 轮 —— 单轮查不到也可能只是 hook 那一瞬间不接，一抖就喊
+    # 「认不出自己」会把排查方向指错（本项目反复踩过「日志骗人」）。
+    _save_note, _save_fails = live_history._SELF_ID_NOTE_ONCE[0], live_history._SELF_ID_FAILS[0]
+    try:
+        live_history._SELF_ID_NOTE_ONCE[0] = False
+        live_history._SELF_ID_FAILS[0] = 0
+        _err = io.StringIO()
+        with contextlib.redirect_stderr(_err):
+            live_history._note_self_id(False, "自测：对不上")
+            live_history._note_self_id(False, "自测：对不上")
+            _early = _err.getvalue()
+            live_history._note_self_id(False, "自测：对不上")
+            live_history._note_self_id(False, "自测：对不上")
+        _txt = _err.getvalue()
+        ok &= check("★ 第 1~2 轮认不出**先不喊**（可能只是 hook 抖了一下）",
+                    _early == "", repr(_early))
+        ok &= check("★ 连续 3 轮认不出 → 留一行痕，写清原因与修法，且不刷屏",
+                    _txt.count("认不出「我自己」") == 1
+                    and "自测：对不上" in _txt and "find_self_wxid" in _txt,
+                    repr(_txt[:160]))
+        _err2 = io.StringIO()
+        with contextlib.redirect_stderr(_err2):
+            live_history._note_self_id(True)
+            live_history._note_self_id(False, "又一次")
+        ok &= check("认得出之后计数清零（下次真的要连续 3 轮才再报）",
+                    _err2.getvalue() == "" and live_history._SELF_ID_FAILS[0] == 1,
+                    (repr(_err2.getvalue()), live_history._SELF_ID_FAILS[0]))
+    finally:
+        live_history._SELF_ID_NOTE_ONCE[0], live_history._SELF_ID_FAILS[0] = _save_note, _save_fails
+        live_history._SELF_ID_OK = None
+
     # 正常空闲**不许**报故障（否则每 5 秒刷一行吓人的日志）
     _clear_poll_errors()
     idle = _FakeClient(_session_idle)
@@ -647,6 +711,7 @@ def main():
     ok &= _t_align_stale_cursor()
     ok &= _t_skip_far_behind()
     ok &= _t_talker_miss()
+    ok &= _t_fts_batch()
 
     print("\n── 非文本补漏：图片不在 fts 里，得靠 SessionTable 的信号捞回来 ──")
     ok &= _t_nonttext_pickup()
@@ -903,13 +968,22 @@ def _t_align_stale_cursor():
                 tab = sql.split("FROM ")[-1].strip()
                 return [{"m": state["head"][tab]}] if tab in state["head"] else []
             if "WHERE rowid >" in sql:
-                tab = sql.split("FROM ")[1].split()[0]
-                bound = int(sql.split("WHERE rowid >")[1].split()[0])
-                if tab not in state["head"] or bound >= state["head"][tab]:
-                    return []          # 一行都取不到（死游标 / 还没新消息）
-                return [{"rowid": state["head"][tab], "acontent": "重建后第一条",
-                         "session_id": 1, "sender_id": 1, "create_time": 1,
-                         "local_type": 1, "message_local_id": 1}]
+                # ⚠️ 别假设「一条 SQL 只有一个分片」：2026-10-06 起收消息那条路把
+                # **4 个分片合并成一条 `UNION ALL`**（每片一个子查询、各自游标）。
+                # 这里按段扫，两种形状都认。
+                out = []
+                for chunk in sql.split("FROM ")[1:]:
+                    parts = chunk.split()
+                    tab = parts[0] if parts else ""
+                    if not tab or tab.startswith("(") or "WHERE rowid >" not in chunk:
+                        continue
+                    bound = int(chunk.split("WHERE rowid >")[1].split()[0])
+                    if tab in state["head"] and bound < state["head"][tab]:
+                        out.append({"shard": tab, "rowid": state["head"][tab],
+                                    "acontent": "重建后第一条",
+                                    "session_id": 1, "sender_id": 1, "create_time": 1,
+                                    "local_type": 1, "message_local_id": 1})
+                return out
             return []
         c = _FakeClient(router)
         c._lh_fts_tables = (time.time(), list(tabs))
@@ -956,6 +1030,115 @@ def _t_align_stale_cursor():
     new3, fixed3 = live_history.align_stale_cursors(bad, {"message_fts_v4_0": 200524})
     ok &= check("★ 头部查不到时保守不动（不许猜）",
                 new3 == {"message_fts_v4_0": 200524} and fixed3 == {}, (new3, fixed3))
+    return ok
+
+
+def _t_fts_batch():
+    """4 个 fts 分片**一次查完**：请求数 5 → 2、行为不变（2026-10-06）。
+
+    ## 为什么有它
+
+    hook **每收到一个请求都要遍历校验所有库句柄**（见 CLAUDE.md「hook 使用铁律」），
+    所以「一个分片一条 SQL」= 4 倍这份固定开销。合并成一条 `UNION ALL`（每个分片带
+    **自己那个 rowid 游标**、各自 `LIMIT`）之后，一轮从 5 个请求降到 2 个 ——
+    空闲期的常态压力砍掉六成，而**延迟一点没动**。
+    （为什么不去做「写入驱动轮询」：本机实测库一直在被写，那条已被否，见
+    `docs/poll-reliability-notes.md` §12。）
+
+    ## 这一条钉什么
+
+    * **一次请求**取回多个分片的新行；**游标按分片各自推进**；
+    * 熔断中的分片**不进**这条 SQL（照旧不查它）；
+    * 后端不给 `shard` 列时：消息照样返回、**不推进分片游标**（靠 `seen` 去重 ⇒
+      只会重复读、不会丢），并留一行痕（限流）。
+    """
+    print("\n── fts 分片合并成一条查询：请求数 5 → 2（2026-10-06）──")
+    ok = True
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+    live_history._SHARD_COL_MISS_AT[0] = 0.0
+
+    def mk(rows_by_shard, with_shard=True):
+        def router(db, sql):
+            if "Name2Id" in sql and "username" in sql:
+                return [{"rowid": 100, "username": "wxid_friend"},
+                        {"rowid": 55, "username": SELF_WXID}]
+            if "SELECT rowid FROM Name2Id" in sql:
+                return [{"rowid": 55}]
+            if "WHERE rowid >" in sql:
+                out = []
+                for tab, rows in rows_by_shard.items():
+                    for rid, txt, ts in rows:
+                        r = {"rowid": rid, "acontent": txt, "session_id": 100,
+                             "sender_id": 100, "create_time": ts, "local_type": 1,
+                             "message_local_id": 1}
+                        if with_shard:
+                            r["shard"] = tab
+                        out.append(r)
+                return out
+            return []
+        c = _FakeClient(router)
+        c._lh_fts_tables = (time.time(), sorted(rows_by_shard))
+        c._lh_fts_selfid = (time.time(), 55)
+        return c
+
+    rows = {"message_fts_v4_0": [(11, "a0", 1000), (12, "a1", 1001)],
+            "message_fts_v4_1": [(7, "b0", 1002)]}
+    c = mk(rows)
+    msgs, cur = live_history._v4_new_messages(
+        c, {"message_fts_v4_0": 10, "message_fts_v4_1": 0})
+    fts_sqls = [s for d, s in c.sql_log if d == "message_fts.db" and "WHERE rowid >" in s]
+    ok &= check("★ 两个分片只发**一条** fts 查询", len(fts_sqls) == 1, len(fts_sqls))
+    ok &= check("★ 一条 SQL 里两个分片都在（UNION ALL + 各自那个游标）",
+                bool(fts_sqls) and "UNION ALL" in fts_sqls[0]
+                and "message_fts_v4_0 WHERE rowid > 10" in fts_sqls[0]
+                and "message_fts_v4_1 WHERE rowid > 0" in fts_sqls[0],
+                (fts_sqls or [""])[0][:170])
+    ok &= check("每个分片各自 LIMIT（不是整条共用一个）",
+                bool(fts_sqls)
+                and fts_sqls[0].count(f"LIMIT {live_history.POLL_ROWS_PER_SHARD}") == 2,
+                (fts_sqls or [""])[0][:170])
+    ok &= check("三条消息都回来了",
+                sorted(m["content"] for m in msgs) == ["a0", "a1", "b0"], msgs)
+    ok &= check("★ 游标按**分片各自**推进",
+                cur.get("message_fts_v4_0") == 12 and cur.get("message_fts_v4_1") == 7, cur)
+    ok &= check("时间游标也在维护（fts 掉线要退回按会话表查）",
+                cur.get("__time__") == 1002, cur.get("__time__"))
+    ok &= check("这次成功了 → 熔断/失败账清掉",
+                live_history.poll_errors() == {}, live_history.poll_errors())
+
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
+    live_history._shard_blocked_until["message_fts_v4_1"] = time.monotonic() + 60
+    c2 = mk(rows)
+    live_history._v4_new_messages(c2, {"message_fts_v4_0": 10, "message_fts_v4_1": 0})
+    s2 = [s for d, s in c2.sql_log if d == "message_fts.db" and "WHERE rowid >" in s]
+    ok &= check("★ 熔断中的分片**不进**这条 SQL（只查没熔断的那个）",
+                bool(s2) and "message_fts_v4_0" in s2[0] and "message_fts_v4_1" not in s2[0],
+                (s2 or [""])[0][:150])
+    live_history.reset_shard_breakers()
+
+    ok &= check("分片全在熔断里 → 一条 fts 查询都不发（拼出来是空串）",
+                live_history._v4_shard_batch_sql([], {}) == "")
+
+    c3 = mk(rows, with_shard=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        msgs3, cur3 = live_history._v4_new_messages(
+            c3, {"message_fts_v4_0": 0, "message_fts_v4_1": 0})
+        live_history._SHARD_COL_MISS_AT[0] = 0.0        # 放开限流，再触发一次
+        live_history._v4_new_messages(c3, {"message_fts_v4_0": 0, "message_fts_v4_1": 0})
+        live_history._v4_new_messages(c3, {"message_fts_v4_0": 0, "message_fts_v4_1": 0})
+    ok &= check("★ 后端不给 shard 列 → 消息照样返回（不吞消息）", len(msgs3) == 3, len(msgs3))
+    ok &= check("★ 这时**不推进分片游标**（靠 seen 去重：只会重复读、不会丢）",
+                cur3.get("message_fts_v4_0") in (0, None)
+                and cur3.get("message_fts_v4_1") in (0, None)
+                and cur3.get("__time__") == 1002, cur3)
+    ok &= check("★ 并留一行痕，且**限流**（同一句话不刷屏）",
+                buf.getvalue().count("没带 `shard` 列") == 2, buf.getvalue()[:80])
+
+    live_history.reset_shard_breakers()
+    _clear_poll_errors()
     return ok
 
 

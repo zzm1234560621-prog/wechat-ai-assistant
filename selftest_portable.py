@@ -170,8 +170,12 @@ def main():
     do_scripts = [f for f in os.listdir(inst_dir)
                   if f.lower().startswith("do_") and f.lower().endswith(".ps1")] \
         if os.path.isdir(inst_dir) else []
-    check(f"8 个 do_*.ps1 都在（实际 {len(do_scripts)} 个）", len(do_scripts) == 8,
-          f"找到：{sorted(do_scripts)}")
+    # 部署/卸载脚本的**集合**（2026-10-06：加「只替换 version.dll」的 do_fix_hook.ps1 后为 10 个）。
+    # 这条钉的是「别把随包脚本弄丢」；个数变化时**必须回来一起改**，
+    # 免得新增一个脚本忘了带 BOM/不引入 _common.ps1。
+    EXPECTED_DO_SCRIPTS = 10
+    check(f"{EXPECTED_DO_SCRIPTS} 个 do_*.ps1 都在（实际 {len(do_scripts)} 个）",
+          len(do_scripts) == EXPECTED_DO_SCRIPTS, f"找到：{sorted(do_scripts)}")
     bad = []
     for name in sorted(do_scripts):
         t = open(os.path.join(inst_dir, name), "r", encoding="utf-8").read()
@@ -297,6 +301,24 @@ def main():
         if os.path.isfile(bp) else ""
     check("打包脚本的「从这里开始.txt」首推它",
           "一键部署.bat" in bp_txt and "助手.bat**，按 **[9]" not in bp_txt)
+
+    # ── 7b · 诊断工具必须随包走（2026-10-06 真机踩出来的）──────────────────
+    print("── 7b · 出问题时有工具可用：hook_doctor 随包 ──")
+    # 为什么钉这一条：真机上用户拿到新包却起不来（微信里那份 hook 是旧的），
+    # 而**包里没有任何诊断工具**——诊断脚本当时只存在于开发机的 `_audit\`（打包时被排除）。
+    # 于是只能靠来回猜。规矩：诊断工具必须在包根，且它能 import 到判据模块 hook_check。
+    doctor_py = os.path.join(BASE, "tools", "hook_doctor.py")
+    hc_py = os.path.join(BASE, "hook_check.py")
+    check("tools/hook_doctor.py 存在（hook/闸门的一站式诊断）", os.path.isfile(doctor_py))
+    check("hook_check.py 存在（安装目录与包内 DLL 的判据唯一真源）", os.path.isfile(hc_py))
+    check("打包脚本会把 hook_doctor.py 放到**包根**（用户不用 cd 进 tools）",
+          "hook_doctor.py" in bp_txt and "$pkg 'hook_doctor.py'" in bp_txt)
+    # 判据逻辑只能有一份：doctor 必须 import hook_check，而不是自己再写一遍找目录/比哈希
+    doc_txt = open(doctor_py, "r", encoding="utf-8").read() if os.path.isfile(doctor_py) else ""
+    check("doctor 复用 hook_check（不另写第二份判据）",
+          "import hook_check" in doc_txt)
+    check("「从这里开始.txt」里首推先跑 doctor（排错第一站）",
+          "hook_doctor.py" in bp_txt and "先跑" in bp_txt)
 
     # ── 8 · .bat 必须是纯 ASCII ────────────────────────────────────────
     print("── 8 · .bat 全是纯 ASCII（GBK 控制台才不会乱码）──")

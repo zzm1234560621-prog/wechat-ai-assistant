@@ -14,6 +14,7 @@
 风格照抄 selftest_aixed.py / selftest_executor_chain.py：ok/FAIL + 结尾汇总 + 失败 sys.exit(1)。
 """
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -147,6 +148,15 @@ def main():
     chk(specs_file == direct, "requirements_specs() 默认读的就是项目根 requirements.txt")
     chk("pypdf" in lower, "requirements.txt 里有 pypdf（读收到的 PDF 要用）")
     chk("wcferry" in lower, "requirements.txt 里有 wcferry")
+    # ★ zstandard 必须在这份清单里（2026-10-06 第二台部署机真机）：
+    #   微信把长文本/appmsg/**语音条 XML** 都用 zstd 存，缺了它 `decode_msg_content`
+    #   只能给空串 —— 表现是「文字正常、只有语音答不上来」（拿不到 voicelength），
+    #   而且**不报错**。它以前只装在开发机的 .venv 里（Required-by 是空的），
+    #   没进清单 ⇒ 换台电脑就缺。这条钉子就是不让它再掉出去。
+    chk("zstandard" in lower,
+        "★ requirements.txt 里有 zstandard（解 zstd 存的语音 XML / 长文本 / appmsg）")
+    chk("zstandard" in env.REQUIRED_PKGS,
+        "★ REQUIRED_PKGS 含 zstandard（启动自检 / installer 都要它）")
     chk(all(s and not s.startswith("#") for s in specs_file),
         f"注释/空行都被过滤掉（解析出 {len(specs_file)} 条：{names_file}）")
     chk("yaml" in env.REQUIRED_PKGS, "REQUIRED_PKGS 含 yaml（PyYAML 的导入名）")
@@ -658,6 +668,132 @@ def main():
         example = json.load(f)
     chk(isinstance(example.get("optional"), dict) and "voice" in example["optional"],
         f"settings.example.json 里有 optional 段：{example.get('optional')}")
+
+    # ── 打包机：self_wxid 的四级来源与核实（2026-10-05 / 10-06 两次部署真机的回归）───
+    # 事故一（10-05）：包里的 config.yaml 是 config.example.yaml 的拷贝，`self_wxid: ""`
+    # 是空的，而这个 hook 构建的 `/GetSelfProfile` **不给 wxid** —— 换台电脑装完就露空，
+    # 表现是「它把自己以前说过的话当成你的新提问、再答一遍」。
+    # 事故二（10-06）：补上的「从 contact 表认」那条判据是**行序经验**，第二台电脑上
+    # 它认出了**别人** ⇒ `is_self` 恒为 0 ⇒ bot 自己回答自己刚发出的回复（「重复回复」），
+    # 还是不报错。所以现在认出来的值要拿**本机账号目录**核实，对不上就否掉。
+    print("\n打包机：self_wxid 四级来源与核实")
+    with open(os.path.join(HERE, "config.example.yaml"), encoding="utf-8") as f:
+        ex_yaml = f.read()
+    chk(re.search(r"(?m)^self_wxid:\s*", ex_yaml) is not None,
+        "★ config.example.yaml 里有 self_wxid 这一行（包里的 config.yaml 就是从它拷的）")
+    chk("contact 表" in ex_yaml and "GetSelfProfile" in ex_yaml,
+        "★ 注释写明来源与「有的构建不给 wxid」，用户才知道空着也能跑")
+
+    import aixed_api
+    import bot as _bot
+    import verify_real as _vr
+    chk(callable(getattr(aixed_api, "detect_self_wxid", None)),
+        "aixed_api 导出模块级 detect_self_wxid()（给启动/自检复用）")
+    chk(callable(getattr(aixed_api.AixedClient, "detect_self_wxid", None)),
+        "AixedClient 上有 detect_self_wxid 方法（认不出给空串，绝不猜）")
+    chk(callable(getattr(aixed_api, "resolve_self_wxid", None)),
+        "★ aixed_api.resolve_self_wxid() 是「我是谁」的唯一解析入口")
+    chk(callable(getattr(aixed_api, "account_dir_wxids", None)),
+        "★ 离线判据（本机账号目录）也导出，用来核实 contact 表的猜测")
+    chk("resolve_self_wxid" in inspect.getsource(_bot.main),
+        "★ bot.main 启动那一段走这条唯一入口（不再自己抄一份）")
+    chk(callable(getattr(_vr, "resolve_self_wxid", None)),
+        "verify_real 把解析抽成了可测纯函数 resolve_self_wxid()")
+    chk("_resolve_self_wxid" in inspect.getsource(_vr.resolve_self_wxid),
+        "★ 自检那条路**委托**给 aixed_api 的同一份实现（两处不许各写一份）")
+
+    class _Probe(aixed_api.AixedClient):
+        """假客户端：接口给不给 wxid、contact 表认不认得出，都由构造参数决定。"""
+
+        def __init__(self, hook_wxid="", contact_row=None):
+            super().__init__("http://127.0.0.1:1")
+            self.hook_wxid = hook_wxid
+            self.contact_row = contact_row
+            self.calls = []
+
+        def get_self_wxid(self):
+            self.calls.append("get_self_wxid")
+            return self.hook_wxid
+
+        def query_sql(self, db, sql, timeout=None):
+            self.calls.append("query_sql:" + db)
+            return [self.contact_row] if self.contact_row else []
+
+    # 账号目录是**本机事实**（这台机器上有几个账号由文件系统决定），所以自测里必须替换掉，
+    # 否则「有没有核实过」这一条会随跑自测的机器而变（本机就有两个账号目录）。
+    _saved_dirs = aixed_api.account_dir_wxids
+    try:
+        aixed_api.account_dir_wxids = lambda: ["wxid_fromdb"]
+
+        _p1 = _Probe(hook_wxid="wxid_fromhook", contact_row={"username": "wxid_fromdb"})
+        _w1 = _vr.resolve_self_wxid({"self_wxid": "wxid_fromcfg"}, _p1, "aixed")
+        chk(_w1[0] == "wxid_fromcfg" and _w1[1] == "config.yaml" and _p1.calls == [],
+            f"★ ① 配置里有值就不查任何库（走 verify_real 那个入口，它委托同一份实现）：{_w1}")
+
+        _p2 = _Probe(hook_wxid="wxid_fromhook", contact_row={"username": "wxid_fromdb"})
+        _w2 = _vr.resolve_self_wxid({}, _p2, "aixed")
+        chk(_w2[0] == "wxid_fromhook" and _w2[1] == "hook 接口"
+            and _p2.calls == ["get_self_wxid"],
+            f"★ ② 接口给得出就不冤枉它去认（不做多余的扫描）：{_w2} / {_p2.calls}")
+
+        # ③ 账号目录唯一 → 离线确定，连 contact 表都不查
+        aixed_api.account_dir_wxids = lambda: ["wxid_onlyone123"]
+        _p3a = _Probe(hook_wxid="", contact_row={"username": "wxid_fromdb"})
+        _w3a = aixed_api.resolve_self_wxid({}, _p3a, "aixed")
+        chk(_w3a[0] == "wxid_onlyone123" and "账号目录" in _w3a[1] and _p3a.calls == ["get_self_wxid"],
+            f"★ ③ 只有一个账号目录 → 用目录名（离线判据）：{_w3a} / {_p3a.calls}")
+
+        # ④ contact 表猜的与账号目录**不符** → 否掉（认错比认不出更糟）
+        aixed_api.account_dir_wxids = lambda: ["wxid_aaaa1111bbbb", "wxid_cccc2222dddd"]
+        _p3 = _Probe(hook_wxid="", contact_row={"username": "wxid_fromdb"})
+        _w3 = aixed_api.resolve_self_wxid({}, _p3, "aixed")
+        chk(_w3[0] == "" and "否掉" in _w3[3]
+            and _p3.calls == ["get_self_wxid", "query_sql:contact.db"],
+            f"★ ④ 猜的人不在本机账号里 → **否掉**，如实说认不出：{_w3} / {_p3.calls}")
+
+        # ④ 猜的与账号目录**相符** → 采用
+        aixed_api.account_dir_wxids = lambda: ["wxid_fromdb", "wxid_cccc2222dddd"]
+        _w3b = aixed_api.resolve_self_wxid({}, _Probe(hook_wxid="",
+                                                      contact_row={"username": "wxid_fromdb"}),
+                                           "aixed")
+        chk(_w3b[0] == "wxid_fromdb" and "已核实" in _w3b[1],
+            f"★ ④ 与账号目录对得上 → 采用并标明已核实：{_w3b}")
+    finally:
+        aixed_api.account_dir_wxids = _saved_dirs
+
+    aixed_api.account_dir_wxids = lambda: []
+    try:
+        _p4 = _Probe(hook_wxid="", contact_row={"username": "wxid_fromdb"})
+        _w4 = aixed_api.resolve_self_wxid({}, _p4, "aixed")
+        chk(_w4[0] == "wxid_fromdb" and "未核实" in _w4[1],
+            f"找不到账号目录时照旧兜底、但如实标注未核实：{_w4}")
+    finally:
+        aixed_api.account_dir_wxids = _saved_dirs
+
+    _p5 = _Probe(hook_wxid="", contact_row=None)
+    _w5 = aixed_api.resolve_self_wxid({}, _p5, "aixed")
+    chk(_w5[0] == "" and _w5[1] == "",
+        f"全空时**如实给空**（自检照旧报 ❌，绝不编一个 wxid）：{_w5}")
+    chk("detect_self_wxid" in inspect.getsource(aixed_api.resolve_self_wxid),
+        "★ 「从库里认」那一级还在唯一入口里（认不出才走它）")
+
+    class _FakeClient(aixed_api.AixedClient):
+        """模块级入口的第二种调用形态：只认 query_sql(db, sql)。"""
+
+        def __init__(self):
+            super().__init__("http://127.0.0.1:1")
+
+        def query_sql(self, db, sql, timeout=None):
+            self.seen = (db, sql)
+            return [{"username": "wxid_abcdefghijkl"}]
+
+    _fc = _FakeClient()
+    chk(aixed_api.detect_self_wxid(_fc) == "wxid_abcdefghijkl",
+        "★ 模块级入口认得出来（日志里说的「从库里认出来了」就是这条）")
+    chk(_fc.seen[0] == "contact.db" and "FROM contact" in _fc.seen[1],
+        f"★ 只查 contact 表的一行：{_fc.seen}")
+    chk(aixed_api.detect_self_wxid(object()) == "",
+        "不支持的客户端给空串（不抛异常、不猜一个 id）")
 
     # ── 汇总 ──────────────────────────────────────────────────────────
     print()

@@ -67,6 +67,18 @@ foreach ($d in @('docs', 'tools', 'plugins', 'searxng')) {
     if (Test-Path $p) { Copy-Item $p $pkg -Recurse -Force }
 }
 
+# `hook_doctor.py`（hook 版本 / 启动闸门的一站式只读诊断）**必须在包根也放一份**：
+# 用的人是「拿到包的人」，让他 cd 进 tools\ 再敲路径是多一道坎——而少了它，
+# 2026-10-06 那种「换了新包仍起不来」就只能靠猜（真机就吃了这一口：
+# 微信目录里的 hook 是旧的，而没有任何地方对比过包里那份与已装那份）。
+# `selftest_portable.py` 钉着「包根有 hook_doctor.py 且能 import hook_check」。
+$doctor = Join-Path $root 'tools\hook_doctor.py'
+if (Test-Path $doctor) {
+    Copy-Item $doctor (Join-Path $pkg 'hook_doctor.py') -Force
+} else {
+    Write-Warning '缺少 tools\hook_doctor.py（出问题时包里没有诊断工具）'
+}
+
 # searxng 复制完之后，**必须剪掉两样东西**（它们会在开发机上长出来）：
 #   * `.venv\`（约 91MB）—— venv 里记的是绝对路径，跨机器拷必坏，和 bot 自己的 .venv
 #     同一条规矩；新机器上由「一键部署」第 3 步现建。
@@ -122,6 +134,12 @@ $quickstart = @'
      建议先拿小号试，风险自担。
   2. hook 是按微信 **4.1.10.27** 这一个版本编译的，微信一升级就失效。
      装 hook 时会顺手挡住微信自动更新，别自己去升级微信。
+
+■ 再知道一件（2026-10-06 起）：**助手要以管理员身份运行**
+  启动助手时会弹一次 UAC，**点「是」**。这不是可选步骤：语音条要读微信进程内存，
+  而普通权限读不了提权开的微信（Windows 的完整性级别限制）。
+  点「否」也能起来，但语音条会明确告诉你读不出来。
+  （为什么、以及"开机自启那条路不会自动提权"，见 docs\admin-elevation-notes.md）
 
 ■ 装法（推荐）：**双击 `一键部署.bat`，然后一路回车**（它就等于助手.bat → [9]，省掉按菜单）
   它按真实顺序走一遍：
@@ -182,6 +200,16 @@ $quickstart = @'
   然后**全程在微信里操作**，直接跟助手说话就行。
 
 ■ 出问题了看哪
+  · **先跑 `hook_doctor.py`**（只读，助手开着也能跑）：
+      .venv\Scripts\python.exe hook_doctor.py
+    它会一次说清四件事：微信目录里的 hook 是哪一版（**和包里那份比**）、
+    运行中的 hook 是哪一版、启动闸门为什么没开、微信数据目录里的库有没有在被写。
+    ⚠️ 最常踩的一条：**解压新包不会替换微信目录里那份 hook**（两个文件）。
+       助手一直刷「hook 已加载，但数据库打不开（微信没登录？）」时，先跑这一条：
+         (Get-Item "C:\Program Files\Tencent\Weixin\version.dll").Length
+       是 **519168** 就是旧的（新版 **527360**）。修法：助手.bat → [8] → [7] → [4]
+       只替换 version.dll，然后**完全退出微信再打开、扫码登录**。
+       详细判据见 README 的「助手一直刷…怎么办」一节。
   · README.md 的「排错」一节（最常见的问题都在那儿）
   · 助手没反应 → 先看 bot.log（或 助手.bat → [6]）
   · 想自测（不需要真微信、不碰 hook）：助手.bat → [8] → 跑全部自测

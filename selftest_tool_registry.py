@@ -24,6 +24,9 @@ send_asset」「暂存区空着要说清、绝不许编一张」这些判据—�
 3. 工具名没出现在 **`config.example.yaml` 的 system_prompt** 里 → 发出去就丢指导；
 4. `config.yaml` 有、`config.example.yaml` **没有**的顶层配置段 → 同上，功能只在开发机上活着；
 5. `TOOLS` 里重名、或缺 `description` / `parameters` → 模型容易用错。
+6. 工具的**可达范围放宽了**（2026-10-05 真踩过：`send_file` 从「只认 `msg/file/`」
+   放宽成「也认盘上绝对路径」，代码/规格都改了），但**模型真正读的那几处没跟着说**
+   → 模型照旧回「做不到」，功能等于没做。模型可见的文本必须说全。
 
 用法：
     .venv\\Scripts\\python.exe selftest_tool_registry.py
@@ -185,6 +188,33 @@ def main():
         miss = [t["name"] for t in contract if t["name"] not in sent]
         check("这些 guidance **真的会进系统提示**（存了不送比不存更坏）",
               not miss, f"送不出去的：{miss}")
+
+    # ── 6 · 可达范围放宽了，**模型看得见的那几处**必须跟着说 ──────────────
+    #
+    # `send_file` 的可达范围在 2026-10-04（T9）就从「只认微信 `msg/file/`」放宽成
+    # 「`msg/file/` ∪ 盘上任意路径（过 `files.path_ok`）」了：代码、`t_send_file`
+    # 的 docstring、`docs/computer-files-spec.md` 全改了 —— **但模型真正读的两处没改**：
+    # `TOOLS['send_file'].description` 还写着「只给文件名，不要带目录或盘符」，
+    # 两份 config 的 system_prompt 还写着「按文件名在微信收/发过的文件里定位」。
+    # 后果（2026-10-05 真机）：用户说「把桌面上 TF/TF/1.docx 发到群里」，助手照那份
+    # 说明**如实拒绝** —— 它没说谎，它只是**不知道**；用户看到的就是「这功能做不到」。
+    # 所以这条钉死：**模型可见的文本必须说全两种给法**，否则放宽等于没放宽。
+    print("── 6 · send_file 的两种来源都写进了模型可见的文本 ──")
+    _sf = next((t for t in agent_tools.TOOLS if t["name"] == "send_file"), None)
+    _desc = (_sf or {}).get("description") or ""
+    check("send_file 的说明提到按文件名找（`msg/file/`）这一路",
+          "msg/file/" in _desc, "老那条路丢了？模型会以为盘上那份也能按名字找到")
+    check("send_file 的说明提到「绝对路径」（盘上那份文件）这一路",
+          "绝对路径" in _desc,
+          "放宽只写在代码里 = 模型照旧回「发不了电脑上的文件」（2026-10-05 真机）")
+    for _label, _prompt in (("config.example.yaml", pe),
+                            ("config.yaml", prompt_of(li, "config.yaml"))):
+        if _prompt is None:
+            skill(f"{_label} 没有 system_prompt——跳过")
+            continue
+        check(f"{_label} 的 system_prompt 也提到「绝对路径」",
+              "绝对路径" in _prompt,
+              "模型可见的指导没跟上放宽：开发机上 / 发布包里会静默差一半")
 
     print("=" * 66)
     if _ok:

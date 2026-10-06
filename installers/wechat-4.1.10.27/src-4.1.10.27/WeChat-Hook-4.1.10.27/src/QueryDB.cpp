@@ -135,6 +135,25 @@ void Route_QueryDB(httplib::Server& svr)
         // 所有查询回 "get database handle ... failed"，而表面上不报任何错。
         // 把原因摆在这儿，用户/上层一眼就能看到，不用猜是不是「掉登录」了。
         resp["LoginGate"] = LoginGateNote();
+        // 闸门的**结构化计数**（2026-10-05 加）：闸门没开时，光看一个 0 分不清是
+        // 「文件侧没到阈值」「句柄拿不到」还是「判据线程压根没跑」。把这些数摆出来，
+        // 下次排查不用靠猜（这是本项目最怕的静默失效的对立面）。
+        const LoginGateInfo gi = GetLoginGateInfo();
+        json gate = {
+            {"dbReady", (uint64_t)gi.dbReady},
+            {"running", (uint64_t)gi.running},
+            {"cycles", (uint64_t)gi.cycles},
+            {"stableChecks", (uint64_t)gi.stableChecks},
+            {"groupsFresh", (uint64_t)gi.groupsFresh},
+            {"handleGroups", (gi.handleGroups == 0xFFFFFFFFu) ? -1 : (int)gi.handleGroups},
+            {"handleTotal", (uint64_t)gi.handleTotal},
+            {"waitChecks", (uint64_t)gi.waitChecks},
+            {"quietMs", (uint64_t)gi.quietMs},
+            {"dbsTracked", (uint64_t)gi.dbsTracked},
+            {"handlesAlive", (uint64_t)gi.handlesAlive},
+            {"handleNames", gi.handleNames}
+        };
+        resp["LoginGateInfo"] = gate;
         res.set_content(resp.dump(4, ' ', false), "application/json");
         });
 
