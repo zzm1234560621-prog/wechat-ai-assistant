@@ -43,7 +43,7 @@ the whole conversation happens in the native WeChat window — no second client 
 
 1. Go to **[Releases](https://github.com/zzm1234560621-prog/wechat-ai-assistant/releases)** and download the latest package (about 240MB)
 2. Unzip it anywhere (keep Chinese characters and spaces out of the path, to save yourself trouble)
-3. **Double-click `一键部署.bat` and just keep pressing Enter**, about 15 minutes
+``一键部署.bat` and just keep pressing Enter**, about 15 minutes
 4. Day to day, use **`助手.bat`**: `[3]` start / `[4]` stop / `[5]` status / `[6]` logs
 
 This package **ships with**: the official WeChat 4.1.10.27 installer, the compiled hook DLL, a hook source snapshot,
