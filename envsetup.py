@@ -199,7 +199,7 @@ OPTIONAL_PIP = {
         # ⇒ 装了最新 av 的机器上**每一条转写都抛 TypeError**（语音条和音频文件一起读不出来，
         # 用户只看到「解析失败」）。本机 av 18.1.0 正常、那台 av 19.0.1 全废。
         # 判据与用户可见的提示在 `audio_read.av_conflict()`（`--status` 会直接报出来）。
-        "specs": ["faster-whisper", "pilk", "av<19"],
+        "specs": ["faster-whisper", "pilk", "av<19", "zhconv"],
         "imports": ["faster_whisper", "pilk"],
     },
     "formats": {

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -291,7 +292,11 @@ def available(cfg):
         return False, ("本地转写模型还没下载（不联网自动下，得用户显式执行）：\n"
                        f"  .venv\\Scripts\\python.exe audio_read.py --setup\n"
                        f"会下到 {model_dir(cfg)}（走 hf-mirror 镜像）。")
-    return True, f"本地转写：faster-whisper {model_name(cfg)}（音频不出本机）"
+    note = ""
+    if simplify_enabled(cfg) and not _has("zhconv"):
+        note = ("（⚠️ `audio.simplify` 开着但没装 **zhconv**：繁体会原样保留。"
+                "装：`.venv\\Scripts\\python.exe -m pip install zhconv`）")
+    return True, f"本地转写：faster-whisper {model_name(cfg)}（音频不出本机）{note}"
 
 
 def _duration(path):
@@ -367,8 +372,67 @@ def initial_prompt(cfg=None):
       * 传「以下是普通话的句子。」：**87.1 秒**（慢 ~1.7 倍），简体了，
         可同一段话的识别质量**肉眼可见地变差**（出现"历史"这类明显误词）。
     慢一倍换一个简繁差别 —— 所以默认**不**开，谁在意繁体谁自己打开。
+    ⚠️ 2026-10-06 起还多了一条**不牺牲速度与准确率**的路：`audio.simplify`（见下），
+    它不动识别、只在输出后换字形 —— 想简体优先用它，别开这个 prompt。
     """
     return str(section(cfg or {}).get("initial_prompt") or "").strip()
+
+
+def simplify_enabled(cfg=None):
+    """`audio.simplify`：把转写结果里的**繁体字形**换成简体。**默认开**。
+
+    为什么有它（2026-10-06 用户报「为什么转写出来的是繁体」）：
+    whisper 在中文上天然爱吐繁体（训练语料里繁体占比高），而另一条路
+    `initial_prompt="以下是普通话的句子。"` 实测**慢 1.7 倍且识别质量明显变差**
+    （见 `initial_prompt` 的注释）。这条路**一个字的识别都不动**，只在输出后做
+    字形转换（`zhconv`，纯 Python、离线、几毫秒），所以代价极小、默认开着。
+
+    ⚠️ 但它**确实改了内容**（字形），所以两条规矩不许破：
+      ① 真的改了就在日志里报**改了几个字**（学 `redact` 的「命中数要打日志」）；
+      ② 缺 `zhconv` 时**不许静默**：`available()` 会说、`audio_read.py --status` 看得见，
+        那一次原样返回（保留繁体），绝不因此让整条转写失败。
+    要"一字不改的原始输出"就把 `audio.simplify: false` 写上。
+    """
+    return section(cfg or {}).get("simplify") is not False
+
+
+_ZHCONV_MISS_AT = [0.0]
+
+
+def _warn_zhconv_missing():
+    """缺 `zhconv` 时限流留痕（5 分钟一次）——不许静默降级。"""
+    now = time.monotonic()
+    if now - _ZHCONV_MISS_AT[0] < 300.0:
+        return
+    _ZHCONV_MISS_AT[0] = now
+    print("[audio] ⚠️ `audio.simplify` 开着但没装 zhconv → 这次原样返回（可能仍是繁体）。"
+          "装：`.venv\\Scripts\\python.exe -m pip install zhconv`", flush=True)
+
+
+def maybe_simplify(text, cfg=None):
+    """转写结果的字形后处理：繁 → 简（关着/缺库时原样返回）。纯函数式，自测直接钉。"""
+    if not text or not simplify_enabled(cfg):
+        return text
+    try:
+        # zhconv 1.4.3 `import` 时会抱怨 `pkg_resources` 弃用（UserWarning）。那条对用户
+        # 不可行动、只有一个噪音，所以只在**这一次 import** 里压掉，别影响别的警告。
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import zhconv
+    except ImportError:
+        _warn_zhconv_missing()
+        return text
+    try:
+        out = zhconv.convert(str(text), "zh-cn")
+    except Exception as e:                      # 转不动就当没开，别让转写失败
+        print(f"[audio] ⚠️ 繁→简失败（原样返回）：{type(e).__name__}: {e}", flush=True)
+        return text
+    if out != text:
+        changed = sum(1 for a, b in zip(text, out) if a != b)
+        print(f"[audio] 繁→简：改了 {changed} 个字", flush=True)
+    return out
+
 
 
 _MODEL_CACHE = {}
@@ -651,7 +715,7 @@ def transcribe_scored(path, cfg=None):
     score = None
     if lps:
         score = (sum(lps) / len(lps)) - (max(nsps) if nsps else 0.0)
-    return text, score, ""
+    return maybe_simplify(text, cfg), score, ""
 
 
 def transcribe(path, cfg=None, max_bytes=None):
@@ -679,7 +743,7 @@ def transcribe(path, cfg=None, max_bytes=None):
         text, err = _local(path, cfg or {})
     if err:
         return "", f"转写失败：{err}"
-    return text, ""
+    return maybe_simplify(text, cfg), ""
 
 
 # ---------------- 用户显式执行的模型下载 ----------------

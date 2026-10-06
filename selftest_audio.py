@@ -743,6 +743,63 @@ def t10_languages(tmp):
           (text, err))
 
 
+def t11_simplify():
+    """繁→简（`audio.simplify`，**默认开**）：2026-10-06 用户报「为什么转写出来的是繁体」。
+
+    识别**一个字不动**，只在输出后换字形（zhconv）。三条钉住：
+      ① 默认开 → 繁体变简体；`false` → 一字不改（要原始输出的人）；
+      ② 真改了要留一行痕（「繁→简：改了 N 个字」——学 redact 的命中数要打日志）；
+      ③ **缺 zhconv 不许静默、也不许让转写失败**：原样返回 + 限流留痕 + `--status` 说明。
+    """
+    print("\n── 繁→简：默认开、改了要留痕、缺库不静默（2026-10-06）──")
+    import contextlib
+
+    class _FakeZhconv:
+        @staticmethod
+        def convert(t, target):
+            return str(t).replace("樹", "树").replace("楊", "杨")
+
+    saved = sys.modules.get("zhconv")
+    try:
+        sys.modules["zhconv"] = _FakeZhconv
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = audio_read.maybe_simplify("白楊樹", {})
+        check("默认开：繁体变简体", out == "白杨树", out)
+        check("★ 改了就在日志里报**改了几个字**（我们确实动过内容）",
+              "繁→简：改了 2 个字" in buf.getvalue(), buf.getvalue()[:80])
+        check("显式 `simplify: false` → 一字不改（要原始输出的人）",
+              audio_read.maybe_simplify("白楊樹", {"audio": {"simplify": False}}) == "白楊樹")
+        check("本来没有繁体 → 原样", audio_read.maybe_simplify("你好呀", {}) == "你好呀")
+        check("空串 → 原样（不抛）", audio_read.maybe_simplify("", {}) == "")
+    finally:
+        if saved is None:
+            sys.modules.pop("zhconv", None)
+        else:
+            sys.modules["zhconv"] = saved
+
+    # 缺库：原样返回 + 留痕（限流）
+    # ⚠️ 这里**不能用 `_Env(zhconv=None)`**（本会话踩了两次）：它模拟的是「装没装」
+    # （`find_spec` + 从 sys.modules 里摘掉），而 `maybe_simplify` 里是**真 `import`**
+    # —— 磁盘上装着就会重新导入，用例当场假红。真 `import` 的"缺"要用
+    # **`sys.modules[name] = None`** 这个 Python 哨兵（它让 import 直接抛 ImportError）。
+    _saved_zh = sys.modules.get("zhconv", "MISSING")
+    try:
+        sys.modules["zhconv"] = None
+        audio_read._ZHCONV_MISS_AT[0] = 0.0
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            out2 = audio_read.maybe_simplify("白楊樹", {})
+        check("★ 缺 zhconv → **原样返回**（绝不因此让整条转写失败）", out2 == "白楊樹", out2)
+        check("★ ……而且留痕（不许静默降级）", "zhconv" in buf2.getvalue(), buf2.getvalue()[:90])
+    finally:
+        if _saved_zh == "MISSING":
+            sys.modules.pop("zhconv", None)
+        else:
+            sys.modules["zhconv"] = _saved_zh
+    return True
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="selftest_audio_")
     global _OK
@@ -767,6 +824,7 @@ def main():
         t4_dispatch(tmp)
         t5_cloud(tmp)
         t6_cloud_failure(tmp)
+        t11_simplify()
         t7_long_audio_windows(tmp)
         t8_max_bytes_zero(tmp)
         t9_language(tmp)

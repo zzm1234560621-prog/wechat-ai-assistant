@@ -42,6 +42,9 @@ _IO_LOCK = threading.Lock()          # 落盘摘要专用：主线程和 worker 
 _THREAD = None
 _CURRENT = None                      # {"chat","label","started"}
 _WAITING = []                        # [{"chat","label","started"}] 排队中（落盘用）
+# 「刚读完」的那份，多久之内算同一个（模型重复提交）(chat,label) → (时间, 是不是失败)
+_DONE = {}
+_DEDUPE_DONE_SEC = 300.0             # 5 分钟；0 = 关掉这条
 
 
 def configured(cfg=None):
@@ -142,6 +145,15 @@ def _worker_loop():
         _RESULTS_PUT(job, text, err, seconds)
         with _LOCK:
             _CURRENT = None
+            # 记下「这份刚读完」（成功/失败都记，判据在 submit 里：**失败的不拦**）
+            _DONE[(job["chat"], job["label"])] = (time.time(), bool(err))
+            if _DEDUPE_DONE_SEC > 0:
+                now = time.time()
+                for k, (ts, _e) in list(_DONE.items()):
+                    if now - ts > _DEDUPE_DONE_SEC * 4:
+                        _DONE.pop(k, None)
+            else:
+                _DONE.clear()
         _save_pending()
 
 
@@ -179,6 +191,18 @@ def submit(chat, label, fn, cfg=None):
         if _CURRENT and _CURRENT.get("chat") == chat and _CURRENT.get("label") == label:
             return True, (f"这份「{label}」**正在读**，不用再提交一次 —— "
                           f"读完我会主动把内容发出来。**你现在手里还没有内容，别编。**")
+        # ⚠️ **刚读完的也别再提交一次**（2026-10-06 真机：同一份 01.mp3 的转写被整段发了**两遍**）。
+        # 上面那两条只拦得住"还在排队/正在读"的重复提交，而模型很容易**等这份读完再提交一次**
+        # （异步路径：它手里一直没有内容，于是又调了一次 read_file）——那会儿 `_WAITING`/`_CURRENT`
+        # 都空了，于是又读一遍、又把全文倒进聊天。所以把窗口延长到"刚读完"。
+        # ⚠️ **失败的绝不拦**：读完报错时，"再试一次"正是我们让用户走的那条路
+        # （`bot` 的失败文案就是「要在本机再试一次就说『重新读一下 X』」）。
+        if _DEDUPE_DONE_SEC > 0:
+            prev = _DONE.get((chat, label))
+            if prev and not prev[1] and (time.time() - prev[0]) <= _DEDUPE_DONE_SEC:
+                return True, (f"这份「{label}」**刚刚已经读完、内容也发出去了**，"
+                              f"不重复读一遍（避免把同一份原文刷两遍）。"
+                              f"要看就往上看我发的那条；**别自己复述内容**。")
         pending = len(_WAITING) + (1 if _CURRENT else 0)
         if pending >= qmax:
             return False, (f"前面已经排了 {pending} 份在读了（上限 read.queue_max={qmax}）。"
@@ -234,6 +258,7 @@ def reset_for_test():
     with _LOCK:
         _CURRENT = None
         _WAITING.clear()
+        _DONE.clear()
     while not _JOBS.empty():
         try:
             _JOBS.get_nowait()

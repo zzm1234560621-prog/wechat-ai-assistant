@@ -187,6 +187,58 @@ def t6_status_and_pending_file():
           raw == "" or '"jobs":[]' in raw.replace(" ", ""), raw[:120])
 
 
+def t7_no_reread_when_just_done():
+    """★ 刚读完的同一份，不许再读一遍（2026-10-06 真机：01.mp3 的转写被整段发了两遍）。
+
+    为什么单独立一条：`submit` 里原本只拦「**还在排队 / 正在读**」的重复提交，而模型是
+    **等这份读完再提交一次**的（异步路径它手里一直没有内容，于是又调了一次 `read_file`）
+    —— 那会儿 `_WAITING` / `_CURRENT` 都空了，于是又读一遍、又把全文倒进聊天。
+    两条不许破：① 窗口内**成功**的不许重读；② **失败的不许拦** —— "重新读一下 X"
+    正是我们让用户走的那条重试路。
+    """
+    print("\n── 刚读完的同一份别再读第二遍（2026-10-06）──")
+    read_worker.reset_for_test()
+    n = [0]
+
+    def count_job():
+        n[0] += 1
+        return ("第一遍读完的内容", None)
+
+    ok1, _ = read_worker.submit("filehelper", "01.mp3", count_job)
+    got = _wait_results(1)
+    check("第一遍正常读完", ok1 and len(got) == 1, (ok1, got))
+
+    ok2, note2 = read_worker.submit("filehelper", "01.mp3", count_job)
+    check("★ 刚读完的同一份：不再入队，并如实告诉模型",
+          ok2 is True and "刚刚已经读完" in note2 and n[0] == 1, (note2, n[0]))
+    check("★ ……而且**没有第二条结果**（不会再把原文刷一遍）",
+          _wait_results(1, timeout=1.0) == [], None)
+
+    ok3, _ = read_worker.submit("filehelper", "别的文件.txt", count_job)
+    _wait_results(1)                     # 等它真的跑完（submit 是异步的）
+    check("文件名不同 → 照常读（去重只认同一份）", ok3 and n[0] == 2, (ok3, n[0]))
+
+    read_worker.reset_for_test()
+    read_worker.submit("filehelper", "坏的.bin", lambda: (None, "boom"))
+    _wait_results(1)
+    ok4, note4 = read_worker.submit("filehelper", "坏的.bin", lambda: ("好了", None))
+    check("★ 上一遍**失败**的：照常允许重读（那条重试路不许堵）",
+          bool(ok4) and "刚刚已经读完" not in note4, note4)
+
+    read_worker.reset_for_test()
+    read_worker.submit("filehelper", "旧.txt", lambda: ("内容", None))
+    _wait_results(1)
+    with read_worker._LOCK:
+        t0, e0 = read_worker._DONE[("filehelper", "旧.txt")]
+        read_worker._DONE[("filehelper", "旧.txt")] = (t0 - read_worker._DEDUPE_DONE_SEC - 1, e0)
+    ok5, note5 = read_worker.submit("filehelper", "旧.txt", lambda: ("内容", None))
+    check("过了去重窗口（默认 5 分钟）→ 允许重读",
+          bool(ok5) and "刚刚已经读完" not in note5, note5)
+
+    read_worker.reset_for_test()
+    return _ok
+
+
 def main():
     print("=" * 60)
     print("read_worker 回归自测（临时目录：%s）" % TMP)
@@ -200,6 +252,7 @@ def main():
         t4_slow_flag()
         t5_startup_note()
         t6_status_and_pending_file()
+        t7_no_reread_when_just_done()
     finally:
         read_worker.reset_for_test()
         shutil.rmtree(TMP, ignore_errors=True)
