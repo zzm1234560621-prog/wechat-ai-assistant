@@ -686,11 +686,11 @@ def t9_image_and_pick():
     image_read.handoff = fake_handoff
     try:
         # ① OCR 出来的短文本**不许**被 `_looks_garbled`（<20 字当可疑）拒掉：
-        #    那张真机缩略图只认出「交 易 猫」四个字，按老判据会被当乱码 —— 和音频同一个坑。
-        fake_handoff.result = {"mode": "ocr", "kind": "text", "text": "交 易 猫",
+        #    那张真机缩略图只认出「测 试 文 字」四个字，按老判据会被当乱码 —— 和音频同一个坑。
+        fake_handoff.result = {"mode": "ocr", "kind": "text", "text": "测 试 文 字",
                                "path": None, "why": ""}
         text, err = file_read.extract(img, cfg)
-        check("图片走 OCR：短文本没被当乱码拒", err is None and text == "交 易 猫", (text, err))
+        check("图片走 OCR：短文本没被当乱码拒", err is None and text == "测 试 文 字", (text, err))
         check("图片用的是 file.max_bytes（不是 image.max_bytes）",
               bool(calls) and calls[-1][1] == cfg["file"]["max_bytes"], calls)
 

@@ -218,11 +218,11 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   - **图片后缀也走这条路**（`IMAGE_SUPPORTED`：jpg/jpeg/png/bmp/gif/webp/tif/tiff）：
     分派给 `image_read.describe()` 走 OCR。**「以文件形式发过来的图」是明文原图**，
     比 `read_image` 那条（只能读微信写过的缩略图）清楚得多 —— 实测缓存里那张 540×720
-    缩略图能认出「我 们 的 Neo 大 球 内 部 是 这 样 的…」。
+    缩略图能认出「一整行可读的中文」。
     - **体积上限用 `file.max_bytes`，不是 `image.max_bytes`**：后者默认 5MB，是给聊天缩略图
       设的，套到原图上会一动就拒。所以 `describe()` 多了一个 `max_bytes` 参数。
     - **OCR 结果必须跳过 `_looks_garbled`**（和音频转写同一个坑）：那条「短于 20 字当可疑」
-      是为「字节解码错了」设计的，而「交 易 猫」只有 4 个字 —— 照老判据会被当乱码拒掉。
+      是为「字节解码错了」设计的，而「测 试 文 字」只有 4 个字 —— 照老判据会被当乱码拒掉。
       回归：`selftest_io_llm.t9_image_and_pick`。
   - **`read_file` 可以只给 `name`**（`file_read.pick()`）：按文件名在 `msg/file/` 里
     **先精确**（`locate`，含 `(1)` 重名退让）**再子串**找，**一次库都不查**。

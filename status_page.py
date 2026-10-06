@@ -6,6 +6,10 @@
     绝不把状态暴露到局域网。
   - 端口被占用只打印告警并返回 None，**绝不让 bot 起不来**。
   - 渲染前一律 html.escape，快照里的错误文本/群名不会变成注入。
+  - **页面骨架跟着 `i18n` 的语言走**，但**只切骨架，绝不翻快照里的值**
+    （wxid / 错误文本 / 时间戳 / 状态词都来自别处，翻了就等于改事实）。
+    语言默认取 `i18n.current()`；`?lang=en` / `?lang=zh` 只覆盖**这一次渲染**，
+    不落盘、不写 settings.json —— 认不出来的值一律忽略。
 
 用法（由 bot.py 接线，本模块不自己起线程去查询）：
 
@@ -17,6 +21,9 @@ import html
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+import i18n
 
 # 回环地址白名单。**只允许这三个**，别加 0.0.0.0 / 局域网 IP。
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "127.0.0.2")
@@ -25,6 +32,42 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "127.0.0.2")
 def _is_loopback(host):
     h = str(host or "").strip().lower()
     return h in LOOPBACK_HOSTS
+
+
+def _lang_from_query(query):
+    """从查询串里取 `?lang=`（`zh` / `en`）。没有 / 认不出来 → `""`。
+
+    **只看这一次渲染**：不写 settings.json、不动 i18n 的缓存，
+    认不出来的值（`?lang=xx`）也绝不猜，直接当作没写。
+    """
+    if not query:
+        return ""
+    try:
+        vals = parse_qs(query, keep_blank_values=True).get("lang") or []
+    except Exception:                           # noqa: BLE001 —— 查询串再怪也不许让页面 500
+        return ""
+    for v in vals:
+        got = i18n.normalize(v)
+        if got:
+            return got
+    return ""
+
+
+def _lang(query=None):
+    """这一次渲染用哪种语言：`?lang=` 优先，其次 `i18n.current()`（配置里那份）。"""
+    return _lang_from_query(query) or i18n.current()
+
+
+def _lang_code(lang):
+    """统一成 `i18n` 认识的两个值，不认识的一律按默认（页面骨架绝不会变成空）。"""
+    return i18n.normalize(lang) or i18n.LANG_DEFAULT
+
+
+def _txt(zh, en, lang=None):
+    """骨架文案二选一。不传 lang 就按当前语言（和 `i18n.t` 同一个语义）。"""
+    if lang:
+        return en if _lang_code(lang) == "en" else zh
+    return i18n.t(zh, en)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -72,7 +115,9 @@ class _Handler(BaseHTTPRequestHandler):
         return data
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        # 查询串只用于 `?lang=`（视图覆盖）；/status.json 不受它影响，永远发原始快照
+        path, _, query = self.path.partition("?")
+        path = path.rstrip("/") or "/"
         if path == "/healthz":
             self._send(200, "ok", "text/plain; charset=utf-8")
         elif path == "/status.json":
@@ -84,7 +129,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, body, "application/json; charset=utf-8")
         elif path == "/":
-            self._send(200, render_html(self._snapshot()), "text/html; charset=utf-8")
+            self._send(200, render_html(self._snapshot(), _lang(query)),
+                       "text/html; charset=utf-8")
         else:
             self._send(404, "404 —— 只有 / 、/status.json 、/healthz", "text/plain; charset=utf-8")
 
@@ -213,24 +259,34 @@ def stop(server):
         pass
 
 
-def render_html(snap):
-    """把快照 dict 渲染成一整页 HTML（深色、中文、简洁）。
+def render_html(snap, lang=None):
+    """把快照 dict 渲染成一整页 HTML（深色、简洁）。
 
     渲染时会把**看起来像密钥的键**（api_key / token / secret / password …）过滤掉：
     状态页是本地页面，但快照是上层随便塞的，不该因为「塞的人忘了」就把 key 印在页面上。
     被过滤的键会如实显示一行说明——不静默。
+
+    `lang` 决定**页面骨架**用中文还是英文（`zh` / `en`；不传就按 `i18n` 当前语言）。
+    ⚠️ 只切骨架：**快照里的值一个字都不翻** —— wxid、错误文本、时间戳、状态词
+    都是别的模块产生的事实，翻译它们 = 把证据改成另一种说法。
     """
-    body = _render_value(snap, 0)
-    title = "微信 AI 助手 · 状态"
+    lang = _lang_code(lang or i18n.current())
+    body = _render_value(snap, 0, lang)
+    title = _txt("微信 AI 助手 · 状态", "WeChat AI Assistant · Status", lang)
     skipped = _sensitive_keys(snap)
     warn = ""
     if skipped:
         warn = ('<div class="hint" style="color:#ff8a80">'
-                f'⚠️ 已隐藏疑似敏感字段：{html.escape("、".join(skipped))}'
-                "（/status.json 不做过滤，是同一份快照的原文）</div>")
+                + _txt("⚠️ 已隐藏疑似敏感字段：", "⚠️ Hidden, looks sensitive: ", lang)
+                + html.escape("、".join(skipped))
+                + _txt("（/status.json 不做过滤，是同一份快照的原文）",
+                       " (/status.json is not filtered — it is the same snapshot verbatim)", lang)
+                + "</div>")
+    hint = _txt("只读视图 · 只渲染 bot 喂进来的事实",
+                "Read-only view · renders only the facts the bot feeds in", lang)
     return (
         "<!DOCTYPE html>\n"
-        '<html lang="zh-CN"><head><meta charset="utf-8">'
+        f'<html lang="{html.escape(_txt("zh-CN", "en", lang))}"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{html.escape(title)}</title><style>"
         "body{background:#14161a;color:#e6e6e6;font-family:Consolas,'Microsoft YaHei',monospace;"
@@ -247,9 +303,12 @@ def render_html(snap):
         ".ok{color:#7ee0a0}.bad{color:#ff8a80}.unk{color:#c8b273}"
         "</style></head><body>"
         f"<h1>{html.escape(title)}</h1>"
-        '<div class="hint">只读视图 · 只渲染 bot 喂进来的事实 · '
+        f'<div class="hint">{hint} · '
         '<a style="color:#8ab4f8" href="/status.json">/status.json</a> · '
-        '<a style="color:#8ab4f8" href="/healthz">/healthz</a></div>'
+        '<a style="color:#8ab4f8" href="/healthz">/healthz</a> · '
+        # 语言切换：**不带 JS**，两个链接各带一次 ?lang=，只影响这一次渲染
+        '<a style="color:#8ab4f8" href="?lang=zh">中文</a> | '
+        '<a style="color:#8ab4f8" href="?lang=en">English</a></div>'
         f"{warn}{body}</body></html>"
     )
 
@@ -282,43 +341,50 @@ def _sensitive_keys(obj):
     return found
 
 
-def _render_value(v, depth):
-    """递归渲染：dict -> 表格，list/tuple -> 列表，标量 -> 转义后的文本。"""
+def _render_value(v, depth, lang=None):
+    """递归渲染：dict -> 表格，list/tuple -> 列表，标量 -> 转义后的文本。
+
+    注意：**翻译的只有骨架**（「（空）」「已隐藏」「是/否」这些页面自己说的话）。
+    值本身（群名、错误文本、wxid…）一律原样转义后输出，绝不过语言那一层。
+    """
     if isinstance(v, dict):
-        return _render_dict(v, depth)
+        return _render_dict(v, depth, lang)
     if isinstance(v, (list, tuple)):
-        return _render_list(v, depth)
-    return _render_scalar(v)
+        return _render_list(v, depth, lang)
+    return _render_scalar(v, lang)
 
 
-def _render_dict(d, depth):
+def _render_dict(d, depth, lang=None):
     if not d:
-        return '<span class="unk">（空）</span>'
+        return f'<span class="unk">{_txt("（空）", "(empty)", lang)}</span>'
     rows = []
     for k, v in d.items():
         key = html.escape(str(k))
         if _sensitive_keys({k: None}):
             # 不渲染密钥的值，但键名和「已隐藏」这件事要如实写出来
             rows.append(f'<tr><td class="k">{key}</td>'
-                        '<td><span class="bad">🔒 已隐藏（疑似敏感字段）</span></td></tr>')
+                        f'<td><span class="bad">🔒 {_txt("已隐藏（疑似敏感字段）", "hidden (looks sensitive)", lang)}</span></td></tr>')
             continue
-        rows.append(f'<tr><td class="k">{key}</td><td>{_render_value(v, depth + 1)}</td></tr>')
+        rows.append(f'<tr><td class="k">{key}</td>'
+                    f'<td>{_render_value(v, depth + 1, lang)}</td></tr>')
     return "<table>" + "".join(rows) + "</table>"
 
 
-def _render_list(items, depth):
+def _render_list(items, depth, lang=None):
     if not items:
-        return '<span class="unk">（空）</span>'
+        return f'<span class="unk">{_txt("（空）", "(empty)", lang)}</span>'
     out = ["<ul>"]
     for it in items:
-        out.append(f"<li>{_render_value(it, depth + 1)}</li>")
+        out.append(f"<li>{_render_value(it, depth + 1, lang)}</li>")
     out.append("</ul>")
     return "".join(out)
 
 
-def _render_scalar(v):
+def _render_scalar(v, lang=None):
     if v is None:
         return '<span class="unk">—</span>'
     if isinstance(v, bool):
-        return f'<span class="b {"ok" if v else "bad"}">{"是" if v else "否"}</span>'
+        # 布尔是快照里的真值，但「是/否」这两个字是页面自己说的 → 跟着语言走
+        word = _txt("是", "yes", lang) if v else _txt("否", "no", lang)
+        return f'<span class="b {"ok" if v else "bad"}">{word}</span>'
     return html.escape(str(v))

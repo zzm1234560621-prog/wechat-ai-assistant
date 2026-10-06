@@ -129,7 +129,7 @@ def t4_menu_wired():
     print("\n[4] 菜单里真的有这一项（不能让修复只存在于文档里）")
     src = open(os.path.join(BASE, "console.py"), "r", encoding="utf-8").read()
     chk("act_fix_hook" in src, "act_fix_hook 实现了")
-    chk('"4", "★ 只替换 version.dll' in src, "Hook 子菜单里挂了 [4]")
+    chk('"4", ("★ 只替换 version.dll' in src, "Hook 子菜单里挂了 [4]")
     chk("do_fix_hook.ps1" in src, "它会去调 do_fix_hook.ps1")
     chk("_report_hook_install()" in src, "一键配置装完 hook 会读回结果")
     chk("_stop_after_version_gate()" in src, "一键配置停在版本闸时会明说")

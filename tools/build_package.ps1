@@ -39,9 +39,9 @@ New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 # ── 1 · 根目录的源码与入口 ────────────────────────────────────────────
 Copy-Item (Join-Path $root '*.py')  $pkg -Force
 Copy-Item (Join-Path $root '*.bat') $pkg -Force
-# `README.en.md` / `LICENSE` 是 2026-10-06 公开到 GitHub 时加的：README 中英双语，
+# `README.zh-CN.md` / `LICENSE` 是 2026-10-06 公开到 GitHub 时加的：README 中英双语，
 # 拿到包的人也拿到同一份协议与免责声明（包里那份 README.md 顶部的语言切换就指向它）。
-foreach ($f in @('README.md', 'README.en.md', 'LICENSE', 'CLAUDE.md', 'requirements.txt')) {
+foreach ($f in @('README.md', 'README.zh-CN.md', 'LICENSE', 'CLAUDE.md', 'requirements.txt')) {
     $p = Join-Path $root $f
     if (Test-Path $p) { Copy-Item $p $pkg -Force } else { Write-Warning "缺少 $f" }
 }
@@ -134,7 +134,7 @@ $quickstart = @'
 【微信 AI 助手 —— 安装说明】
 
 这个包是给**没装过**的电脑用的，全程大概 15 分钟。
-详细文档在 README.md，这里只是最短路径。
+详细文档在 README.zh-CN.md（英文版 README.md），这里只是最短路径。
 
 ■ 先知道两件事
   1. 本工具往微信进程里注入 hook DLL，**违反微信用户协议**，有封号风险。
@@ -204,6 +204,7 @@ $quickstart = @'
 ■ 装完之后怎么用
   双击 **助手.bat** 就是全部： [3] 启动 / [4] 停止重启 / [5] 看状态 /
   [6] 看日志 / [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启）。
+  菜单里按 **[L]** 可以在**中文 / English** 之间切换界面语言（微信里发 `/lang en` 也行）。
   然后**全程在微信里操作**，直接跟助手说话就行。
 
 ■ 出问题了看哪
@@ -218,7 +219,7 @@ $quickstart = @'
        只替换 version.dll，然后**完全退出微信再打开、扫码登录**。
        详细判据见 README 的「助手一直刷…怎么办」一节。
   · README.md 的「助手一直刷「hook 已加载，但数据库打不开」怎么办」一节
-     （最常见的问题都在那儿；英文版是 README.en.md）
+     （最常见的问题都在那儿；中文版是 README.zh-CN.md）
   · 助手没反应 → 先看 bot.log（或 助手.bat → [6]）
   · 想自测（不需要真微信、不碰 hook）：助手.bat → [8] → 跑全部自测
 

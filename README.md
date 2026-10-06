@@ -1,133 +1,140 @@
-# 微信 AI 助手
+# WeChat AI Assistant
 
-**把你的个人微信，变成一个能读会写、还能动手操作你电脑的 AI 助手。**
+**Turn your personal WeChat into an AI assistant that can read, write, and actually operate your computer.**
 
-它实时读本地聊天记录来回答问题，也能代你给别人发消息、自动回复；
-全程在微信原生窗口里说话，不用装第二个客户端。
+It reads your local chat history in real time to answer questions, and it can also send messages to other people on your behalf or reply automatically;
+the whole conversation happens in the native WeChat window — no second client to install.
 
-[English](README.en.md) | **简体中文**
+[**English**](README.md) | [简体中文](README.zh-CN.md)
 
 ---
 
-## ⚠️ 先读这四条
+## ⚠️ Read these four first
 
-1. **封号风险**：本项目向微信进程注入 hook DLL 来收发消息，**违反微信用户协议**。
-   个人低频自用一般没事，官方严打时可能封号——建议用小号测试，**风险自担**。
-2. **版本锁死：必须恰好是微信 PC 4.1.10.27**。hook 是按**这一个版本**的函数偏移编译的——
-   换个版本它**注不进去，而且不报错**：DLL 会被微信正常加载、脚本还写着「已放置，成功」，
-   但 30001 永远没人监听，你只看到助手一直「连不上 30001」。装好后也别升级微信（安装脚本会帮你关掉自动更新）。
-3. **助手要以管理员身份运行**：语音条要读微信进程内存，而 Windows 不允许低权限进程读高权限进程的内存
-   ——不提权开着微信，语音就永远读不出来。启动时会弹一次 UAC，点「是」即可。
-4. **合规**：只处理**你自己账号、你合法拥有**的数据。未经授权抓取他人聊天记录是违法的。
+1. **Ban risk**: this project injects a hook DLL into the WeChat process to send and receive messages, which **violates the WeChat Terms of Service**.
+   Low-frequency personal use is normally fine, but a crackdown can get your account banned — test with a throwaway account, and **use at your own risk**.
+2. **Version lock: it must be exactly WeChat PC 4.1.10.27.** The hook is compiled against the function
+   offsets of that one version — any other version **fails silently**: the DLL loads normally and the
+   installer still reports success, but nothing ever listens on 30001 and all you see is the assistant
+   repeatedly saying it cannot reach 30001. Do not update WeChat either (the install script turns
+   auto-update off for you).
+3. **The assistant must run as administrator**: voice messages are read from the WeChat process memory,
+   and Windows does not let a low-integrity process read a high-integrity one — if the assistant is not
+   elevated, voice transcription will never work. You will get one UAC prompt at startup; click Yes.
+4. **Legality**: only handle data from **your own account, data you legitimately own**. Scraping other people's chat history without authorization is illegal.
 
-## 它能做什么
+## What it can do
 
-- **代你回复**：指定某个人或某个群，AI 结合上下文替你回，并据此推断该用什么语气、怎么称呼对方；可开审核，草稿先发给你确认
-- **主动发消息**：群发（可按分组/标签/群成员）、定时任务与到点提醒、关键词监听，也能帮你批量发祝福
-- **读文件读图**：Word / Excel / PPT / PDF、压缩包递归、邮件、SQLite、图片、语音条转文字、视频音轨
-  （语音转文字要装一次**可选组件**：`一键部署.bat` 的第 ③ 步，或双击 `可选组件.bat`）
-- **联网搜索**：问本机资料之外的事，回答带来源（自建 SearXNG，免费无 API key；后端**随包携带**，
-  装一次可选组件即可，默认关）
-- **碰你电脑上的文件**：列 / 搜 / 读 / 写 / 复制 / 移动 / 删到回收站（删除强制确认）
-- **撤回原文回显**：对方撤回的内容，助手把原文回显给你
-- **可扩展**：往 `plugins/` 丢一个 `.py` 就多一个功能（插件契约见 [docs/plugin-contract-spec.md](docs/plugin-contract-spec.md)）
+- **Reply for you**: pick a person or a group and the AI answers with context — inferring the right tone and how to address them; review mode is available, so drafts go to you for approval first
+- **Send messages proactively**: broadcasts (by group/tag/group member), scheduled tasks and reminders, keyword watching — it can even send batch greetings for you
+- **Read files and images**: Word / Excel / PPT / PDF, recursive archives, email, SQLite, images, voice-message transcription, video audio tracks
+  (voice-to-text needs a one-time **optional component** install: step ③ of `一键部署.bat`, or double-click `可选组件.bat`)
+- **Web search**: for anything beyond your local material, with sources in the answer (self-hosted SearXNG, free, no API key; the backend **ships with the package** —
+  one optional-component install and it is on, off by default)
+- **Touch files on your computer**: list / search / read / write / copy / move / delete to Recycle Bin (deletes require confirmation)
+- **Unsend echo**: when the other side unsends a message, the assistant echoes the original text back to you
+- **Bilingual UI**: the local console, the `/bot` panel in WeChat, and the read-only status page
+  all speak Chinese or English — send `/lang en` in WeChat, press `[L]` in the console menu,
+  or open the status page with `?lang=en`. (Errors and logs stay Chinese on purpose: they are
+  what you grep against the code.)
+- **Extensible**: drop a `.py` into `plugins/` and you have one more feature (plugin contract: [docs/plugin-contract-spec.md](docs/plugin-contract-spec.md))
 
-## 下载与安装
+## Download and install
 
-**环境**：Windows 10/11 64 位 · 微信 PC **4.1.10.27** · **64 位 Python 3.11**（3.8~3.12 可用）
+**Environment**: Windows 10/11 64-bit · WeChat PC **4.1.10.27** · **64-bit Python 3.11** (3.8–3.12 work)
 
-### 方式 A · 下载成品包（推荐，非开发者走这条）
+### Option A · Download the prebuilt package (recommended, non-developers take this path)
 
-1. 到 **[Releases](https://github.com/zzm1234560621-prog/wechat-ai-assistant/releases)** 下载最新那个包（约 240MB）
-2. 解压到任意目录（路径别带中文和空格，省得踩坑）
-3. **双击 `一键部署.bat`，一路回车**，大约 15 分钟（等价于 `助手.bat` → `[9]`）
-4. 日常用 **`助手.bat`**：`[3]` 启动 / `[4]` 停 / `[5]` 看状态 / `[6]` 看日志
+1. Go to **[Releases](https://github.com/zzm1234560621-prog/wechat-ai-assistant/releases)** and download the latest package (about 240MB)
+2. Unzip it anywhere (keep Chinese characters and spaces out of the path, to save yourself trouble)
+3. **Double-click `一键部署.bat` and just keep pressing Enter**, about 15 minutes (same as `助手.bat` → `[9]`)
+4. Day to day, use **`助手.bat`**: `[3]` start / `[4]` stop / `[5]` status / `[6]` logs
 
-这个包里**自带**：微信 4.1.10.27 官方安装程序、编译好的 hook DLL、hook 源码快照、
-随包携带的 SearXNG（搜索后端）、全部文档与自测脚本。
+This package **ships with**: the official WeChat 4.1.10.27 installer, the compiled hook DLL, a hook source snapshot,
+the bundled SearXNG (search backend), all the documentation and the self-test scripts.
 
-### 方式 B · 从源码跑（开发者）
+### Option B · Run from source (developers)
 
 ```powershell
 git clone https://github.com/zzm1234560621-prog/wechat-ai-assistant.git
 cd wechat-ai-assistant
 ```
 
-⚠️ **仓库里不含两个微信安装程序**（`WeChatWin_4.1.10.27.exe` 239MB、
-`WeChatSetup-3.9.12.51.exe` 285MB）：它们太大，只跟着 Release 包发。
-从源码这条路请自己准备 **微信 4.1.10.27**——版本必须严格一致（见上面「先读这四条」），或者干脆用方式 A 的 zip。
+⚠️ **The repository does not contain the two WeChat installers** (`WeChatWin_4.1.10.27.exe` 239MB,
+`WeChatSetup-3.9.12.51.exe` 285MB): they are too large and ship only with the Release package.
+On the source route, get **WeChat 4.1.10.27** yourself — the version must match exactly (see "Read these four first" above) — or just use the zip from Option A.
 
-拿到源码后跟方式 A 一样，双击 **`一键部署.bat`**。
+Once you have the source, it works exactly like Option A: double-click **`一键部署.bat`**.
 
-## 实现方法
+## How it works
 
-主线就一句话：**用 [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook) 把微信变成一个本地 HTTP 服务，剩下的都是普通程序。**
-
-```
-微信 PC 4.1.10.27 ──[注入 version.dll]──> 本地 HTTP 服务 127.0.0.1:30001
-                                             ▲ 读：POST /QueryDB/execute  （直接发 SQL）
-                                             │ 写：POST /SendTextMsg、/SendImgMsg
-                                             ▼
-   bot.py 每 5 秒轮询数据库拿新消息 ──> 是命令就执行，否则调大模型（带工具循环）──> 回复
-```
-
-- **收消息靠轮询**：这套 hook **没有推送接口**，只能被查询，所以 bot 每 `poll_interval`（默认 **5 秒**）
-  查一次新消息——秒级，不是毫秒级。
-- **发消息就是一次 HTTP POST**：`/SendTextMsg` 发文本，`/SendImgMsg` 发图片
-  （**发普通文件也走它**，名字里的 Img 是上游历史遗留）。
-- **查询统一走 `live_history.py`**：它同时适配微信 3.9.x / 4.1.x 两套库结构，别在别处裸调 hook。
-- **hook 不支持并发**：查询和发送全部串行（查询还有预算闸），这是「慢一点但稳」的原因，
-  也是微信不被搞崩的前提。
-- **模型通道**支持 Anthropic 官方 / OpenAI 兼容两种协议，`/provider` 一键切服务商
-  （DeepSeek、Claude、通义、Kimi、智谱、OpenAI、本地 Ollama）。
-
-> 这个 hook 一共只暴露 8 个端点：`/SendTextMsg`、`/SendImgMsg`、`/ForwardXMLMsg`、`/Decode_Pic`、
-> `/GetSelfProfile`、`/QueryDB/execute`、`/QueryDB/GetAllDBName`、`/QueryDB/status`——
-> 没有「收消息」接口，这就是必须轮询的原因。
-
-## 项目结构
+The main line in one sentence: **use [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook) to turn WeChat into a local HTTP service; everything else is an ordinary program.**
 
 ```
-bot.py                 主循环：轮询 → 命令 / 大模型 → 回复
-live_history.py        查微信库的唯一入口（同时适配 3.9.x / 4.1.x 两套 schema）
-agent_tools.py         给大模型的工具层 + 待确认机制 + 查询预算
-plugins.py / plugins/  插件契约（工具与事件的唯一真源）+ 用户插件目录
-llm.py / providers.py  两种模型协议（Anthropic / OpenAI 兼容）+ 服务商预设
-file_read.py 等        读文件 / 图片 / 语音 / 视频 / 压缩包 / 邮件 / 数据库
-files.py               操作本机文件（列/搜/读/写/复制/移动/删到回收站）
-scheduler.py           定时任务（到点发消息 / 提醒我 / 问一句话）
-health.py 等           日志轮转、掉登录告警、用量统计、只读状态页
-console.py / *.bat     本地控制台（助手.bat 菜单、一键部署.bat、可选组件.bat）
-tools/                 打包、诊断、OCR/Office/缩放等脚本
-docs/                  设计规格与真机实测记录
-searxng/               随包携带的搜索后端（网上搜索用）
-installers/            hook DLL 与安装脚本（+ Release 包里那份微信安装程序）
+WeChat PC 4.1.10.27 ──[inject version.dll]──> local HTTP service 127.0.0.1:30001
+                                                ▲ read:  POST /QueryDB/execute   (send SQL directly)
+                                                │ write: POST /SendTextMsg, /SendImgMsg
+                                                ▼
+   bot.py polls the database for new messages every 5s ──> run it if it's a command, else call the LLM (with a tool loop) ──> reply
 ```
 
-## 更多文档
+- **Receiving is polling**: this hook **has no push interface**, it can only be queried, so the bot looks for new messages once per `poll_interval` (default **5 seconds**)
+  — second-level, not millisecond-level.
+- **Sending is just an HTTP POST**: `/SendTextMsg` sends text, `/SendImgMsg` sends images
+  (**ordinary files go through it too**; the "Img" in the name is upstream history).
+- **All queries go through `live_history.py`**: it adapts to both the WeChat 3.9.x and 4.1.x database layouts; don't call the hook raw anywhere else.
+- **The hook does not support concurrency**: every query and send is serialized (queries also have a budget gate). That is why it is "slower but stable",
+  and it is the precondition for not crashing WeChat.
+- **Model channels** support both the official Anthropic and OpenAI-compatible protocols; `/provider` switches provider in one step
+  (DeepSeek, Claude, Tongyi, Kimi, Zhipu, OpenAI, local Ollama).
 
-- [CLAUDE.md](CLAUDE.md) —— 架构、hook 铁律与踩坑的权威说明（改代码前先看）
-- [docs/](docs/) —— 设计规格与实测记录（hook、文件、语音、搜索、插件契约等）
-- [docs/README-full.md](docs/README-full.md) —— 旧版详细 README：全部命令、配置项、常见问题排查
+> This hook exposes exactly 8 endpoints: `/SendTextMsg`, `/SendImgMsg`, `/ForwardXMLMsg`, `/Decode_Pic`,
+> `/GetSelfProfile`, `/QueryDB/execute`, `/QueryDB/GetAllDBName`, `/QueryDB/status` —
+> there is no "receive message" endpoint, which is exactly why polling is mandatory.
 
-## 协议与免责声明
+## Project structure
 
-本项目以 **[MIT License](LICENSE)** 开源，**按「现状」提供，不附带任何担保**。
+```
+bot.py                 main loop: poll → command / LLM → reply
+live_history.py        the only entry point for querying the WeChat DB (adapts to both the 3.9.x / 4.1.x schemas)
+agent_tools.py         the tool layer for the LLM + pending-confirmation mechanism + query budget
+plugins.py / plugins/  plugin contract (single source of truth for tools and events) + user plugin directory
+llm.py / providers.py  the two model protocols (Anthropic / OpenAI-compatible) + provider presets
+file_read.py etc.      read files / images / voice / video / archives / email / databases
+files.py               operate local files (list/search/read/write/copy/move/delete to Recycle Bin)
+scheduler.py           scheduled tasks (send a message on time / remind me / ask a question)
+health.py etc.         log rotation, logout alerts, usage stats, read-only status page
+console.py / *.bat     local console (助手.bat menu, 一键部署.bat, 可选组件.bat)
+tools/                 packaging, diagnostics, OCR/Office/resize and other scripts
+docs/                  design specs and real-machine test records
+searxng/               the bundled search backend (used by web search)
+installers/            hook DLL and install scripts (+ the WeChat installer in the Release package)
+```
 
-**免责声明**（请完整读完）：
+## More documentation
 
-- 本项目通过注入 hook DLL 扩展微信功能，**违反微信用户协议**。使用可能导致**账号被封禁**、
-  消息丢失或账号数据损坏。**一切后果由使用者自行承担**，作者不承担任何责任。
-- 请**只**对**你自己的账号**、**你合法拥有**的数据使用本项目。抓取、分析他人聊天记录
-  在多数司法管辖区**违法**。
-- 使用者须自行遵守所在地法律法规及腾讯的服务条款。**请勿用于商业用途、大规模群发、
-  骚扰或任何违法活动。**
-- 本项目与腾讯、微信官方**无任何关联**，未获其授权或认可。
+- [CLAUDE.md](CLAUDE.md) — the authoritative notes on architecture, the hook's iron rules and the pitfalls (read it before changing code)
+- [docs/](docs/) — design specs and measured records (hook, files, voice, search, plugin contract, and more)
+- [docs/README-full.md](docs/README-full.md) — the old detailed README: every command, config option and troubleshooting entry
 
-## 参考来源
+## License and disclaimer
 
-- [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook) —— 本项目**主线**用的 hook（微信 4.x），
-  注入 `version.dll` 后提供本地 HTTP 接口；编译好的 DLL 与源码快照都在 `installers/` 里
-- [WeChatFerry](https://github.com/lich0821/WeChatFerry) —— 保留的**另一条后端**（仅微信 3.9.x）
-- [PyWxDump](https://github.com/xaoyaoo/PyWxDump) —— 3.9.x 时代的历史记录导出工具（4.x 未采用）
-- [SearXNG](https://github.com/searxng/searxng) —— 网上搜索的后端（随包携带）
+This project is open source under the **[MIT License](LICENSE)**, provided **"as is", without warranty of any kind**.
+
+**Disclaimer** (please read it in full):
+
+- This project extends WeChat's functionality by injecting a hook DLL, which **violates the WeChat Terms of Service**. Using it may get your **account banned**,
+  lose messages, or corrupt your account data. **You bear all consequences yourself**; the author accepts no responsibility whatsoever.
+- Please use this project **only** with **your own account** and **data you legitimately own**. Scraping or analyzing other people's chat history
+  is **illegal** in most jurisdictions.
+- Users must comply with the laws of their own jurisdiction and with Tencent's terms of service. **Do not use it for commercial purposes, large-scale mass messaging,
+  harassment, or any illegal activity.**
+- This project has **no affiliation whatsoever** with Tencent or the official WeChat team, and is neither authorized nor endorsed by them.
+
+## References
+
+- [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook) — the hook this project's **main line** uses (WeChat 4.x);
+  injecting `version.dll` provides the local HTTP interface; the compiled DLL and a source snapshot are both in `installers/`
+- [WeChatFerry](https://github.com/lich0821/WeChatFerry) — the **other backend** we kept (WeChat 3.9.x only)
+- [PyWxDump](https://github.com/xaoyaoo/PyWxDump) — a 3.9.x-era history export tool (not adopted for 4.x)
+- [SearXNG](https://github.com/searxng/searxng) — the backend for web search (bundled with the package)

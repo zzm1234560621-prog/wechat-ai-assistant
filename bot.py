@@ -32,6 +32,7 @@ import file_read
 import files
 import groups
 import hook_check
+import i18n
 import live_history
 import plugins
 import settings
@@ -330,6 +331,7 @@ HELP_TEXT = (
     "/provider <编号> 选服务商（自动配好协议+接口+模型）\n"
     "/api <key>       设置 API Key（自动测一次连通性）\n"
     "/api clear       清除 API Key\n"
+    "/lang [zh|en]    切换界面语言（中文 / English）\n"
     "/baseurl <url>   改接口地址\n"
     "/model <id>      改模型\n"
     "/temp <0-1>      设 temperature\n"
@@ -391,8 +393,14 @@ HELP_TEXT = (
 )
 
 
+# 界面骨架里的一小段文案：`_L("中文", "English")` —— 就是 `i18n.t` 的短名字。
+# 为什么用短名字：面板里一行要塞好几个标签，缩写读起来不抢戏。
+_L = i18n.t
+
+
 def _yn(v):
-    return "**开**" if v else "关"
+    """开关怎么显示：跟着界面语言走（开/关 ↔ on/off）。值本身一个字都不动。"""
+    return _L("**开**", "**on**") if v else _L("关", "off")
 
 
 # `/bot <功能名>` → 等价命令。**控制动作绝不复刻逻辑**：改写成现有命令再交给
@@ -410,28 +418,53 @@ BOT_ROUTES = {
     "自检": "/selfcheck", "体检": "/selfcheck",
     "状态": "/status", "status": "/status",
     "帮助": "/help", "help": "/help",
+    "语言": "/lang", "lang": "/lang", "language": "/lang",
     "模型": "/provider", "provider": "/provider", "服务商": "/provider",
 }
 
-BOT_MENU = (
-    "🤖 `/bot` 能控制这些（后面接功能名；这条只列可控制的，完整命令表发 /help）：\n"
-    "\n"
-    "  模型/密钥   → `/bot 模型`　`/api <key>`　`/model <id>`\n"
-    "  自动回复    → `/bot 自动回复 开|关`　`/bot 自动回复 add 张三`…\n"
-    "  盯着        → `/bot 盯着 开|关`　`/bot 盯着 关键词 <正则>`\n"
-    "  定时任务    → `/bot 定时`　`/bot 定时 加 9:00 张三 早`\n"
-    "  分组        → `/bot 分组`　`/bot 分组 建 同学 张三、李四`\n"
-    "  群发/素材   → 直接说「帮我祝所有人节日快乐」/「发给张三」\n"
-    "  预算        → `/bot 预算`　`/bot 预算 20`　`/bot 预算 关`\n"
-    "  用量        → `/bot 用量`\n"
-    "  导出对话    → `/bot 导出 张三`\n"
-    "  诊断        → `/bot 自检`　`/bot 状态`\n"
-    "\n"
-    "**只读、要在 config.yaml 里改的**（命令不改配置文件，那是你手写的）：\n"
-    "  语义检索 `semantic.enabled` · 联网搜索 `search.enabled` ·\n"
-    "  图片模式 `image.mode` · 送云端前脱敏 `privacy.redact` · 状态页 `status.enabled`\n"
-    "  （改完重启助手生效。语义检索还要先装可选依赖 + `semantic.py --setup/--build`。）"
-)
+def bot_menu():
+    """`/bot 功能`（以及「没认出来」时）给的那张表。
+
+    ⚠️ 必须是**函数**而不是模块级常量：`/lang en` 在运行期切语言，
+    常量在 import 时就拼死了，切完还是旧语言（这正是「看起来生效了、其实没有」那类坑）。
+    """
+    return "\n".join([
+        _L("🤖 `/bot` 能控制这些（后面接功能名；这条只列可控制的，完整命令表发 /help）：",
+           "🤖 `/bot` controls these (append a feature name; this list has only the controllable ones — send /help for the full table):"),
+        "",
+        _L("  模型/密钥   → `/bot 模型`　`/api <key>`　`/model <id>`",
+           "  Model/key   → `/bot 模型`　`/api <key>`　`/model <id>`"),
+        _L("  自动回复    → `/bot 自动回复 开|关`　`/bot 自动回复 add 张三`…",
+           "  Auto-reply  → `/bot 自动回复 开|关`　`/bot 自动回复 add 张三`…"),
+        _L("  盯着        → `/bot 盯着 开|关`　`/bot 盯着 关键词 <正则>`",
+           "  Watch       → `/bot 盯着 开|关`　`/bot 盯着 关键词 <正则>`"),
+        _L("  定时任务    → `/bot 定时`　`/bot 定时 加 9:00 张三 早`",
+           "  Scheduled   → `/bot 定时`　`/bot 定时 加 9:00 张三 早`"),
+        _L("  分组        → `/bot 分组`　`/bot 分组 建 同学 张三、李四`",
+           "  Groups      → `/bot 分组`　`/bot 分组 建 同学 张三、李四`"),
+        _L("  群发/素材   → 直接说「帮我祝所有人节日快乐」/「发给张三」",
+           "  Broadcast/assets → just say it in plain words (the model picks the tool)"),
+        _L("  预算        → `/bot 预算`　`/bot 预算 20`　`/bot 预算 关`",
+           "  Budget      → `/bot 预算`　`/bot 预算 20`　`/bot 预算 关`"),
+        _L("  用量        → `/bot 用量`",
+           "  Usage       → `/bot 用量`"),
+        _L("  导出对话    → `/bot 导出 张三`",
+           "  Export chat → `/bot 导出 张三`"),
+        _L("  诊断        → `/bot 自检`　`/bot 状态`",
+           "  Diagnostics → `/bot 自检`　`/bot 状态`"),
+        _L("  语言        → `/bot 语言`　`/lang zh`　`/lang en`",
+           "  Language    → `/bot 语言`　`/lang zh`　`/lang en`"),
+        "",
+        _L("**只读、要在 config.yaml 里改的**（命令不改配置文件，那是你手写的）：",
+           "**Read-only, edited in config.yaml** (commands never rewrite that file — you own it):"),
+        "  " + _L("语义检索", "semantic") + " `semantic.enabled` · "
+        + _L("联网搜索", "web search") + " `search.enabled` ·",
+        "  " + _L("图片模式", "image mode") + " `image.mode` · "
+        + _L("送云端前脱敏", "redact before cloud") + " `privacy.redact` · "
+        + _L("状态页", "status page") + " `status.enabled`",
+        _L("  （改完重启助手生效。语义检索还要先装可选依赖 + `semantic.py --setup/--build`。）",
+           "  (Restart the assistant after changing them. Semantic search also needs the optional dependency + `semantic.py --setup/--build`.)"),
+    ])
 
 
 def bot_dashboard(cfg, contacts=None):
@@ -453,28 +486,29 @@ def bot_dashboard(cfg, contacts=None):
         except Exception:
             return default
 
-    L = ["🤖 **助手控制台**（`/bot <功能名>` 就能控制；`/bot 功能` 看全部）", ""]
+    L = [_L("🤖 **助手控制台**（`/bot <功能名>` 就能控制；`/bot 功能` 看全部）",
+            "🤖 **Assistant console** (`/bot <feature>` controls it; `/bot 功能` lists all)"), ""]
 
     key = str(c.get("api_key") or "")
-    L.append(f"模型　　{c.get('provider') or 'anthropic'} / {c.get('model') or '（没设）'}"
-             f"　key {mask(key) if key else '**没设**'}　→ `/bot 模型`")
+    L.append(f"{_L('模型　　', 'Model     ')}{c.get('provider') or 'anthropic'} / {c.get('model') or _L('（没设）', '(not set)')}"
+             f"　key {mask(key) if key else _L('**没设**', '**not set**')}　→ `/bot 模型`")
 
     n_ar = len(safe(lambda: auto_reply.chats(c), []) or [])
     ar_on = safe(lambda: auto_reply.enabled(c), False)
     ar_rev = (c.get("auto_reply") or {}).get("review", True)
-    L.append(f"自动回复　{_yn(ar_on)}　· {n_ar} 人　· 审核 {_yn(ar_rev)}"
+    L.append(f"{_L('自动回复　', 'Auto-reply')} {_yn(ar_on)}　· {n_ar} {_L('人', 'people')}　· {_L('审核', 'review')} {_yn(ar_rev)}"
              f"　→ `/bot 自动回复 开|关`")
 
     n_w = len(safe(lambda: watch.chat_list(c), []) or [])
     n_k = len(safe(lambda: watch.keywords(c), []) or [])
-    L.append(f"盯着　　{_yn(safe(lambda: watch.enabled(c), False))}"
-             f"　· {n_w} 人　· 关键词 {n_k} 条　→ `/bot 盯着 开|关`")
+    L.append(f"{_L('盯着　　', 'Watch    ')}{_yn(safe(lambda: watch.enabled(c), False))}"
+             f"　· {n_w} {_L('人', 'people')}　· {_L('关键词', 'keywords')} {n_k}　→ `/bot 盯着 开|关`")
 
     L.append(safe(lambda: recall.status_line(c), "撤回回显　（读不出来）"))
 
-    L.append(f"定时　　{len(safe(lambda: scheduler.tasks(c), []) or [])} 个任务"
+    L.append(f"{_L('定时　　', 'Scheduled')} {len(safe(lambda: scheduler.tasks(c), []) or [])} {_L('个任务', 'tasks')}"
              f"　→ `/bot 定时`")
-    L.append(f"分组　　{len(safe(lambda: groups.all_groups(c), {}) or {})} 个组"
+    L.append(f"{_L('分组　　', 'Groups   ')} {len(safe(lambda: groups.all_groups(c), {}) or {})} {_L('个组', 'groups')}"
              f"　→ `/bot 分组`")
 
     if usage is None:
@@ -482,7 +516,7 @@ def bot_dashboard(cfg, contacts=None):
     else:
         bt = safe(lambda: usage.budget_text(c), None)
         first = (str(bt).splitlines()[0].strip() if bt else "（读不出来）")
-        L.append(f"预算　　{first}　→ `/bot 预算 <金额>`")
+        L.append(f"{_L('预算　　', 'Budget   ')}{first}　→ `/bot 预算 <金额>`")
 
     # 语义检索：**状态从磁盘读**（索引文件在不在），不查库。
     # ⚠️ `semantic is None` 必须**单独说**，不能被 `safe()` 吞成「读不出来」——
@@ -501,23 +535,25 @@ def bot_dashboard(cfg, contacts=None):
             istate = f"**没建索引**（要 `semantic.py --build`）{why}"
         else:
             istate = f"索引 {len(idx_obj.get('docs') or [])} 条可用"
-        L.append(f"语义检索　{_yn(sem_on)}　{istate}　→ 改 config.yaml 的 semantic.enabled")
+        L.append(f"{_L('语义检索　', 'Semantic ')}{_yn(sem_on)}　{istate}　→ {_L('改 config.yaml 的 semantic.enabled', 'edit semantic.enabled in config.yaml')}")
 
     srch = c.get("search") or {}
-    L.append(f"联网搜索　{_yn(srch.get('enabled') is True)}"
-             f"　→ 改 config.yaml 的 search.enabled")
+    L.append(f"{_L('联网搜索　', 'Web search ')}{_yn(srch.get('enabled') is True)}"
+             f"　→ {_L('改 config.yaml 的 search.enabled', 'edit search.enabled in config.yaml')}")
     img = c.get("image") or {}
-    L.append(f"图片解读　{img.get('mode') or 'ocr'}"
-             f"　· 送云端前脱敏 {_yn((c.get('privacy') or {}).get('redact') is True)}")
+    L.append(f"{_L('图片解读　', 'Image     ')}{img.get('mode') or 'ocr'}"
+             f"　· {_L('送云端前脱敏', 'redact before cloud')} {_yn((c.get('privacy') or {}).get('redact') is True)}")
 
     h = _h()
     if h is not None:
         s = safe(lambda: h.snapshot(), None)
         if isinstance(s, dict):
-            L.append(f"运行　　轮询 {s.get('poll_count')} 次　· 登录 "
-                     f"{'正常' if s.get('login_ok') else '**异常**'}　· 分片错误 "
-                     f"{len(s.get('poll_errors') or {})}　· hook 报错 "
-                     f"{_err_count(s.get('hook_errors'))}　· 发送失败 "
+            L.append(f"{_L('运行　　', 'Runtime  ')}{_L('轮询', 'polls')} {s.get('poll_count')} "
+                     f"{_L('次　· 登录 ', '· login ')}"
+                     f"{_L('正常', 'OK') if s.get('login_ok') else _L('**异常**', '**ERROR**')}"
+                     f"　· {_L('分片错误', 'shard errors')} "
+                     f"{len(s.get('poll_errors') or {})}　· {_L('hook 报错', 'hook errors')} "
+                     f"{_err_count(s.get('hook_errors'))}　· {_L('发送失败', 'send failures')} "
                      f"{_err_count(s.get('send_failures'))}　→ `/bot 自检`")
         else:
             L.append("运行　　（读不出健康快照）　→ `/bot 自检`")
@@ -525,10 +561,11 @@ def bot_dashboard(cfg, contacts=None):
         # 拿不到 Health 实例时**要明说**，不能整行省略——用户会以为面板就是这些内容。
         L.append("运行　　**拿不到健康快照**（health 模块没装或没初始化）　→ `/bot 自检`")
     st = c.get("status") or {}
-    L.append(f"状态页　{_yn(st.get('enabled') is True)}"
-             f"（{st.get('host') or '127.0.0.1'}:{st.get('port') or 39002}）")
+    L.append(f"{_L('状态页　', 'Status page ')}{_yn(st.get('enabled') is True)}"
+             f"　({st.get('host') or '127.0.0.1'}:{st.get('port') or 39002})")
 
-    L += ["", "发 `/bot 功能` 看全部可控制项；发 `/help` 看完整命令表。"]
+    L += ["", _L("发 `/bot 功能` 看全部可控制项；发 `/help` 看完整命令表。",
+                "Send `/bot 功能` for every controllable feature; send `/help` for the full command table.")]
     return "\n".join(L)
 
 
@@ -574,16 +611,35 @@ def handle_command(text, wcf, cfg, live_ok, contacts=None, chat=None):
         key = bits[0].strip()
         rest = bits[1].strip() if len(bits) > 1 else ""
         if key.lower() in ("功能", "菜单", "menu", "help", "?", "列表"):
-            return BOT_MENU, False
+            return bot_menu(), False
         target = BOT_ROUTES.get(key.lower()) or BOT_ROUTES.get(key)
         if not target:
-            return (f"没认出来「{key}」。\n\n" + BOT_MENU), False
+            return (f"没认出来「{key}」。\n\n" + bot_menu()), False
         sub = f"{target} {rest}".strip()
         # 防呆：路由表要是被人改成了 /bot 自己，这里就会无限递归。
         if sub.lower().startswith("/bot"):
             return "内部错误：`/bot` 的路由指向了自己（会无限递归），已拒绝。", False
         # **复用既有命令的唯一实现**，不另写一套开关逻辑。
         return handle_command(sub, wcf, fresh, live_ok, contacts=contacts)
+
+    if cmd in ("/lang", "/语言"):
+        # 界面语言：存 settings.json 的 `language`（zh / en），默认中文。
+        # 认不出来的值**原地不动**并如实说 —— 绝不静默改回默认（那比报错更坏：
+        # 用户写了 language: 日本語，界面却变成中文，他只会以为命令没生效）。
+        if not arg or arg.lower() in ("?", "help", "用法", "状态"):
+            return (_L("当前界面语言：", "Current UI language: ")
+                    + f"**{i18n.LANG_NAMES[i18n.current()]}**\n"
+                    + _L("用法：", "Usage: ")
+                    + "`/lang zh`　`/lang en`"
+                    + _L("（也可以 `/bot 语言`）", " (or `/bot 语言`)"), False)
+        got, bad = i18n.set_lang(arg)
+        if bad is not None:
+            return (_L("认不出语言", "Unrecognised language") + f"「{bad}」"
+                    + _L("——只认 `zh`（中文）/ `en`（English）。\n",
+                         " — only `zh` and `en` are accepted.\n")
+                    + _L("**没有改任何东西**，当前还是", "**Nothing was changed**; still ")
+                    + i18n.LANG_NAMES[got] + "。", False)
+        return (_L("界面语言已切成 **中文**。", "Interface language is now **English**."), False)
 
     if cmd == "/api":
         if not arg or arg.lower() in ("clear", "清空", "清除"):

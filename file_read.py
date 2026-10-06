@@ -1344,7 +1344,7 @@ def extract(path, cfg=None, full=False, on_image=None):
     if not from_audio and not via_image and _looks_garbled(text):
         # **音频转写和图片 OCR 都不走这个判据**：`_looks_garbled` 里「短于 20 字就当
         # 可疑」是为「字节解码错了」设计的（短文本没法判）；而 STT / OCR 的输出根本
-        # 不是解码产物——一句 3 秒的「好的」只有两个字，一张图上的「交 易 猫」只有
+        # 不是解码产物——一句 3 秒的「好的」只有两个字，一张图上的「测 试 文 字」只有
         # 四个字，按那条会被当成乱码拒掉，是错的。
         return None, ("抽出来的内容像是乱码（可能是特殊字体编码或扫描件），"
                       "我不拿它当内容用。")

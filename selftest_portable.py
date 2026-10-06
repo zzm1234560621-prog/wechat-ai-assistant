@@ -42,11 +42,20 @@ CODE_EXT = (".py", ".ps1", ".bat")
 # 它在 `wechat_version.COMMON_PATHS` / `bypass_update.COMMON_PATHS` 里是**兜底候选**，
 # 而它们的正经来源是注册表和 `$env:ProgramFiles`——默认路径不是「本机身份」，
 # 换台电脑照样成立。要拦的是**只在这台机器上成立**的东西：项目所在盘符和用户名。
+# ⚠️ 用户名**不写死在文件里**（2026-10-06）：写死一个用户名，本身就是一条「本机身份」，
+# 而这份文件是公开仓库的一部分。改成**运行期**取当前登录用户名：覆盖范围一样
+# （本机的用户目录照样会被拦下来），但文件里不再有那个名字。
+# 取不到用户名时才退化成「任何人的用户目录」这条通配（宁可多报，也不漏）。
+_USER = (os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
 FORBIDDEN = [
     (r"[A-Za-z]:[\\/]+wechat-ai-assistant", "本机上的项目绝对路径"),
-    (r"[A-Za-z]:[\\/]+Users[\\/]+zzm12", "本机用户名下的绝对路径"),
-    (r"\bzzm12\b", "本机用户名"),
 ]
+if _USER:
+    FORBIDDEN.append((r"[A-Za-z]:[\\/]+Users[\\/]+" + re.escape(_USER),
+                      "本机用户名下的绝对路径"))
+    FORBIDDEN.append((r"\b" + re.escape(_USER) + r"\b", "本机用户名"))
+else:
+    FORBIDDEN.append((r"[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"']+", "用户目录下的绝对路径"))
 
 _ok = True
 

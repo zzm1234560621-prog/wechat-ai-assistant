@@ -10,6 +10,11 @@
 所以顶层只许导入标准库 + `envsetup`（它也只导标准库）——
 一旦顶层去 import 第三方包（yaml 之类），「装依赖」这条路自己就先崩了，用户会卡死。
 需要读配置时就**在函数里延迟导入**，并且自己兜住异常（见 `_status_page`）。
+`i18n` 可以放顶层：它只导标准库 + `settings`（本文件本来就导了那份），不引入第三方包。
+
+⚠️ 界面语言（`i18n`）**只翻菜单骨架**（`menu()` / `_submenu()` 的框线和条目）。
+报错、告警、诊断、`first_run()` / `auto()` 一键部署的每一行**一律留中文**——
+它们是对着代码 grep 排查用的证据（`i18n.py` 开头那条规矩）。
 """
 import os
 import re
@@ -20,7 +25,9 @@ import time
 import admin
 import botctl
 import envsetup as env
+import i18n
 import settings
+from i18n import t
 
 BASE = env.BASE
 
@@ -273,23 +280,39 @@ def _verify_real_flow():
         print(("[√] " if ok else "[!] ") + msg)
 
 
+def _switch_lang():
+    """切一次界面语言（[L]）。确认语按**刚切过去**的那种语言说。
+
+    ⚠️ 只有认不出来的值（理论上不会发生，这里是兜底）才原地不动并如实说——
+    绝不静默改成默认语言（`i18n.set_lang` 的规矩，见 `i18n.py`）。
+    """
+    got, bad = i18n.set_lang("en" if i18n.current() == "zh" else "zh")
+    if bad:
+        print(t(f"语言没认出来（{bad!r}），还是用中文。",
+                f"Unrecognised language ({bad!r}); staying with English."))
+        return
+    print(t("[√] 语言已切换成中文。", "[√] Language switched to English."))
+
+
 def _submenu(title, entries):
     """单键子菜单。`entries` = [(键, 标签, 回调)]；回调返回字符串就打印出来。
 
     ⚠️ **为什么一律单键**：这个菜单一度平铺到 20 项，于是 [10]~[20] 需要**敲两个数字**——
     用户当场就说「我键盘怎么有 10？」。手放在数字键上的人期待的是**一个键一个动作**，
     所以顶层只留最常用的 8 个，其余按主题收进子菜单；**[0] 恒为返回**（在顶层就是退出）。
+
+    `title` / 条目标签 / 框线都按当前语言渲染（翻骨架，不翻回调里的结果文案）。
     """
     while True:
         print()
         print("=" * 46)
-        print(f"  {title}")
+        print(f"  {t(title[0], title[1])}")
         print("=" * 46)
         for k, label, _fn in entries:
-            print(f"   [{k}] {label}")
-        print("   [0] 返回主菜单")
+            print(f"   [{k}] {t(label[0], label[1])}")
+        print(t("   [0] 返回主菜单", "   [0] Back to main menu"))
         print("=" * 46)
-        c = _clean(input("请输入数字选择："))
+        c = _clean(input(t("请输入数字选择：", "Enter a number: ")))
         if c == "0":
             return None
         hit = None
@@ -304,7 +327,7 @@ def _submenu(title, entries):
             msg = hit()
             if msg:
                 print(msg)
-        input("\n按回车返回 ... ")
+        input(t("\n按回车返回 ... ", "\nPress Enter to go back ... "))
 
 
 # ── 各个动作（菜单和子菜单共用同一批函数，别写两份）──────────────────────
@@ -750,8 +773,12 @@ def optional_menu():
         if c == "0":
             return None
         if c == toggle_key:
-            _submenu("自动安装开关（写 settings.json）", [
-                (str(i), f"{name}：现在{'关掉' if _opt_wanted(name) else '打开'}",
+            # 可选组件这条路（`可选组件.bat`）**不跟界面语言走**：它和一键部署同一档，
+            # 一律中文（理由见文件开头那条规矩）。写法上仍要跟 `_submenu` 的新签名一致。
+            _submenu(("自动安装开关（写 settings.json）",
+                      "自动安装开关（写 settings.json）"), [
+                (str(i), (f"{name}：现在{'关掉' if _opt_wanted(name) else '打开'}",
+                          f"{name}：现在{'关掉' if _opt_wanted(name) else '打开'}"),
                  (lambda n=name: _toggle_opt(n)))
                 for i, (name, _label) in enumerate(OPTIONAL_ITEMS, start=1)
             ])
@@ -1192,23 +1219,36 @@ def menu():
     while True:
         print()
         print("=" * 46)
-        print("           微信 AI 助手 · 控制台")
+        print(t("           微信 AI 助手 · 控制台",
+                "           WeChat AI Assistant · Console"))
         print("=" * 46)
-        print("  第一次用？直接按 [9]「一键配置」，然后**连按回车**走完")
+        print(t("  第一次用？直接按 [9]「一键配置」，然后**连按回车**走完",
+                "  First time? Press [9] \"One-click setup\", then just press Enter"))
         print("-" * 46)
-        print("   [1] 降级微信 4.x -> 3.9.x")
-        print("   [2] 安装依赖（自动识别版本）")
-        print("   [3] 启动助手（后台，无窗口）")
-        print("   [4] 停止 / 重启助手")
-        print("   [5] 看状态（进程 + 健康快照）")
-        print("   [6] 看日志")
-        print("   [7] 一键开始（检测 -> 装依赖 -> 启动）")
-        print("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）")
-        print("   [9] 一键配置（装 hook + 装依赖 + 可选组件 + 启动 + 配模型）")
-        print("   [0] 退出")
+        print(t("   [1] 降级微信 4.x -> 3.9.x",
+                "   [1] Downgrade WeChat 4.x -> 3.9.x"))
+        print(t("   [2] 安装依赖（自动识别版本）",
+                "   [2] Install dependencies (auto-detect version)"))
+        print(t("   [3] 启动助手（后台，无窗口）",
+                "   [3] Start assistant (background, no window)"))
+        print(t("   [4] 停止 / 重启助手",
+                "   [4] Stop / restart assistant"))
+        print(t("   [5] 看状态（进程 + 健康快照）",
+                "   [5] Show status (process + health snapshot)"))
+        print(t("   [6] 看日志", "   [6] Show logs"))
+        print(t("   [7] 一键开始（检测 -> 装依赖 -> 启动）",
+                "   [7] One-click start (check -> deps -> start)"))
+        print(t("   [8] 更多…（配模型 / 真机自检 / 跑自测 / hook / 自启 / 状态页）",
+                "   [8] More... (model / real check / tests / hook / autostart / status)"))
+        print(t("   [9] 一键配置（装 hook + 装依赖 + 可选组件 + 启动 + 配模型）",
+                "   [9] One-click setup (hook + deps + optional + start + model)"))
+        # [L] 在 [9] 和 [0] 之间：它既不是「部署」也不是「退出」，位置固定、不参与 [0]~[9] 那套编号
+        print(t(f"   [L] 语言 / Language（当前：{i18n.LANG_NAMES[i18n.current()]}）",
+                f"   [L] Language / 语言 (current: {i18n.LANG_NAMES[i18n.current()]})"))
+        print(t("   [0] 退出", "   [0] Quit"))
         print("=" * 46)
 
-        c = _clean(input("请输入数字选择："))
+        c = _clean(input(t("请输入数字选择：", "Enter a number: ")))
 
         if c == "1":
             act_downgrade()
@@ -1217,59 +1257,89 @@ def menu():
         elif c == "3":
             print(act_start())
         elif c == "4":
-            _submenu("停止 / 重启助手", [
-                ("1", "停止助手", act_stop),
-                ("2", "重启助手", act_restart),
+            _submenu(("停止 / 重启助手", "Stop / restart assistant"), [
+                ("1", ("停止助手", "Stop assistant"), act_stop),
+                ("2", ("重启助手", "Restart assistant"), act_restart),
             ])
         elif c == "5":
             health_screen()
         elif c == "6":
-            _submenu("看日志", [
-                ("1", "最近 40 行", act_log_tail),
-                ("2", "实时跟随（Ctrl+C 返回）", lambda: botctl.follow()),
+            _submenu(("看日志", "Show logs"), [
+                ("1", ("最近 40 行", "Last 40 lines"), act_log_tail),
+                ("2", ("实时跟随（Ctrl+C 返回）", "Follow live (Ctrl+C to return)"),
+                 lambda: botctl.follow()),
             ])
         elif c == "7":
             auto()
         elif c == "8":
-            _submenu("更多", [
-                ("1", "配置模型（选服务商 + 填 key）", lambda: run("setup_llm.py")),
-                ("2", "真机自检（只读；需先停 bot，会问你）", _verify_real_flow),
-                ("3", "跑全部自测（不用真微信）", lambda: run("selftest_all.py")),
-                ("4", "启动助手（前台，看日志）", act_foreground),
-                ("5", "查看微信版本", lambda: run("wechat_version.py")),
-                ("6", "开机自启（开 / 关 / 看）", lambda: _submenu("开机自启", [
-                    ("1", "开启", lambda: run("autostart.py", ["on"])),
-                    ("2", "关闭", lambda: run("autostart.py", ["off"])),
-                    ("3", "查看状态", lambda: run("autostart.py", ["status"])),
-                ])),
-                ("7", "Hook（装 / 摘 / 装回 / 修）", lambda: _submenu("Hook 与微信", [
-                    ("1", "装 hook（放 version.dll + 禁用微信自动更新）",
-                     lambda: act_hook("do_hook_install.ps1", "装 hook")),
-                    ("2", "摘 hook（改名 .disabled，会强杀卡死的微信）",
-                     lambda: act_hook("do_remove_hook.ps1", "摘 hook")),
-                    ("3", "装回 hook（并重启微信）",
-                     lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
-                    ("4", "★ 只替换 version.dll（微信里那份是旧的时用这个）",
-                     act_fix_hook),
-                ])),
-                ("8", "打开状态页（本地只读网页）", act_status_page),
-                ("9", "搜索服务（网上搜索后端 启 / 停 / 看 / 装）", lambda: _submenu(
-                    "搜索服务（SearXNG，网上搜索的后端）", [
-                        ("1", "启动搜索服务", act_search_start),
-                        ("2", "停止搜索服务", act_search_stop),
-                        ("3", "看状态（进程 / 能不能查 / 开关 / 自启）", act_search_status),
-                        ("4", "装 / 修依赖（在它自己的目录里建 venv）", act_search_install),
-                    ])),
+            _submenu(("更多", "More"), [
+                ("1", ("配置模型（选服务商 + 填 key）",
+                       "Configure model (pick provider + paste key)"),
+                 lambda: run("setup_llm.py")),
+                ("2", ("真机自检（只读；需先停 bot，会问你）",
+                       "Real-machine check (read-only; asks to stop the bot first)"),
+                 _verify_real_flow),
+                ("3", ("跑全部自测（不用真微信）",
+                       "Run all selftests (no real WeChat needed)"),
+                 lambda: run("selftest_all.py")),
+                ("4", ("启动助手（前台，看日志）",
+                       "Start assistant (foreground, shows logs)"), act_foreground),
+                ("5", ("查看微信版本", "Show WeChat version"),
+                 lambda: run("wechat_version.py")),
+                ("6", ("开机自启（开 / 关 / 看）",
+                       "Start on boot (on / off / status)"),
+                 lambda: _submenu(("开机自启", "Start on boot"), [
+                     ("1", ("开启", "Enable"), lambda: run("autostart.py", ["on"])),
+                     ("2", ("关闭", "Disable"), lambda: run("autostart.py", ["off"])),
+                     ("3", ("查看状态", "Show status"),
+                      lambda: run("autostart.py", ["status"])),
+                 ])),
+                ("7", ("Hook（装 / 摘 / 装回 / 修）",
+                       "Hook (install / remove / restore / fix)"),
+                 lambda: _submenu(("Hook 与微信", "Hook and WeChat"), [
+                     ("1", ("装 hook（放 version.dll + 禁用微信自动更新）",
+                            "Install hook (drop version.dll + block WeChat auto-update)"),
+                      lambda: act_hook("do_hook_install.ps1", "装 hook")),
+                     ("2", ("摘 hook（改名 .disabled，会强杀卡死的微信）",
+                            "Remove hook (rename to .disabled; kills a stuck WeChat)"),
+                      lambda: act_hook("do_remove_hook.ps1", "摘 hook")),
+                     ("3", ("装回 hook（并重启微信）",
+                            "Restore hook (and restart WeChat)"),
+                      lambda: act_hook("do_restore_hook.ps1", "装回 hook")),
+                     ("4", ("★ 只替换 version.dll（微信里那份是旧的时用这个）",
+                            "★ Replace version.dll only (use when WeChat has an old one)"),
+                      act_fix_hook),
+                 ])),
+                ("8", ("打开状态页（本地只读网页）",
+                       "Open status page (local read-only web page)"), act_status_page),
+                ("9", ("搜索服务（网上搜索后端 启 / 停 / 看 / 装）",
+                       "Search service (web-search backend: start / stop / status / install)"),
+                 lambda: _submenu(
+                     ("搜索服务（SearXNG，网上搜索的后端）",
+                      "Search service (SearXNG, the web-search backend)"), [
+                         ("1", ("启动搜索服务", "Start search service"), act_search_start),
+                         ("2", ("停止搜索服务", "Stop search service"), act_search_stop),
+                         ("3", ("看状态（进程 / 能不能查 / 开关 / 自启）",
+                                "Show status (process / reachable / switch / autostart)"),
+                          act_search_status),
+                         ("4", ("装 / 修依赖（在它自己的目录里建 venv）",
+                                "Install / repair deps (venv inside its own folder)"),
+                          act_search_install),
+                     ])),
             ])
         elif c == "9":
             first_run()
+        elif c.lower() == "l":
+            # 切完语言**当场重画菜单**：所以这里 continue，别再让用户按一次回车
+            _switch_lang()
+            continue
         elif c == "0":
-            print("再见！")
+            print(t("再见！", "Bye!"))
             break
         else:
             print("无效选择，请输入 0~9。")
 
-        input("\n按回车返回菜单 ... ")
+        input(t("\n按回车返回菜单 ... ", "\nPress Enter to return to the menu ... "))
 
 
 def main():
