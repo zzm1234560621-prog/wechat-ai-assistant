@@ -139,11 +139,18 @@ def _try_selfheal(client, min_interval=None):
 # 而闸门是「不知道要等多久」的场景——用户扫码可能要等几分钟。首次照扫（限流比的是
 # 「距上次」，初值 0），之后最多 5 分钟一次。
 _GATE_HEAL_INTERVAL = 300.0
-# 只有**连不上 hook** 才计数放弃。掉登录、库打不开都**不放弃**——用户在扫码的那一刻，
-# 我们得还在（旧实现 30 次之后 sys.exit(1)，扫了码也救不回来）。
-# 30 次 × 10 秒 = 约 5 分钟；连不上时这一轮还会先花掉一次探针超时（默认 15 秒），
-# 所以卡死的 hook 下实际会更久——**这里不写死「几分钟」**，只说次数。
-_GATE_HARD_FAIL_LIMIT = 30
+# 「连不上 hook」时**不再放弃**（2026-10-07 真机事故后退役了那条判据）。
+# 旧实现：连不上就计数，到 30 次（约 5 分钟）就 `return None` → `sys.exit(1)`；
+# 旧注释说「连不上 hook = 真起不来，只有这条才放弃」。那晚的事实把这句话证伪了：
+#   10-06 22:03 自启拉起进程 → 当时微信没开、连不上 30001 → 22:12 放弃退出
+#   → 之后**没有任何东西再拉它**（Run 键只在登录响一次）→ 用户看到的就是
+#   「开机自启了，发消息却不回复」，一直持续到第二天早上人工拉起。
+# 现在**一直等**：微信可能几小时后才起来（用户就是这么用的），我们得还在。
+# 上界只由调用方**显式**给（`connect_aixed(give_up_fails=…)`，产品路径不传 = 不放弃）。
+# 回归：selftest_bot_loop.py 的 t_gate_selfheal ⑥。
+# 退避阶梯（秒）：连不上时不是每 10 秒硬敲几小时 —— 前两次仍 10 秒（用户刚开微信就能接上），
+# 之后 30、60 封顶。
+_GATE_BACKOFF_SEC = (10, 10, 30, 60)
 
 # ── 「微信刚回来」时允许**绕开限流补一次重扫**（2026-10-06 真机，用户原话「恢复时间久确实搞人心态」）──
 # 现场：用户重登微信后，助手先前那次重扫是在"微信还没活"时做的（必然失败），之后每 10 秒都被
@@ -155,8 +162,23 @@ _GATE_HEAL_BYPASS_INTERVAL = 60.0  # 绕开限流补扫之间至少隔这么久�
 _GATE_HEAL_AT = [0.0]              # 上次真扫的时刻（monotonic）
 _GATE_HEAL_BYPASS_AT = [0.0]       # 上次绕开限流补扫的时刻
 _GATE_LOG_INTERVAL = 60.0          # 闸门日志限流：以前每 10 秒两行，一晚能把日志刷穿
-_GATE_NOTIFY_AFTER = 30            # 卡这么多轮（×10 秒 ≈ 5 分钟）就主动弹一次本地通知
+_GATE_NOTIFY_AFTER = 30            # 卡这么多轮就主动弹一次本地通知（轮间隔见退避阶梯 → 约 10 分钟）
 _GATE_NOTIFY_INTERVAL = 600.0
+
+
+def _gate_backoff_sec(hard_fails):
+    """连不上 hook 时的下一次重试间隔（秒）。10 → 30 → 60 封顶。
+
+    为什么要有退避：现在是**一直等**，可能要等几小时（微信没开）。每 10 秒敲一次
+    对已关闭的端口是瞬时失败、不心疼，但日志/通知的节奏会让人以为"它在刷屏"；
+    阶梯让长时间等待安静下来，同时前 5 分钟仍保持 10 秒的敏捷（用户刚开微信就接上）。
+    """
+    steps = _GATE_BACKOFF_SEC
+    try:
+        i = min(max(0, int(hard_fails) - 1), len(steps) - 1)
+    except (TypeError, ValueError):
+        i = 0
+    return float(steps[i])
 
 
 def gate_heal_decision(last_rescan_age, rescan_interval, db_age,
@@ -221,7 +243,8 @@ def _gate_retry_step(client, hard_fails):
 
     ⚠️ 三种失败**必须分开处理**（2026-10-05 真机：混成一种就会让 bot 永远起不来）：
       * hook 说**已登录**、却连库都打不开 → 句柄表被重建了，**自愈一次**（重扫，2.7 秒修好）；
-      * hook **连不上** → 那才是真起不来，计一次数（到 `_GATE_HARD_FAIL_LIMIT` 如实放弃）；
+      * hook **连不上** → 那才是真起不来，计一次数（**但不再放弃**：退避着一直重试，
+        见 `connect_aixed` 的 `give_up_fails`）；
       * hook 说**没登录**（`IsLogin: 0`）→ 等用户扫码就好，**绝不重扫**
         （扫了也白扫，还得白花一次 700MB 进程的全内存扫描）。
 
@@ -2284,6 +2307,60 @@ def with_broadcast_preview(answer, preview):
     return (text.rstrip() + "\n\n" + prev).strip()
 
 
+def error_reply_text(exc):
+    """把「这一轮没答上来」翻成**用户能看懂、能行动**的一句话。
+
+    ⚠️ 换掉的是原来那句 `出错了，看终端日志。`（2026-10-07 真机）：
+    助手现在是**计划任务拉起的无窗口进程**，用户**根本没有终端可看** —— 那句话
+    既没说他遇上了什么，也没说该做什么，正好撞在项目最忌讳的"无用/误导文案"上。
+    真机现场：模型接口那 38 分钟连不上（`ConnectionRefusedError` → `连不上
+    https://api.deepseek.com`），5 次提问收到的都是那句废话。
+
+    两条硬规矩：
+      * **不转发整段 traceback**（里面有本机路径、请求细节），只取异常文本的头一段；
+      * 认不出的异常也**如实报类型与原文**，并指向 `bot.log`（用户能打开那个文件），
+        **绝不编一个原因**。
+    """
+    text = str(exc or "").strip()
+    low = text.lower()
+    # ① llm.py 已经分好类了（`LLMUnreachable.kind`）→ 直接照着说，**别去嗅探文本**。
+    # 2026-10-07 真机（校园网 Wi-Fi 掉线 3 分钟）：分类的价值就在这里 ——
+    # 「本机没网」和「只有这个接口不通」要用户做的事完全不同。
+    kind = getattr(exc, "kind", None)
+    target = getattr(exc, "target", "") or ""
+    detail = getattr(exc, "detail", "") or text
+    if kind == "net_down":
+        waited = float(getattr(exc, "waited", 0.0) or 0.0)
+        tail = (f"（我等了 {waited:.0f} 秒也没回来）" if waited > 0
+                else "（我探了两个公共目标都不通）")
+        return (f"这台电脑现在连不上外网（Wi-Fi 掉线 / 还没认证？{tail}）。"
+                f"助手本身在跑，网络回来再发一次就行。")
+    if kind == "dns":
+        return (f"域名解析不了（{target}）：多半是本机网络刚断或刚重连。"
+                f"过一会儿再发一次就行。")
+    if kind == "refused":
+        return (f"模型接口连不上（我探过别的公网目标是通的，所以更像接口这边/代理的问题）："
+                f"{target}　过一会儿再发一次就行。")
+    if kind == "host_down":
+        return (f"模型接口连不上（连接超时或中断）：{target}。"
+                f"过一会儿再发一次就行。")
+    # ② 没分类的（老调用点、别的异常）→ 按下文文本判断，行为与以前一致。
+    # 模型通道连不上（llm.py `_post` 的原话）：网络/代理问题，和助手本身无关。
+    if text.startswith("连不上 ") or "urlopen error" in low:
+        # 去掉异常自带的那个「连不上 」前缀，否则读起来是「连不上…：连不上…」
+        detail = text[len("连不上 "):] if text.startswith("连不上 ") else text
+        return ("模型接口连不上（这通常是网络或代理的问题，助手本身在跑）："
+                + detail[:120] + "\n过一会儿再发一次就行。")
+    # 模型接口有回应但拒绝：429 最常见，说清是限流而不是"坏了"。
+    if "http 429" in low:
+        return "模型接口在限流（HTTP 429）。等一两分钟再发一次就行。"
+    if "http 401" in low or "http 403" in low:
+        return "模型接口拒绝了这次调用（HTTP 401/403，多半是 key 失效或没额度）。" \
+               "在微信里发 /api <新key> 可以换一把。"
+    head = f"{type(exc).__name__}：{text[:150]}" if text else type(exc).__name__
+    return f"这一轮没能答上来（{head}）。完整堆栈在 bot.log 里。"
+
+
 # 每个自动回复会话上次自动回复的时间，用来做 min_gap 冷却
 _LAST_AUTO = {}
 
@@ -2369,14 +2446,21 @@ def connect_wcferry():
     return None
 
 
-def connect_aixed(base_url):
-    """连 aixed/WeChat-Hook 起的本地 HTTP 服务。失败返回 None。
+def connect_aixed(base_url, give_up_fails=None):
+    """连 aixed/WeChat-Hook 起的本地 HTTP 服务。**一直在等**，除非调用方显式给上界。
 
     ⚠️ 2026-10-05 真机：微信掉登录、用户重新扫码之后，hook 自报 `IsLogin: 1`，
     可三个库的句柄**全是空的**（`get database handle which named … failed`）。
     旧实现只探不修，于是它每 10 秒刷一行「请扫码登录」，**30 次之后 sys.exit(1)**——
-    用户明明已经扫码了，助手却再也起不来（那是「发消息没反应」的真正原因）。
-    现在：失败先走 `_gate_retry_step`（该自愈的自愈），而且**只有连不上 hook 才放弃**。
+    用户明明已经扫码了，助手却再也起不来。现在：失败先走 `_gate_retry_step`（该自愈的自愈）。
+
+    ⚠️ 2026-10-07 真机（**本函数的核心契约**）：旧实现还有第二条「到次数就放弃」——
+    连不上 hook 时 30 次（约 5 分钟）就 `return None` → `sys.exit(1)`。那晚的后果是
+    「开机自启了，却静默失联一整晚」：22:03 拉起时微信根本没开、22:12 就放弃了，
+    而 Run 键是**一次性发射**，没有任何东西再拉它。**微信晚几小时起来是正常用法**，
+    所以「放弃」被退役了：现在退避着**一直等**（前两次 10 秒，之后 30/60 秒封顶）。
+    `give_up_fails`（连续失败多少次就放弃）**只有自测会传**，产品路径故意不传。
+    见 `docs/autostart-task-notes.md`。
     """
     print(f"[bot] 正在连接 aixed HTTP 服务 {base_url} ...")
     client = AixedClient(base_url)
@@ -2384,6 +2468,7 @@ def connect_aixed(base_url):
     retries = 0
     last_log = 0.0
     last_notify = 0.0
+    started = time.monotonic()
     while True:
         ok, info = client.ping()
         if ok:
@@ -2392,8 +2477,12 @@ def connect_aixed(base_url):
         retries += 1
         now = time.monotonic()
         hard_fails, note = _gate_retry_step(client, hard_fails)
-        if hard_fails >= _GATE_HARD_FAIL_LIMIT:
+        # 显式上界（**只有自测会传**；产品路径不传 ⇒ 一直等，见 docstring）。
+        if give_up_fails and hard_fails >= int(give_up_fails):
+            print(f"[bot] 连不上 hook 已连续 {hard_fails} 次（调用方给的上界）→ 如实放弃。")
             return None
+        # 连不上是"hook 没应答"；库打不开是"hook 在、句柄空"——退避按前者算。
+        wait = _gate_backoff_sec(hard_fails) if hard_fails else 10.0
         # 日志**限流**（2026-10-06）：以前每 10 秒两行（"限流中"+"10 秒后重试"），一晚能把
         # 日志刷穿，而且看的人更慌。改成一分钟一行，并带上「第几次 / 等了多久 / 微信还在写库吗」
         # —— 后者正是判断"该不该等"的那条事实（`core_db_age_sec`，纯 stat）。
@@ -2407,20 +2496,23 @@ def connect_aixed(base_url):
                 db_age = None
             wrote = (f"微信最近写库 {db_age:.0f} 秒前" if db_age is not None
                      else "微信写库时间读不到")
-            print(f"[bot] ⏳ 还在等微信的库能打开（第 {retries} 次 / 约 {retries * 10} 秒；{info}；"
-                  f"{wrote}），10 秒后再试 ...")
+            print(f"[bot] ⏳ 还在等（第 {retries} 次 / 已等 {int(now - started)} 秒；{info}；"
+                  f"{wrote}），{wait:.0f} 秒后再试 ...（助手会一直等，不会自己退出）")
         # 卡过 `_GATE_NOTIFY_AFTER` 轮就**主动弹一次本地通知**：控制台没人看、WeChat 又收不到
-        # 消息的时候，这是唯一能告诉他"该去彻底重开微信"的路（和 C 的告警同一个通道）。
+        # 消息的时候，这是唯一能告诉他"该去把微信开起来"的路（和 C 的告警同一个通道）。
+        # 两种等法的话**不能混**（2026-10-07）：连不上 hook ≠ 已登录但句柄空，用户要做的事不一样。
         if retries >= _GATE_NOTIFY_AFTER and now - last_notify >= _GATE_NOTIFY_INTERVAL:
             last_notify = now
-            try:
-                health.notify(
-                    "微信助手：还在等微信的库",
+            body = ("连不上微信的 hook（127.0.0.1:30001 没应答）。**把微信打开就行**——"
+                    "助手会一直等、自己接上，不用管它。"
+                    if hard_fails else
                     "hook 还在应答、也显示已登录，但数据库句柄打不开（**不是掉登录**）。"
                     "该做的：彻底退出微信 → 重新打开 → 扫码；助手不用动，它会自己接上。")
+            try:
+                health.notify("微信助手：还在等微信", body)
             except Exception:
                 traceback.print_exc()
-        time.sleep(10)
+        time.sleep(wait)
 
 
 class _Ticker:
@@ -3225,6 +3317,35 @@ def _chdir_project_root():
     return cur
 
 
+def _has_interactive_console():
+    """这份进程有没有**可用的控制台窗口** = 「有没有人能点 UAC」的唯一判据（2026-10-07）。
+
+    为什么要它：`admin.ensure_elevated(assume=…)` 需要知道"这一刻有没有人能点那个 UAC 弹窗"。
+    错的判据会两头都坏：写死 `assume=False` → 无人值守时弹一个没人点的窗，超时后 `exit(2)`
+    （pythonw 无窗口，用户什么都看不到）；写死 `assume=True` → 用户双击启动时**静默降级成
+    普通权限**，语音条读不到却毫无提示（本项目最忌讳的那种失效）。
+
+    判据用 `GetConsoleWindow()`：pythonw / 计划任务 / 无窗口自启 = 0（没人能点），
+    终端 / `启动助手.bat` 里有真窗口 = 非 0（有人能点）。
+    **拿不到就按"没人能点"处理**（宁可只告警继续跑，也绝不静默消失）。
+    """
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return False
+
+
+def gate_assume_no_uac(has_console):
+    """「这一刻没人能点 UAC」→ `assume=True`（只告警、继续跑）。纯函数，便于自测钉住两个分支。
+
+    有控制台 = 用户在看着，该弹就弹（`assume=False`）：否则静默降级成普通权限，
+    语音条读不到却毫无提示。没控制台（计划任务 / pythonw / 无人值守）= 弹了也没人点，
+    超时后 `exit(2)` 在无窗口进程里等于静默消失 —— 那正是 2026-10-06 22:12 那晚的死法。
+    """
+    return not bool(has_console)
+
+
 def main():
     moved_from = _chdir_project_root()
     setup_logging()
@@ -3237,9 +3358,17 @@ def main():
     # 就被 `GetLastError=5` 拒绝）。证据见 docs/voice-reliability-2026-10-03.md 第六节。
     # 位置：**在 `acquire_single_instance()` 之前** —— 提权失败时这里就退出，
     # 不会出现"没提权的那一份先抢了锁、提权那一份反而起不来"。
-    # `assume=True`：开机自启那一刻没人点 UAC，所以**只告警不弹窗**（弹了也没人点）；
-    # 双击启动那条路（`启动助手.bat`）走的是正常提权，会弹一次 UAC。
-    _eok, _emsg, _elaunched = admin.ensure_elevated(capture=True)
+    #
+    # `assume`：**判据是"这份进程有没有控制台窗口"**，也就是"有没有人能点 UAC"（2026-10-07 修）。
+    # 旧代码写死 `assume=False`（注释却写着自启那条路是 True）→ 开机自启那一刻它会去弹 UAC，
+    # 没人点就 `exit(2)`，而 pythonw 无窗口 ⇒ **一点提示都没有**，用户只看到"发消息不回复"。
+    # 现在的分工：
+    #   * 没控制台（计划任务 / 老 Run 键 / 无人值守）→ `assume=True`：只告警，**继续以普通权限跑**
+    #     （文本仍能回，只有语音条读不到）；绝不静默消失；
+    #   * 有控制台（`启动助手.bat`、终端里 `python bot.py`）→ 照旧弹一次 UAC。
+    # 计划任务那条路本来就是管理员（`RunLevel=Highest`），`is_admin()` 先返回，不受这里影响。
+    _assume = gate_assume_no_uac(_has_interactive_console())
+    _eok, _emsg, _elaunched = admin.ensure_elevated(capture=True, assume=_assume)
     if not _eok:
         print(f"[bot] {_emsg}", file=sys.stderr, flush=True)
         sys.exit(2)
@@ -3299,7 +3428,8 @@ def main():
         history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), history_file)
     static_history = HistoryStore(history_file)
 
-    # 连接微信；后台自启时微信可能还没启动，两种后端都会重试等待（最多约 5 分钟）
+    # 连接微信；后台自启时微信**可能还没启动**——所以这里**一直等**（2026-10-07 起：
+    # 不再"约 5 分钟就放弃"，那正是"自启了却不回复"那晚的死因；见 connect_aixed 的 docstring）。
     backend = cfg.get("backend", "wcferry")
     # 默认值必须跟 config.yaml / CLAUDE.md 一致（5 秒）。以前这里写 2，而
     # config.yaml 的注释明确写着「实测 2 秒间隔会把微信卡到 CPU 999 秒」——
@@ -3309,8 +3439,10 @@ def main():
         # 兜底端口必须跟 config.yaml / CLAUDE.md / postman 一致（30001）。
         # 这里以前写 8080：配置里一旦漏了 aixed_base_url，就会连错端口，
         # 而报错文案却指向「微信没启动、version.dll 没加载」，排查方向全错。
+        # **不传 `give_up_fails`**：一直等（微信晚几小时起来也接得上）。
         wcf = connect_aixed(cfg.get("aixed_base_url", "http://127.0.0.1:30001"))
         if wcf is None:
+            # 正常路径到不了这里（不给上界就一直等）；留作兜底，绝不假装成功。
             print("[bot] 连不上 aixed 服务。请确认微信已启动、version.dll 已加载、aixed_base_url 端口正确。")
             sys.exit(1)
         # 连上了 → 这时才拿得到**运行时**那条 hook 版本证据（`LoginGateInfo` 有没有）。
@@ -4346,10 +4478,12 @@ def main():
                     dialog_append(sender, "user", query, cfg)
                     dialog_append(sender, "assistant", answer, cfg)
                     print(f"[bot] 已回复: {answer[:60]}...")
-                except Exception:
+                except Exception as e:
                     traceback.print_exc()
                     try:
-                        send("出错了，看终端日志。", sender)
+                        # 说清「这一轮为什么没答上来」+ 该怎么办；**绝不再说"看终端日志"**
+                        # （无窗口后台任务，用户没有终端；见 error_reply_text 的说明）。
+                        send(error_reply_text(e), sender)
                     except Exception:
                         pass
         except KeyboardInterrupt:

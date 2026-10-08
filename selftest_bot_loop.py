@@ -759,6 +759,53 @@ def _tiny_png(path):
     return path
 
 
+def t_error_reply_text():
+    sec("这一轮没答上来时回的那句话：说清原因 + 怎么办，绝不说「看终端日志」")
+    # 2026-10-07 真机：模型接口 38 分钟连不上，5 次提问收到的都是「出错了，看终端日志。」
+    # 而助手是**计划任务拉起的无窗口进程** —— 用户根本没有终端可看。
+    E = bot.error_reply_text
+    net = E(RuntimeError("连不上 https://api.deepseek.com：<urlopen error [WinError 10061] "
+                         "由于目标计算机积极拒绝，无法连接。>"))
+    chk("网络或代理" in net and "过一会儿" in net,
+        f"连不上模型 → 说清是网络/代理问题并给出重试建议：{net[:40]!r}")
+    chk("api.deepseek.com" in net, "把连不上的目标带上（用户/排查都需要它）")
+    chk("Traceback" not in net and "File \"" not in net, "**不转发整段 traceback**（里面有本机路径）")
+    chk("限流" in E(RuntimeError("https://api.deepseek.com 返回 HTTP 429：{\"error\":\"rate\"}")),
+        "HTTP 429 → 说成限流，不是「坏了」")
+    chk("/api" in E(RuntimeError("https://api.deepseek.com 返回 HTTP 401：Invalid key")),
+        "HTTP 401/403 → 指路 /api <新key>")
+    gen = E(ValueError(""))
+    chk("ValueError" in gen and "bot.log" in gen, f"认不出的异常如实报类型 + 指向 bot.log：{gen!r}")
+    chk("看终端日志" not in (E(None) + net + gen),
+        "退役的那句「出错了，看终端日志。」不许再出现（无窗口进程没有终端可看）")
+
+    # llm.py 分好类的那种（2026-10-07 校园网 Wi-Fi 掉线）：**照 kind 说**，别去嗅探文本
+    class _U(RuntimeError):
+        def __init__(self, kind):
+            super().__init__("连不上 https://api.deepseek.com：拒绝")
+            self.kind = kind
+            self.target = "https://api.deepseek.com"
+            self.detail = "拒绝"
+
+    chk("Wi-Fi 掉线" in E(_U("net_down")),
+        "kind=net_down → 直接说「这台电脑连不上外网」，不甩锅给模型接口")
+
+    class _UN(RuntimeError):
+        def __init__(self):
+            super().__init__("连不上 https://api.deepseek.com：拒绝")
+            self.kind = "net_down"
+            self.target = "https://api.deepseek.com"
+            self.detail = "拒绝"
+            self.waited = 90.0
+
+    chk("等了 90 秒" in E(_UN()),
+        "等过网络（睡醒那种）→ 文案里如实写出「我等了 90 秒也没回来」")
+    chk("通" in E(_U("refused")) and "接口" in E(_U("refused")),
+        "kind=refused → 说明本机网络是通的，问题在接口/代理那一侧")
+    chk("解析" in E(_U("dns")), "kind=dns → 说成域名解析失败")
+    chk("超时" in E(_U("host_down")), "kind=host_down → 说成连接超时/中断")
+
+
 def t_inline_image_round(tmp):
     """`image.mode=inline`：原图**附给模型当次调用**，而且（关键）**不进对话记忆**。
 
@@ -1243,11 +1290,21 @@ def t_gate_selfheal():
         chk(c is not None, "自愈一次之后 ping 通了 → 返回 client（不再 sys.exit）")
         chk(len(calls) == 1, f"端到端里确实重扫了 1 次（实际 {len(calls)}）")
 
-        # ⑥ 连不上 hook：到上限就如实放弃，不无限等
-        bot.AixedClient = lambda url: _GateCli(reachable=False)
+        # ⑥ 连不上 hook：**默认不再放弃**（2026-10-07 退役了"到上限就退出"那条）。
+        #    现场：22:03 自启起来时微信根本没开、22:12 放弃退出，而 Run 键只在登录响一次
+        #    ⇒ 静默失联一整晚。微信晚几小时起来是正常用法，所以要一直等下去。
+        bot.AixedClient = lambda url: _GateCli(reachable=False, ping_ok_after=40)
         with contextlib.redirect_stdout(io.StringIO()):
             c2 = bot.connect_aixed("http://127.0.0.1:1")
-        chk(c2 is None, "连不上 hook → 到上限返回 None（交给上层如实报错）")
+        chk(c2 is not None, "连不上 hook 也一直等：第 40 次 ping 成功 → 返回 client（不再 sys.exit）")
+        # 上界只有调用方**显式**给时才生效（产品路径不传；自测靠它把循环收住）
+        bot.AixedClient = lambda url: _GateCli(reachable=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            c3 = bot.connect_aixed("http://127.0.0.1:1", give_up_fails=5)
+        chk(c3 is None, "调用方显式给上界 → 到上界返回 None（交给上层如实报错）")
+        chk(bot._gate_backoff_sec(1) == 10 and bot._gate_backoff_sec(2) == 10
+            and bot._gate_backoff_sec(99) == 60, "退避阶梯：前两次 10 秒，之后 30/60 封顶")
+        chk(bot._gate_backoff_sec(0) == 10, "没算到「连不上」时也是 10 秒一轮（扫码那种场景）")
     finally:
         bot.live_history.force_rescan = old_rescan
         bot.time.sleep = old_sleep
@@ -1255,6 +1312,19 @@ def t_gate_selfheal():
         bot.hook_check.core_db_age_sec = old_db_age
         bot._GATE_HEAL_AT[0] = 0.0
         bot._GATE_HEAL_BYPASS_AT[0] = 0.0
+
+
+def t_gate_assume():
+    sec("启动闸门：assume 判据 = 「这份进程有没有控制台」")
+    # 2026-10-07 修：旧代码写死 assume=False（注释却写着自启那条路是 True）→ 开机那一刻
+    # 它会去弹 UAC，没人点就 exit(2)，而 pythonw 无窗口 ⇒ **一点提示都没有**
+    # （用户只看到「开机自启了，发消息却不回复」）。
+    chk(bot.gate_assume_no_uac(True) is False,
+        "有控制台（启动助手.bat / 终端）→ 该弹 UAC：绝不静默降级成普通权限")
+    chk(bot.gate_assume_no_uac(False) is True,
+        "没控制台（计划任务 / pythonw / 无人值守）→ 只告警、继续跑，绝不 exit(2)")
+    chk(isinstance(bot._has_interactive_console(), bool),
+        "控制台判据本机可用（拿不到也按「没人能点」处理，不抛异常）")
 
 
 def t_gate_heal_when_wechat_back():
@@ -2162,12 +2232,14 @@ def main():
     t_selfcheck()
     t_stall_selfheal()
     t_gate_selfheal()
+    t_gate_assume()
     t_gate_heal_when_wechat_back()
     t_bot_console()
     t_check_ret()
     t_own_image()
     t_broadcast_preview_note()
     t_auto_reply_truth_note()
+    t_error_reply_text()
     t_now_line()
     t_from_self_reaches_toolbox()
     t_own_echo_without_identity()

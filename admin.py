@@ -32,9 +32,12 @@
 
 * 用户点了 UAC 的「否」→ 起不来（`ERROR_CANCELLED=1223`）；这里会如实说，
   **绝不偷偷降级成普通权限接着跑** —— 那正是本项目最忌讳的失效形态。
-* 开机自启那一刻**没人点 UAC**：`-Verb RunAs` 在那种场景不是"会弹一下"，
-  而是可能静默失败。所以自启那条路走 `assume=True`（不弹 UAC、只告警）。
-  想**完全静默**地在开机时提权，标准做法是计划任务（`RunLevel=Highest`），不是 RunAs。
+* **开机自启走的是计划任务（`RunLevel=Highest`），已经不需要 UAC**（2026-10-07 改，见
+  `docs/autostart-task-notes.md`）。`-Verb RunAs` 只留给"有控制台、有人能点"的交互式入口
+  （`启动助手.bat` / 终端里 `python bot.py`）。
+* `assume=True` 的用途因此收窄成「**这份进程没有控制台、没人能点 UAC**」：只告警、继续以
+  普通权限跑（文本仍能回，只有语音条读不到），**绝不弹窗、绝不 exit(2) 静默消失**。
+  判据由调用方给（`bot._has_interactive_console()`），不是"谁拉起来的"。
 """
 import os
 import subprocess
@@ -154,6 +157,12 @@ def relaunch_elevated(argv=None, exe=None, cwd=None, capture=False, wait=False):
         else:
             p = subprocess.run(["powershell", "-NoProfile", "-Command", line],
                                timeout=None)
+    except subprocess.TimeoutExpired:
+        # 2026-10-07 真机：这条以前混在下面那句里报「拉不起 PowerShell」——**甩锅甩错了对象**。
+        # 真实情况是「UAC 弹窗 120 秒没人点」（人不在键盘前就是常态），排查方向完全不同。
+        return False, ("提权超时：UAC 弹窗 120 秒没人点（人不在？）。"
+                       "**没有以管理员身份跑起来，也没有降级成普通权限**，"
+                       "确认有人在电脑前再试一次。")
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"提权失败（拉不起 PowerShell）：{type(e).__name__}: {e}"
     if p.returncode == 0:
@@ -189,7 +198,9 @@ def ensure_elevated(argv=None, exe=None, cwd=None, assume=False,
     `(True, "已经提权", True)` = 别往下跑。`botctl.start()` 就是这么用的
     （那里错一次就是**两个助手同时轮询 hook**，实测会把微信搞崩）。
 
-    `assume=True`（开机自启那条路用）：**不弹 UAC**，只在不是管理员时告警并继续。
+    `assume=True`（**没有控制台**的场景用，如计划任务/无人值守）：**不弹 UAC**，
+    只在不是管理员时告警并继续。调用方用 `bot._has_interactive_console()` 判断
+    「这一刻有没有人能点 UAC」——有控制台就该弹（否则静默降级成普通权限，语音条悄悄废掉）。
     ⚠️ 这一档**排在令牌判定之前**：自启这条路从来不会自己提权，所以哪怕环境里
     侥幸留着一个令牌（用户先双击提权过一次、自启进程继承了那个环境），也不许据此
     认为"我已经是提权的了"——那会把"不是管理员"这件事**静默吞掉**。

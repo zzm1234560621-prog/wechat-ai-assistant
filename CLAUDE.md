@@ -257,12 +257,12 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
     末帧**（旧代码 `est > 帧数` 会扔掉内存里**完整存在**的候选——长语音读不出来的根因）；
     定位用 XML 的 `length` 做指纹（真实 SILK 长度 = `length`−1）。**别删**"够不着就不解码"的
     便宜闸（否则几百次 pilk 解码卡死轮询）。见 **`docs/voice-reliability-2026-10-03.md`**。
-  - ⚠️ **助手必须以管理员运行**（2026-10-06 用户拍的硬约束，部署到别的电脑也一样）：
-    语音要读微信进程内存，而 Windows 不许低完整性进程读高完整性进程（微信提权开 →
-    普通权限助手 `OpenProcess` 就是 `err=5`）。四个「起 bot」入口（`助手.bat`/`启动助手.bat`/
-    开机自启/`botctl.start`）都过 **`admin.ensure_elevated()`**、启动弹一次 UAC；
-    **别再加第五个入口而不接这道闸**。命令串只许在 `admin.py` 写一次，
-    坑与自测见 **`docs/admin-elevation-notes.md`**。
+  - ⚠️ **助手必须以管理员运行**（2026-10-06 硬约束，换电脑也一样；理由见
+    `docs/admin-elevation-notes.md`）：四个「起 bot」入口（`助手.bat`/`启动助手.bat`/
+    开机自启/`botctl.start`）都过 **`admin.ensure_elevated()`**；自启已是**计划任务**
+    （`RunLevel=Highest`，静默；细节见 `docs/autostart-task-notes.md`），其余弹一次 UAC，
+    无控制台时 `assume=True`（只告警继续跑，**绝不 exit(2) 静默消失**）。
+    **别再加第五个入口而不接这道闸**；命令串只许在 `admin.py` 写一次。
   - **三条硬约束**（改之前先读 `docs/voice-input-spec.md`）：① `audio.max_seconds`（默认 1800）+ `file.max_bytes`
     是**硬上限，超了如实拒绝、绝不静默截断音频**；
     ② **绝不在聊天里静默下模型** —— 推理只认本地目录（结构上不可能联网），下载只由
@@ -300,7 +300,7 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 - `usage.py` — token/费用统计，落盘 `data/usage.jsonl`，`/用量` 读它。
 - `redact.py` — 送云端前的脱敏（手机号/身份证/银行卡/邮箱/IP），**默认关闭**，规范见下面「运行看护」。
 - `status_page.py` — 只读本地状态页（默认关）。**规范见下面「运行看护」**。
-- 入口有三条，都会起 `bot.py`：`助手.bat` 菜单、`启动助手.bat`、开机自启注册表。
+- 入口有三条，都会起 `bot.py`：`助手.bat` 菜单、`启动助手.bat`、开机自启（**计划任务**，见 `docs/autostart-task-notes.md`）。
 
 ## ⚠️ 本地执行（run_command / executor.py）—— 微信就是远程执行入口
 
@@ -324,12 +324,11 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
 **这个 hook 前后把微信搞崩过 8 次**（转储里能数出 8 份）。崩溃的直接诱因是**两个 bot（或两路查询）同时在轮询**——已加了单实例锁（`bot.py:acquire_single_instance`，回环端口 39001），但这只是兜底，真正的死因是下面三条。
 
 **崩溃取证怎么做**：微信自己的转储在
-`%APPDATA%\Tencent\xwechat\crashinfo\reports\Weixin_*.dmp`（不是 WER 那份）。
-`%TEMP%\dump_parse.py <dmp>` 能直接解出异常码 / 出错地址 / 归属模块偏移（纯 struct，不要 windbg）。
-**8 份转储的完整对照表、逐份异常地址、崩溃点反汇编，以及 2026-10-05「收紧就绪判据」的
-判据/owner/部署/验证记录，全在 `docs/hook-login-gate-notes.md`**（改 hook 之前先读它）。
-一句话版本：命中最多的是 `Weixin.dll+0x32BB4xx~+0x32BB80x`（句柄对象被当成有效对象用，
-读 `0x1`/`0x10000`/`0xFFFF…` 这类非地址值），另有 `+0x505AFBD` 读 NULL 与 `ntdll` 堆损坏。
+`%APPDATA%\Tencent\xwechat\crashinfo\reports\Weixin_*.dmp`（不是 WER 那份）；
+`%TEMP%\dump_parse.py <dmp>` 直接解异常码/地址/偏移（纯 struct，不要 windbg）。
+**8 份转储的完整对照表、崩溃点反汇编，以及 2026-10-05「收紧就绪判据」的
+判据/部署/验证记录，全在 `docs/hook-login-gate-notes.md`**（改 hook 之前先读它）。
+一句话版本：命中最多的偏移在 `Weixin.dll+0x32BB4xx~+0x32BB80x`，另有 `+0x505AFBD` 读 NULL。
 
 **注意：转储的模块表里看不到这个 hook**。钩子会把自己从 PEB 模块链里摘掉
 （见 `docs/hook-anti-tamper-notes.md`），所以**别用「模块在不在」判断钩子有没有涉案**
@@ -381,11 +380,11 @@ usage / redact       ← /用量 读 data/usage.jsonl；redact 只作用于送�
   0. **先分诊「是不是掉登录了」**：跑 `is_login()` / `self_profile()`。
      微信会**自己重启到登录界面**（换 PID、内存掉到 ~148MB、30001 仍在监听但 `IsLogin: 0`）——
      表现和 fts 静默失效几乎一样，但**恢复只能人工扫码**，`force_rescan` 没用还白搭一次全内存扫描。
-     ⚠️ 2026-10-05 真机更正：本机这份自编 DLL 的 `g_IsLogin` **只置 1、从不置回 0**
-     （`docs/hook-login-gate-notes.md`），所以上面这条判据会骗人 —— **真正管用的是「库能不能查」**：
-     `IsLogin: 1` + 三个库全 `handle … failed` = 句柄表被重建，这种状态**重扫有用**
-     （实测 2.7 秒修好），别再当成「只能扫码」。启动闸门已接自愈（`bot._gate_retry_step`），
-     且**只在连不上 hook 时才放弃**。
+     ⚠️ 2026-10-05 真机更正：本机这份 DLL 的 `g_IsLogin` **只置 1、从不置回 0**
+     （`docs/hook-login-gate-notes.md`），这条判据会骗人 —— **真正管用的是「库能不能查」**：
+     `IsLogin: 1` + 三个库全 `handle … failed` = 句柄表被重建，**重扫有用**（实测 2.7 秒修好），
+     别再当成「只能扫码」。闸门已接自愈（`bot._gate_retry_step`），且连不上 hook 也**一直等**
+     （2026-10-07 起不再 5 分钟就退出；`give_up_fails` 只有自测传）。
   1. 再看 `bot.log` 的轮询心跳（`[bot] 轮询心跳 #N，游标=X`）。游标不动就是 fts 那条。
   2. 才手工 `force_rescan`。
 - **不需要重启 bot**——每轮空结果都会重查 `_v4_fts_tables`，修好后 5 秒内自动接上。

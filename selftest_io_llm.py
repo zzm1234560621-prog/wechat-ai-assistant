@@ -10,8 +10,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -1073,6 +1076,200 @@ def t12_embedded_images():
         print("  ⏭️  没有多页 PDF 样本，跳过「页数截断要说明」这条")
 
 
+def t13_llm_unreachable():
+    """模型通道的连接失败：**只在请求没发出去时**重试 + 失败带分类（2026-10-07 真机）。
+
+    真机：校园网 Wi-Fi 掉线 3 分钟，到 api.deepseek.com:443 被立即拒绝（10061），
+    5 次提问全废。那时 `chat()` 和 `chat_with_tools()` **各自写了一份**请求/异常处理，
+    所以"只修一个入口"会让另一个静默失效 —— 这里同时钉住两条路都走同一个 HTTP 出口。
+
+    **不联网**：urlopen 与网络探针都换成桩。
+    """
+    print("\n── T13 · llm 连接失败：有界重试 + 分类（不联网）──")
+    real_urlopen = llm.urllib.request.urlopen
+    real_probe = llm.network_down
+    real_sleeps = llm._LLM_RETRY_SLEEP
+    llm._LLM_RETRY_SLEEP = (0.0, 0.0)          # 别真等 7 秒
+    impl = llm._OpenAICompat("deepseek-chat", "sk-fake", "https://api.example.invalid", 100, 0.7)
+    body = {"choices": [{"finish_reason": "stop",
+                         "message": {"content": "好", "tool_calls": []}}]}
+    calls = []
+    probe_calls = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(body).encode()
+
+    def raiser(exc):
+        def f(req, timeout=None):
+            calls.append(1)
+            raise exc
+        return f
+
+    try:
+        # ① 拒连两次、第三次成功 → **必须重试回来**（连接被拒 = 请求根本没发出去，重试不花钱）
+        def flaky(req, timeout=None):
+            calls.append(1)
+            if len(calls) < 3:
+                raise urllib.error.URLError(ConnectionRefusedError(10061, "拒绝连接"))
+            return _Resp()
+        llm.urllib.request.urlopen = flaky
+        llm.network_down = lambda *a, **k: False
+        r = impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        check("拒连两次后成功 → 重试生效（共 3 次请求，拿到答复）",
+              len(calls) == 3 and r.text == "好", (len(calls), r.text))
+
+        # ①b `chat()`（不带工具那条路）也必须走同一个出口
+        calls.clear()
+        r2 = impl.chat("s", [{"role": "user", "content": "hi"}])
+        check("chat() 那条路同样重试（两条路共用一个 HTTP 出口）",
+              len(calls) == 3 and r2 == "好", (len(calls), r2))
+
+        # ② 读超时**绝不重试**（无法确认模型是否已经生成并计费）
+        calls.clear()
+        probe_calls.clear()
+        llm.urllib.request.urlopen = raiser(urllib.error.URLError(TimeoutError("timed out")))
+        llm.network_down = lambda *a, **k: probe_calls.append(1) or False
+        err = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err = e
+        check("读超时只发一次、不重试", len(calls) == 1, len(calls))
+        check("读超时 → LLMUnreachable(kind=host_down)",
+              isinstance(err, llm.LLMUnreachable) and err.kind == "host_down",
+              (type(err).__name__, getattr(err, "kind", None)))
+        check("读超时那一路**不去探本机网络**（探针也有成本，且判不出'发没发出去'）",
+              probe_calls == [], probe_calls)
+
+        # ③ 一直被拒 + 探针说本机也没网 → net_down（用户看到的应是「这台电脑没外网」）
+        calls.clear()
+        real_net_wait = llm._NET_RECOVER_WAIT_SEC
+        llm._NET_RECOVER_WAIT_SEC = 0.0            # 本用例只验分类，不等网络（见 ⑧⑨）
+        llm.urllib.request.urlopen = raiser(urllib.error.URLError(ConnectionRefusedError(10061, "拒绝")))
+        llm.network_down = lambda *a, **k: True
+        err2 = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err2 = e
+        check("拒连会重试到上限（3 次请求）才放弃", len(calls) == 3, len(calls))
+        check("探针说本机没网 → kind=net_down", getattr(err2, "kind", None) == "net_down",
+              getattr(err2, "kind", None))
+        llm._NET_RECOVER_WAIT_SEC = real_net_wait
+
+        # ④ 一直被拒、但探针说网络是通的 → refused（问题在接口/代理那一侧）
+        calls.clear()
+        llm.urllib.request.urlopen = raiser(urllib.error.URLError(ConnectionRefusedError(10061, "拒绝")))
+        llm.network_down = lambda *a, **k: False
+        err3 = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err3 = e
+        check("本机网络通 → kind=refused", getattr(err3, "kind", None) == "refused",
+              getattr(err3, "kind", None))
+
+        # ⑤ 域名解析失败 = 一个字节都没发 → 也允许重试，并归 dns
+        calls.clear()
+        llm.urllib.request.urlopen = raiser(
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known")))
+        llm.network_down = lambda *a, **k: False
+        err4 = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err4 = e
+        check("解析失败也重试（3 次）且 kind=dns",
+              len(calls) == 3 and getattr(err4, "kind", None) == "dns",
+              (len(calls), getattr(err4, "kind", None)))
+
+        # ⑥ HTTP 500 语义明确 → **不重试**，原样报 HTTP 状态
+        calls.clear()
+
+        def http500(req, timeout=None):
+            calls.append(1)
+            raise urllib.error.HTTPError("https://api.example.invalid", 500, "boom", {},
+                                         io.BytesIO(b'{"error":"server"}'))
+        llm.urllib.request.urlopen = http500
+        err5 = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err5 = e
+        check("HTTP 500 不重试（1 次请求）", len(calls) == 1, len(calls))
+        check("HTTP 500 原样带状态与 detail",
+              isinstance(err5, RuntimeError) and "HTTP 500" in str(err5) and "server" in str(err5),
+              str(err5)[:60])
+
+        # ⑦ 判据本身：哪些算「请求没发出去」
+        check("_retryable: 拒连 / 解析失败 = True",
+              llm._retryable(ConnectionRefusedError(10061, "x"))
+              and llm._retryable(socket.gaierror(-2, "x")))
+        check("_retryable: 超时 / 连接重置 = False（可能已经送到服务端）",
+              not llm._retryable(TimeoutError("t")) and not llm._retryable(ConnectionResetError("r")))
+
+        # ⑧ 睡醒那几十秒（2026-10-07 真机）：本机没网 → 等网络回来 → **同一个请求**再试一次并成功
+        calls.clear()
+        real_wait_fn = llm._wait_network_back
+        llm._wait_network_back = lambda *a, **k: (True, 20.0)
+
+        def refuse_then_ok(req, timeout=None):
+            calls.append(1)
+            if len(calls) <= 3:
+                raise urllib.error.URLError(ConnectionRefusedError(10061, "拒绝"))
+            return _Resp()
+        llm.urllib.request.urlopen = refuse_then_ok
+        llm.network_down = lambda *a, **k: True
+        r3 = impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        check("网络回来后重试成功 → 用户收到正常答复（不用重发）",
+              r3.text == "好" and len(calls) == 4, (getattr(r3, "text", None), len(calls)))
+
+        # ⑨ 等了预算还是没回来 → 如实报，且 waited 记下来（文案里会写「等了 N 秒」）
+        calls.clear()
+        llm._wait_network_back = lambda *a, **k: (False, 90.0)
+        llm.urllib.request.urlopen = raiser(urllib.error.URLError(ConnectionRefusedError(10061, "拒绝")))
+        err6 = None
+        try:
+            impl.chat_with_tools("s", [{"role": "user", "content": "hi"}], [])
+        except Exception as e:
+            err6 = e
+        check("等满预算仍不通 → 如实抛，并带上 waited",
+              getattr(err6, "kind", None) == "net_down" and getattr(err6, "waited", 0) == 90.0,
+              (getattr(err6, "kind", None), getattr(err6, "waited", None)))
+        llm._wait_network_back = real_wait_fn
+
+        # ⑩ 等待函数本身：探针通了就立刻返回，探针一直不通就等满预算（sleep 换桩，不真等）
+        real_sleep = llm.time.sleep
+        try:
+            llm.time.sleep = lambda s: None
+            seq = {"n": 0}
+
+            def probe_after_two(*a, **k):
+                seq["n"] += 1
+                return seq["n"] <= 2            # 前两次没网，第三次通了
+            llm.network_down = probe_after_two
+            ok_back, waited_back = llm._wait_network_back(seconds=90, step=5)
+            check("等待函数：网络回来就立刻返回，并报出真实等待秒数",
+                  ok_back is True and waited_back == 15.0, (ok_back, waited_back))
+            llm.network_down = lambda *a, **k: True
+            ok_back2, waited_back2 = llm._wait_network_back(seconds=20, step=5)
+            check("等待函数：一直不通就等满预算（20 秒）后放弃",
+                  ok_back2 is False and waited_back2 == 20.0, (ok_back2, waited_back2))
+        finally:
+            llm.time.sleep = real_sleep
+    finally:
+        llm.urllib.request.urlopen = real_urlopen
+        llm.network_down = real_probe
+        llm._LLM_RETRY_SLEEP = real_sleeps
+
+
 def main():
     # 临时根改到系统临时盘（`PROJ_TMP`）：默认的 `<项目>/data/tmp_*` 在受限环境
     # （只允许写工作区顶层的沙箱）里**建都建不了**，压缩包用例会 PermissionError。
@@ -1097,6 +1294,7 @@ def main():
     t10_unlimited_and_sniff()
     t11_paging_and_export()
     t12_embedded_images()
+    t13_llm_unreachable()
     print("\n" + "=" * 60)
     print("全部通过 ✅" if _ok else "有失败项 ❌")
     print("=" * 60)

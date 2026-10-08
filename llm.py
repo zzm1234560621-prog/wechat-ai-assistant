@@ -12,6 +12,8 @@ API Key 从 config / 环境变量读取，显式传入优先；**环境变量按
 """
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -316,6 +318,102 @@ def _is_truncated(resp) -> bool:
 
 
 # ============================================================
+#  连接失败：分类 + **只在「请求没发出去」时**有界重试
+# ============================================================
+# 2026-10-07 真机（校园网 Wi-Fi 掉线，38 分钟里 5 次提问全废）：
+#   12:51:57 Wi-Fi 断开 → 12:52:47 重连 → 12:54:45/50 仍拿不到 DHCP 地址；
+#   这 3 分钟里到 api.deepseek.com:443 的 TCP 连接被**立即拒绝**（WinError 10061），
+#   而用户收到的是「出错了，看终端日志。」——他是无窗口的后台进程，根本没有终端。
+# 所以这里做三件事（每件都有反例钉着，别删）：
+#   ① 只在**请求根本没发出去**的失败上重试：域名没解析出来（`gaierror`）、
+#      对端直接拒连（`ConnectionRefusedError`）——这两类没到服务端、**不会重复计费**；
+#   ② **绝不对读超时 / 连接重置重试**：无法确认模型是否已经生成并计费（项目既定立场：
+#      宁可如实说失败，也不冒"重复扣费/重复动作"的险）；
+#   ③ 放弃前探一下**别的公网目标**，把「本机整体没网」和「只有这个接口不通」分开说
+#      —— 不然又把排查方向指错（和当初那句「看终端日志」一个毛病）。
+_LLM_ATTEMPTS = 3
+_LLM_RETRY_SLEEP = (2.0, 5.0)
+# 「睡醒/掉线后等本机网络回来」的总预算（秒）。2026-10-07 真机：这台笔记本走
+# Modern Standby，一天进出几十次，每次醒来 Wi-Fi 都要重新关联 + 续租，那 **30~90 秒**
+# 里到模型接口的连接被立即拒绝 —— 用户看到的正是"睡醒后发消息没回复"。
+# 7 秒的短重试救不了，所以这里再等一会儿（每 5 秒探一次本机网络）。
+# ⚠️ 这段等待发生在 **HTTP 层、请求发出去之前**：既不会重复计费，也不会把上层
+# 已经发生的副作用（待确认项、工具调用）重跑一遍。配 0 = 不等（老行为）。
+_NET_RECOVER_WAIT_SEC = 90.0
+_NET_RECOVER_STEP_SEC = 5.0
+# 探测目标用**国内公共 DNS**（TCP:53）：校园网/家宽都通，纯 TCP、不发 HTTP、不花钱。
+# 两个都连不上才算「本机整体没网」——单看一个目标，可能只是它自己关了那个端口。
+_PROBE_TARGETS = (("223.5.5.5", 53), ("114.114.114.114", 53))
+_PROBE_TIMEOUT = 1.5
+
+
+class LLMUnreachable(RuntimeError):
+    """模型接口**连接阶段**失败（请求没发出去）。`kind` 让上层直接说人话，不必嗅探文本。
+
+    `kind`：`net_down`（探针说本机整体没网）/ `refused`（被拒连）/ `dns`（解析失败）/
+    `host_down`（其它连接失败，含读超时、TLS 之类）。
+    `waited`：为了等网络回来实际等了多久（秒；0 = 没等）。
+    """
+
+    def __init__(self, message, kind="host_down", target="", detail="", waited=0.0):
+        super().__init__(message)
+        self.kind = kind
+        self.target = target
+        self.detail = detail
+        self.waited = float(waited or 0.0)
+
+
+def _retryable(reason):
+    """这个连接错误**是不是发生在请求发出去之前**（只有这种才允许重试）。
+
+    * `socket.gaierror` —— 域名都没解析出来，一个字节都没发；
+    * `ConnectionRefusedError` —— 对端直接拒了，也没发。
+    其余（`TimeoutError` / `ConnectionResetError` / TLS 错误）**一律不重试**：
+    读超时可能是模型已经生成、正在计费；连接重置可能已经把请求送出去过。
+    """
+    return isinstance(reason, (socket.gaierror, ConnectionRefusedError))
+
+
+def network_down(timeout=_PROBE_TIMEOUT):
+    """本机对外是不是**整体**不通。纯 TCP 探测，不发 HTTP、不花钱、不碰 hook。
+
+    只有「连接阶段失败」的收尾才调它（探针自己也要建 TCP，别浪费在读超时上）。
+    返回 True = 两个独立目标都连不上（那就别把锅甩给模型接口）。
+    """
+    for host, port in _PROBE_TARGETS:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return False          # 有一个通 → 本机网络是好的
+        except OSError:
+            continue
+    return True
+
+
+def _wait_network_back(seconds=_NET_RECOVER_WAIT_SEC, step=_NET_RECOVER_STEP_SEC):
+    """睡醒/掉线后等本机网络回来：每 `step` 秒探一次，最多 `seconds` 秒。
+
+    返回 `(网络是否回来, 实际等了多久秒)`。
+
+    ⚠️ 这段等待**必须**发生在请求发出去之前（`_request` 里就是），这样它既不会重复计费，
+    也不会把上层已经发生的副作用重跑一遍。等待期间打印真实进度（排查时一眼能看出来）。
+    """
+    try:
+        total = max(0.0, float(seconds))
+        every = max(1.0, float(step))
+    except (TypeError, ValueError):
+        return False, 0.0
+    waited = 0.0
+    while waited + every <= total + 1e-6:
+        time.sleep(every)
+        waited += every
+        if not network_down():
+            print(f"[llm] ✅ 网络回来了（等了 {waited:.0f} 秒），立刻重试这次请求", flush=True)
+            return True, waited
+        print(f"[llm] ⏳ 本机还是没网，继续等（已等 {waited:.0f}/{total:.0f} 秒）", flush=True)
+    return False, waited
+
+
+# ============================================================
 #  OpenAI 兼容（DeepSeek / Ollama / 中转）
 # ============================================================
 
@@ -342,28 +440,7 @@ class _OpenAICompat:
         if self.temperature is not None:
             payload["temperature"] = self.temperature
 
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                body = json.loads(r.read().decode("utf-8", "ignore"))
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", "ignore")[:300]
-            except Exception:
-                pass
-            raise RuntimeError(f"{self.base_url} 返回 HTTP {e.code}：{detail}") from e
-        except (urllib.error.URLError, OSError) as e:
-            raise RuntimeError(f"连不上 {self.base_url}：{e}") from e
-
+        body = self._request("/chat/completions", payload)
         # 记账放在解析之前：body 已经拿到了，且**绝不许**让记账失败被下面那个
         # except 当成「返回格式看不懂」误报。
         _rec_openai(self.model, body, "chat")
@@ -412,9 +489,17 @@ class _OpenAICompat:
         _rec_openai(self.model, body, "tools")
         return ChatResult(text, calls, truncated=(choice.get("finish_reason") == "length"))
 
-    def _post(self, payload):
+    def _request(self, path, payload):
+        """**唯一的 HTTP 出口**（`chat` 与 `chat_with_tools` 都走它，别各写一份请求）。
+
+        行为契约（见文件里那一节的长注释）：
+          * 连接阶段失败（域名解析不了 / 被拒连）→ 有界重试 `_LLM_ATTEMPTS` 次，间隔 `_LLM_RETRY_SLEEP`；
+          * 读超时 / 连接重置 / TLS 错误 → **不重试**，直接如实抛；
+          * HTTP 4xx/5xx → **不重试**，原样带 detail 抛（语义明确，重试也白搭）；
+          * 最终失败一律抛 `LLMUnreachable`（带 `kind`，让上层说人话）。
+        """
         req = urllib.request.Request(
-            self.base_url + "/chat/completions",
+            self.base_url + path,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -422,18 +507,52 @@ class _OpenAICompat:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                return json.loads(r.read().decode("utf-8", "ignore"))
-        except urllib.error.HTTPError as e:
-            detail = ""
+        attempt = 0
+        waited_net = False
+        while True:
+            attempt += 1
             try:
-                detail = e.read().decode("utf-8", "ignore")[:300]
-            except Exception:
-                pass
-            raise RuntimeError(f"{self.base_url} 返回 HTTP {e.code}：{detail}") from e
-        except (urllib.error.URLError, OSError) as e:
-            raise RuntimeError(f"连不上 {self.base_url}：{e}") from e
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    return json.loads(r.read().decode("utf-8", "ignore"))
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "ignore")[:300]
+                except Exception:
+                    pass
+                # HTTP 层错误语义明确：**不重试**（429/401 各有各的处理，别在这里糊）
+                raise RuntimeError(f"{self.base_url} 返回 HTTP {e.code}：{detail}") from e
+            except (urllib.error.URLError, OSError) as e:
+                reason = getattr(e, "reason", e)
+                if _retryable(reason) and attempt < _LLM_ATTEMPTS:
+                    delay = _LLM_RETRY_SLEEP[min(attempt - 1, len(_LLM_RETRY_SLEEP) - 1)]
+                    print(f"[llm] ⚠️ 连接失败（{type(reason).__name__}，请求没发出去），"
+                          f"{delay:.0f} 秒后重试（第 {attempt + 1}/{_LLM_ATTEMPTS} 次）", flush=True)
+                    time.sleep(delay)
+                    continue
+                kind = ("dns" if isinstance(reason, socket.gaierror)
+                        else "refused" if isinstance(reason, ConnectionRefusedError)
+                        else "host_down")
+                # 只有"请求没发出去"的失败才值得探本机网络（探针自己也要建 TCP）
+                if kind in ("refused", "dns") and network_down():
+                    kind = "net_down"
+                waited = 0.0
+                # 「本机整体没网」（睡醒那几十秒就是这种）→ 等网络回来再试一次。
+                # 这段等待在请求发出去之前，所以**不会重复计费、也不会重跑上层副作用**。
+                if kind == "net_down" and not waited_net and _NET_RECOVER_WAIT_SEC > 0:
+                    waited_net = True
+                    back, waited = _wait_network_back()
+                    if back:
+                        continue
+                _err = str(e)[:200]
+                print(f"[llm] ❌ 连不上 {self.base_url}（kind={kind}，等了 {waited:.0f} 秒）：{_err}",
+                      flush=True)
+                raise LLMUnreachable(f"连不上 {self.base_url}：{e}", kind=kind,
+                                     target=self.base_url, detail=_err, waited=waited) from e
+
+    def _post(self, payload):
+        """`chat_with_tools` 的 HTTP 出口（**自测就是桩这一层**，别再往里加逻辑）。"""
+        return self._request("/chat/completions", payload)
 
 
 def _openai_messages(messages):
