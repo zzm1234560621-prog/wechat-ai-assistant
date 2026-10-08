@@ -1495,6 +1495,52 @@ def t18_address_without_membership():
         auto_reply.live_history.query_contact_history = real_qch
 
 
+def t19_emoji_brackets():
+    """表情必须写成 `[捂脸]` 这种方括号：裸写「捂脸」到对方那儿只是两个汉字。
+
+    2026-10-08 真机：11:49 给一位朋友学了一次语气，学出来的人设写的是
+    `常用“确实”“可以”“牛逼”“闹麻了”“wc”“捂脸/旺柴”` —— **表情名是裸词**。
+    人设是**整体替换**注入的（`persona_for`），模型照着它写，于是 11:53 起对方收到的
+    每条带表情的回复都成了「… 捂脸」；而 10-02 那份学出来的人设写的是
+    `[呲牙][捂脸][强]`（带方括号），同一天的回复就真是 `[捂脸]`。
+    两天都是 `deepseek-flash`（`data/usage.jsonl`），**模型没换，变的只是人设里的写法**。
+
+    所以规矩和「不许替我承诺」一样必须落在 `_COMMON_RULES`（单聊/群聊无条件追加），
+    并且要**明说「人设里只写了表情名也照样补方括号」**——已经存下的那些人设不会自己变好。
+    学语气那一侧（`_LEARN_SYSTEM`）也要要求保留方括号，否则下次学出来又是裸词。
+    """
+    print("T19. 表情：必须写成 [捂脸] 这种方括号（裸写 = 两个汉字，等于没发）")
+    # 照真机上那份「学到的」人设的样子写：表情名是**裸词**，且不含这条规矩
+    learned = ("你正在代替我本人回复微信。用第一人称，口语、简短，像平时打微信，"
+               "不确定的事别编。语气随意直白，常用“牛逼”“闹麻了”“捂脸/旺柴”。")
+    chk("[捂脸]" not in learned and "方括号" not in learned,
+        "那段人设自身不含这条规矩（绿了只能是 _COMMON_RULES 给的）")
+
+    msgs = [{"content": "你咋回事啊", "is_self": 0, "sender": "wxid_z",
+             "time": "10-08 11:53"}]
+    cases = [
+        ("单聊·学到的人设（裸词）", {"wxid": "wxid_z", "mode": "self", "persona": learned},
+         {}, False),
+        ("群聊·学到的人设（裸词）", {"wxid": "wxid_z", "mode": "self", "persona": learned},
+         {}, True),
+        ("单聊·没设人设（走默认）", {"mode": "self"}, {}, False),
+    ]
+    for label, rec, cfg, group in cases:
+        cap = _CaptureLLM()
+        auto_reply.make_reply(cap, rec, msgs, {}, cfg, group=group)
+        sys_p = cap.system or ""
+        chk("[捂脸]" in sys_p, f"{label}：prompt 里给了方括号写法（[捂脸]）")
+        chk("方括号" in sys_p, f"{label}：明说是方括号的写法")
+        chk("裸写" in sys_p and "补上方括号" in sys_p,
+            f"{label}：说清「不许裸写、人设只写表情名也要补方括号」")
+
+    # 唯一真源在 _COMMON_RULES；学语气那一侧也要保留方括号（否则下次学出来又是裸词）
+    chk("[捂脸]" in auto_reply._COMMON_RULES,
+        "规矩的唯一真源是 auto_reply._COMMON_RULES")
+    chk("[捂脸]" in auto_reply._LEARN_SYSTEM and "方括号" in auto_reply._LEARN_SYSTEM,
+        "_LEARN_SYSTEM 也要求保留方括号写法（学到的表情名不许是裸词）")
+
+
 def main():
     print("=" * 60)
     print("scheduler / auto_reply 回归自测（不联网、不碰微信、不启动 bot）")
@@ -1510,7 +1556,8 @@ def main():
                t11_per_person_persona, t12_learn_persona_from_history,
                t13_address_from_history, t14_groups,
                t15_watch_keywords, t16_no_commitment_on_my_behalf,
-               t17_remind_me, t18_address_without_membership):
+               t17_remind_me, t18_address_without_membership,
+               t19_emoji_brackets):
         fn()
         print("")
     assert settings.SETTINGS_PATH == real_settings, "别把真配置文件路径改回不去"
